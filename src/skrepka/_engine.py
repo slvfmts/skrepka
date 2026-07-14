@@ -89,6 +89,51 @@ def _warn(msg):
     print(json.dumps({"warning": msg}), file=sys.stderr)
 
 
+def _require_human(operation):
+    """Cooperative gate for human-only operations (resolving comment
+    threads, updates that acknowledge comment loss). Agent runs are
+    normally non-interactive, so requiring a TTY confirmation stops the
+    accidental/default agent path before any API call. It is NOT a
+    security boundary: an agent could set the env var or allocate a PTY —
+    forbidding that is the agent contract's job (skills/CONTRACT.md), and
+    an agent holding the OAuth token could bypass this CLI entirely.
+    A human running non-interactively (their own scripts/CI) can
+    pre-authorize with SKREPKA_ASSUME_HUMAN=1.
+    """
+    if os.environ.get("SKREPKA_ASSUME_HUMAN") == "1":
+        return
+    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+        _error(
+            f"'{operation}' is a human-only operation and needs an "
+            f"interactive terminal confirmation. If you are a human running "
+            f"this non-interactively, set SKREPKA_ASSUME_HUMAN=1 and rerun. "
+            f"If you are an AI agent: do not set that variable and do not "
+            f"bypass this gate — ask the person you work for to run "
+            f"'{operation}' themselves.")
+    print(f"Confirm human-only operation '{operation}'? [y/N]: ",
+          end="", file=sys.stderr, flush=True)
+    answer = sys.stdin.readline().strip().lower()
+    if answer not in ("y", "yes"):
+        _error(f"'{operation}' was not confirmed — nothing done")
+
+
+def _emit_json(payload, output=None, summary=None):
+    """Print payload as JSON, or (with output=PATH) write it to a file and
+    print a short receipt instead. Protects agents whose tool output gets
+    truncated from acting on a cut-off list (see agents/CONTRACT.md)."""
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    if not output:
+        print(text)
+        return
+    with open(output, "w", encoding="utf-8") as f:
+        f.write(text + "\n")
+    receipt = {"written": os.path.abspath(output),
+               "bytes": len(text.encode("utf-8")) + 1}
+    if summary:
+        receipt.update(summary)
+    print(json.dumps(receipt, ensure_ascii=False))
+
+
 def get_creds():
     """Authenticate and return credentials."""
     creds = None
@@ -419,7 +464,15 @@ def _count_quote_occurrences(doc_tab, quote):
 
 
 def _write_control(revision_id):
-    """Build writeControl block for batchUpdate with required revision pinning."""
+    """Build writeControl block for batchUpdate with required revision pinning.
+
+    Fails closed on a missing revision id: the google client drops None
+    values from request bodies, so an unvalidated None would silently turn
+    a pinned write into an UNPINNED one (codex delta-review hardening).
+    """
+    if not revision_id:
+        _error("internal: batchUpdate without a revision id — refusing an "
+               "unpinned write (doc read likely returned no revisionId)")
     return {"requiredRevisionId": revision_id}
 
 
@@ -827,7 +880,7 @@ def upload_md(file_path, folder_id=None, title=None, no_highlights=False):
     }))
 
 
-def list_comments(file_id):
+def list_comments(file_id, output=None):
     """List comments on a Google Doc."""
     try:
         creds = get_creds()
@@ -853,7 +906,10 @@ def list_comments(file_id):
     except HttpError as e:
         _error(f"failed to fetch comments: {e.reason if hasattr(e, 'reason') else e}")
 
-    print(json.dumps(comments, ensure_ascii=False, indent=2))
+    _emit_json(comments, output=output,
+               summary={"comments": len(comments),
+                        "unresolved": sum(1 for c in comments
+                                          if not c.get("resolved"))})
 
 
 # ---------------------------------------------------------------------------
@@ -1767,6 +1823,10 @@ def mark_range(file_id, name, quote, tab_id=None, occurrence=1):
 
 def reply_comment(file_id, comment_id, text, resolve=False):
     """Post a reply to an existing comment. If resolve=True, also resolves the thread."""
+    if resolve:
+        # resolving a thread is the reviewer's call, never the agent's —
+        # gate it mechanically, not just by instruction
+        _require_human("resolve comment thread")
     file_id = _extract_doc_id(file_id)
     try:
         creds = get_creds()
@@ -1870,9 +1930,17 @@ def _prepare_export_html(html):
       without this, regenerated md loses bold/italic and a subsequent
       sync would strip those styles from the doc)
     - unwrap https://www.google.com/url?q=<real> redirect links
+    - NBSP -> plain space BEFORE markdownify: Google exports ordinary
+      spaces as &nbsp;, and markdownify SWALLOWS a leading NBSP at an
+      inline-tag boundary (live case: a bold run split by coloring one
+      word exported as <b>вернувшимся</b><b>&nbsp;жирным</b> and the
+      space vanished from the md). Both md pipelines already normalize
+      NBSP after conversion; doing it before keeps markdownify's own
+      whitespace logic correct.
     """
     from bs4 import BeautifulSoup
     from urllib.parse import urlparse, parse_qs
+    html = html.replace(" ", " ").replace("&nbsp;", " ")
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup.find_all(["style", "script"]):
         tag.decompose()
@@ -2060,7 +2128,7 @@ def _extract_full_text_inner(content):
     return "".join(parts)
 
 
-def list_suggestions(file_id):
+def list_suggestions(file_id, output=None):
     """Compare original vs accepted suggestions, output as structured diff."""
     file_id = _extract_doc_id(file_id)
 
@@ -2087,12 +2155,13 @@ def list_suggestions(file_id):
     accepted_text = _extract_full_text(doc_accepted.get("body", {}))
 
     if original_text == accepted_text:
-        print(json.dumps({
+        _emit_json({
             "title": title,
             "has_suggestions": False,
             "changes": [],
             "diff": "",
-        }, ensure_ascii=False))
+        }, output=output, summary={"has_suggestions": False,
+                                   "change_count": 0})
         return
 
     orig_lines = original_text.splitlines(keepends=True)
@@ -2119,13 +2188,14 @@ def list_suggestions(file_id):
     if current:
         changes.append(current)
 
-    print(json.dumps({
+    _emit_json({
         "title": title,
         "has_suggestions": True,
         "change_count": len(changes),
         "changes": changes,
         "diff": "".join(diff_lines),
-    }, ensure_ascii=False, indent=2))
+    }, output=output, summary={"has_suggestions": True,
+                               "change_count": len(changes)})
 
 
 # ---------------------------------------------------------------------------
@@ -2184,6 +2254,18 @@ def _marks_signature(spans):
         [[_norm_ws(t), list(m)] for t, m in merged if t], ensure_ascii=False)
 
 
+def _visible_run_styles(raw_runs):
+    """[(content, textStyle)] -> [{"len": utf16_len, "style": textStyle}]
+    for the paragraph's VISIBLE text: the trailing newline is stripped and
+    empty/newline-only runs are dropped (the \\n mark is never rewritten and
+    its style must not break uniformity — codex style-r1 #3)."""
+    if raw_runs:
+        last_c, last_s = raw_runs[-1]
+        if last_c.endswith("\n"):
+            raw_runs = raw_runs[:-1] + [(last_c[:-1], last_s)]
+    return [{"len": _utf16_len(c), "style": s} for c, s in raw_runs if c]
+
+
 def _doc_elements(doc_tab):
     """Extract the comparable element sequence from a documentTab.
 
@@ -2199,7 +2281,7 @@ def _doc_elements(doc_tab):
     for el in body.get("content", []):
         if "paragraph" in el:
             para = el["paragraph"]
-            parts, spans, has_nontext = [], [], False
+            parts, spans, raw_runs, has_nontext = [], [], [], False
             for e in para.get("elements", []):
                 tr = e.get("textRun")
                 if tr is None:
@@ -2210,6 +2292,8 @@ def _doc_elements(doc_tab):
                 parts.append(tr.get("content", ""))
                 spans.append((tr.get("content", ""),
                               _run_marks(tr.get("textStyle"))))
+                raw_runs.append((tr.get("content", ""),
+                                 tr.get("textStyle") or {}))
             text = "".join(parts)
             if text.endswith("\n"):
                 text = text[:-1]
@@ -2236,6 +2320,13 @@ def _doc_elements(doc_tab):
                         # indices stripped — remote-change detection must see
                         # underline/color/font edits too (codex sync-r2 #2)
                         "doc_fp": _opaque_hash(el),
+                        # raw styles for preservation across rewrites; NOT
+                        # persisted to the sidecar (live-doc-only data).
+                        # The paragraph mark is never rewritten, so the
+                        # trailing \n is stripped and newline-only runs are
+                        # dropped — they must not affect style uniformity
+                        "para_style": para.get("paragraphStyle") or {},
+                        "run_styles": _visible_run_styles(raw_runs),
                         "start": el["startIndex"], "end": el["endIndex"]})
         elif "sectionBreak" in el:
             continue
@@ -2515,7 +2606,8 @@ def _sidecar_payload(file_id, md_output_path, md_text, doc):
     # the raw md block (base for local-change detection).
     elements = []
     for k, d in enumerate(doc_els):
-        entry = {k2: d[k2] for k2 in d if k2 not in ("start", "end")}
+        entry = {k2: d[k2] for k2 in d
+                 if k2 not in ("start", "end", "para_style", "run_styles")}
         if not mismatch:
             m = md_els[k]
             entry["raw_md"] = m.get("raw", "")
@@ -2577,36 +2669,204 @@ def _utf16_len(s):
 _KIND_TO_NAMED_STYLE = {**{f"h{i}": f"HEADING_{i}" for i in range(1, 7)},
                         "p": "NORMAL_TEXT", "li": "NORMAL_TEXT"}
 
+# paragraphStyle fields that are writable via updateParagraphStyle and that
+# the doc owner may have set by hand — preserved across a paragraph rewrite
+# (setting namedStyleType RESETS all of them to the named style's defaults,
+# so the namedStyleType update must carry them in the same request).
+# headingId/tabStops are read-only and excluded.
+_PRESERVE_PARA_FIELDS = (
+    "alignment", "lineSpacing", "direction", "spacingMode", "spaceAbove",
+    "spaceBelow", "borderBetween", "borderTop", "borderBottom", "borderLeft",
+    "borderRight", "indentFirstLine", "indentStart", "indentEnd",
+    "keepLinesTogether", "keepWithNext", "avoidWidowAndOrphan", "shading",
+    "pageBreakBefore")
 
-def _style_requests_for_block(el, start_index):
+# textStyle fields preserved across a rewrite when they are UNIFORM over the
+# old paragraph. bold/italic/link are excluded on purpose: the local markdown
+# is the source of truth for those (they round-trip through md).
+_PRESERVE_TEXT_FIELDS = (
+    "underline", "strikethrough", "smallCaps", "backgroundColor",
+    "foregroundColor", "fontSize", "weightedFontFamily", "baselineOffset")
+
+
+def _uniform_text_style(run_styles):
+    """Return (uniform_style, True) when every run agrees on the preserved
+    textStyle fields (an empty dict = 'all defaults' is uniform too), else
+    (None, False)."""
+    filtered = [
+        {k: ts[k] for k in _PRESERVE_TEXT_FIELDS if k in ts}
+        for ts in (run_styles or [{}])
+    ]
+    first = json.dumps(filtered[0], sort_keys=True)
+    for other in filtered[1:]:
+        if json.dumps(other, sort_keys=True) != first:
+            return None, False
+    return filtered[0], True
+
+
+def _capture_preserve(rel, with_text):
+    """Capture style-preservation data from a remote element before rewrite.
+
+    Returns (preserve_dict, text_dropped). preserve always carries the raw
+    paragraphStyle. For rewrites (with_text=True) it carries "text_style":
+    the uniform textStyle to restore over the new text, or {} when the old
+    inline styling was non-uniform — the rewrite then CLEARS to the named
+    style's defaults deterministically (inserted text inherits arbitrary
+    neighbour styling otherwise — codex style-r1 #2) and text_dropped=True
+    reports the loss honestly (span-mapping is a later roadmap item).
+    For style-only changes (with_text=False, text untouched) it carries
+    "run_spans": the old runs' exact lengths+styles, so per-run styling can
+    be reapplied after the bold/italic/link reset (codex style-r1 #4).
+
+    "type" carries the old STRUCTURAL type: namedStyleType alone cannot
+    tell p from li (both NORMAL_TEXT), and a p<->li conversion is a
+    restructure that must not drag old indents/styling along
+    (codex style-r2 #1).
+    """
+    preserve = {"para_style": rel.get("para_style") or {},
+                "type": rel.get("type")}
+    if not with_text:
+        preserve["run_spans"] = rel.get("run_styles") or []
+        return preserve, False
+    uniform, ok = _uniform_text_style(
+        [r["style"] for r in rel.get("run_styles") or []])
+    if ok:
+        preserve["text_style"] = uniform
+        return preserve, False
+    preserve["text_style"] = {}
+    return preserve, True
+
+
+# inserted blocks: nothing to preserve, but the full-mask clear must still
+# run — text inserted next to styled text inherits that styling, so a fresh
+# block would otherwise come out red/10pt/etc. (codex style-r2 #2). No
+# "type" key => same_type is always False => clean named style + clear.
+_FRESH_BLOCK_PRESERVE = {"para_style": {}, "text_style": {}}
+
+
+def _link_intervals(sig, start_index):
+    """[(start, end, is_link)] for the block's NEW md spans, in order."""
+    out = []
+    offset = start_index
+    for span_text, marks in json.loads(sig):
+        span_len = _utf16_len(span_text)
+        out.append((offset, offset + span_len,
+                    any(m.startswith("link:") for m in marks)))
+        offset += span_len
+    return out
+
+
+def _split_by_intervals(start, end, flagged):
+    """Split [start, end) by [(s, e, flag)] coverage; yields
+    (piece_start, piece_end, flag). Positions not covered by any interval
+    (defensive; sig should tile the block) yield flag=False."""
+    pos = start
+    for s, e, flag in flagged:
+        if e <= pos or s >= end:
+            continue
+        s2, e2 = max(s, pos), min(e, end)
+        if s2 > pos:
+            yield pos, s2, False
+        if s2 < e2:
+            yield s2, e2, flag
+        pos = e2
+        if pos >= end:
+            return
+    if pos < end:
+        yield pos, end, False
+
+
+def _style_requests_for_block(el, start_index, preserve=None):
     """Build style requests for a block whose PLAIN text sits at start_index.
 
     Returns a list of batchUpdate requests: namedStyleType, bullets,
     bold/italic/link spans (narrow field masks).
+
+    preserve (from _capture_preserve) reapplies what the block's own style
+    requests would otherwise destroy: hand-set paragraphStyle fields (the
+    namedStyleType update resets them), the uniform textStyle of the old
+    paragraph over rewritten text ({} = deterministic clear for non-uniform
+    originals), and per-run styles for style-only blocks whose text was
+    never rewritten. A type change (p->h2) is an intentional restructure:
+    it gets the clean named style AND cleared text styling.
     """
     reqs = []
     text = el["text"]
     end_index = start_index + _utf16_len(text)
     para_range = {"startIndex": start_index, "endIndex": end_index + 1}
-    reqs.append({"updateParagraphStyle": {
+    target_named = _KIND_TO_NAMED_STYLE[el["type"]]
+    para_style = {"namedStyleType": target_named}
+    para_fields = ["namedStyleType"]
+    same_type = True
+    if preserve is not None:
+        old = preserve.get("para_style") or {}
+        # preserve only when the STRUCTURAL type is unchanged: a type change
+        # (p->h2, p<->li, ...) is an intentional restructure and gets the
+        # clean named style. Compared on el-types, not namedStyleType —
+        # p and li share NORMAL_TEXT (codex style-r2 #1). Inserted blocks
+        # carry no "type" and never preserve.
+        same_type = preserve.get("type") == el["type"]
+        if same_type:
+            for k in _PRESERVE_PARA_FIELDS:
+                if k in old:
+                    para_style[k] = old[k]
+                    para_fields.append(k)
+    # one request per concern, but ORDER differs by block type: both bullet
+    # ops rewrite paragraph indents (deleteParagraphBullets "visually
+    # preserves" nesting by adjusting indentStart/indentFirstLine), so for
+    # plain blocks it must run BEFORE the paragraphStyle update or preserved
+    # indents get stomped; for list items createParagraphBullets must run
+    # AFTER the namedStyleType reset so the bullet indents it sets survive.
+    para_req = {"updateParagraphStyle": {
         "range": para_range,
-        "paragraphStyle": {"namedStyleType": _KIND_TO_NAMED_STYLE[el["type"]]},
-        "fields": "namedStyleType",
-    }})
+        "paragraphStyle": para_style,
+        # the API applies namedStyleType (with its reset) BEFORE the other
+        # fields within one request, so preserved fields win
+        "fields": ",".join(para_fields),
+    }}
     if el["type"] == "li":
+        reqs.append(para_req)
         reqs.append({"createParagraphBullets": {
             "range": para_range,
             "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE",
         }})
     else:
         reqs.append({"deleteParagraphBullets": {"range": para_range}})
-    # Reset inline styles over the whole block, then apply spans
+        reqs.append(para_req)
+    # Reset inline styles over the whole block, then apply spans.
+    # Link clearing is SPECIAL (live-verified 2026-07-14): {"link": None}
+    # is silently dropped from the body by the google client, and a
+    # fields="link" unset is honored ONLY when the request range is
+    # entirely linked — over a mixed range (whole block) it is silently
+    # ignored. The whole-block reset below therefore handles rewritten/
+    # inserted text (one insertText => uniformly inherited, so the range
+    # is either fully linked or link-free); style-only blocks get precise
+    # per-piece link clears in the run_spans pass further down.
     if text:
         reqs.append({"updateTextStyle": {
             "range": {"startIndex": start_index, "endIndex": end_index},
-            "textStyle": {"bold": False, "italic": False, "link": None},
-            "fields": "bold,italic,link",
+            "textStyle": {},
+            "fields": "link",
         }})
+        reqs.append({"updateTextStyle": {
+            "range": {"startIndex": start_index, "endIndex": end_index},
+            "textStyle": {"bold": False, "italic": False},
+            "fields": "bold,italic",
+        }})
+        if preserve is not None and "text_style" in preserve:
+            # rewritten text. Full field mask: inserted text may have
+            # INHERITED stray styling from a neighbour, so absent captured
+            # fields must be cleared back to the named-style defaults, not
+            # left as inherited. A type change clears everything (clean
+            # restructure — codex style-r1 #1); a non-uniform original
+            # arrives here as {} = deterministic clear (codex style-r1 #2).
+            # Applied BEFORE the md spans so a link span keeps its automatic
+            # link color/underline.
+            reqs.append({"updateTextStyle": {
+                "range": {"startIndex": start_index, "endIndex": end_index},
+                "textStyle": preserve["text_style"] if same_type else {},
+                "fields": ",".join(_PRESERVE_TEXT_FIELDS),
+            }})
     offset = start_index
     for span_text, marks in json.loads(el["sig"]):
         span_len = _utf16_len(span_text)
@@ -2630,6 +2890,59 @@ def _style_requests_for_block(el, start_index):
                     "fields": ",".join(sorted(set(fields))),
                 }})
         offset += span_len
+    if preserve is not None and preserve.get("run_spans"):
+        # style-only block: the text was never rewritten, so the old runs
+        # map 1:1 onto the current text. Reapply preserved fields AFTER the
+        # md spans: the bold/italic/link reset and re-linking slosh
+        # neighbour/default styling over the range (documented side effects
+        # of unsetting/setting link), and this pass makes the outcome
+        # deterministic — a custom link color or a colored word survives a
+        # bold toggle elsewhere in the paragraph (codex style-r1 #4).
+        # Link topology decides what each piece gets (codex style-r2 #4):
+        #   old link  & new link  -> captured style (custom look survives)
+        #   old link  & new plain -> {} (clear the ghost link appearance)
+        #   old plain & new link  -> NO restore (default link look stands)
+        #   old plain & new plain -> captured style
+        spans_total = sum(s["len"] for s in preserve["run_spans"])
+        if spans_total == end_index - start_index:
+            new_links = _link_intervals(el["sig"], start_index)
+            offset = start_index
+            for span in preserve["run_spans"]:
+                run_start, run_end = offset, offset + span["len"]
+                offset = run_end
+                old_linked = "link" in span["style"]
+                captured = {k: span["style"][k]
+                            for k in _PRESERVE_TEXT_FIELDS
+                            if k in span["style"]}
+                for pc_start, pc_end, new_linked in _split_by_intervals(
+                        run_start, run_end, new_links):
+                    if new_linked and not old_linked:
+                        continue
+                    piece = {"startIndex": pc_start, "endIndex": pc_end}
+                    if old_linked and not new_linked:
+                        # the whole-block link reset is silently ignored
+                        # over mixed ranges (API quirk, see above); this
+                        # piece is entirely inside the old linked run, so
+                        # a targeted unset works
+                        reqs.append({"updateTextStyle": {
+                            "range": piece, "textStyle": {},
+                            "fields": "link",
+                        }})
+                        style = {}
+                    else:
+                        style = captured
+                    reqs.append({"updateTextStyle": {
+                        "range": piece,
+                        "textStyle": style,
+                        "fields": ",".join(_PRESERVE_TEXT_FIELDS),
+                    }})
+        else:
+            # defensive: captured spans do not tile the block (should be
+            # impossible for a style-only element) — skip the restore
+            # rather than style wrong ranges
+            _warn(f"style restore skipped for block at {start_index}: "
+                  f"captured runs cover {spans_total} of "
+                  f"{end_index - start_index} code units")
     return reqs
 
 
@@ -2886,29 +3199,42 @@ def sync_doc(file_id, md_path, tab_id=None):
             insert_before.setdefault(target, []).extend(by_gap[g])
 
     # --- expected merged sequence + style slots (codex sync-r1 #2) ---
-    expected, style_slots = [], []
+    expected, style_slots, styles_dropped = [], [], []
 
     def _entry_para(text):
         return ("para", _norm_ws(text))
 
     for j, rel in enumerate(remote_els):
         for lel in insert_before.get(j, []):
-            style_slots.append((len(expected), lel))
+            style_slots.append((len(expected), lel, _FRESH_BLOCK_PRESERVE))
             expected.append(_entry_para(lel["text"]))
         a = action.get(j)
         if a and a[0] == "delete":
             continue
         if a and a[0] == "replace":
-            style_slots.append((len(expected), a[1]))
+            # capture the OLD paragraph's styles: the rewrite keeps
+            # paragraphStyle on its own, but our namedStyleType update
+            # resets it, and the new text loses the old runs' textStyle
+            preserve, dropped = _capture_preserve(rel, with_text=True)
+            if dropped:
+                styles_dropped.append({
+                    "text": a[1]["text"][:60],
+                    "reason": "old paragraph had non-uniform inline styling "
+                              "(e.g. one colored word) — not restorable yet",
+                })
+            style_slots.append((len(expected), a[1], preserve))
             expected.append(_entry_para(a[1]["text"]))
         elif rel["type"] == "opaque":
             expected.append(("opaque", rel.get("hash", "")))
         else:
             if j in so_remote:
-                style_slots.append((len(expected), so_remote[j]))
+                # text untouched: runs keep their styles, only the
+                # paragraphStyle needs shielding from the namedStyleType reset
+                preserve, _ = _capture_preserve(rel, with_text=False)
+                style_slots.append((len(expected), so_remote[j], preserve))
             expected.append(_entry_para(rel["text"]))
     for lel in end_inserts:
-        style_slots.append((len(expected), lel))
+        style_slots.append((len(expected), lel, _FRESH_BLOCK_PRESERVE))
         expected.append(_entry_para(lel["text"]))
 
     # --- text requests ---
@@ -3059,9 +3385,9 @@ def sync_doc(file_id, md_path, tab_id=None):
     # --- style pass: positions taken positionally from fresh_els ---
     styled = 0
     style_reqs = []
-    for k, lel in style_slots:
+    for k, lel, preserve in style_slots:
         style_reqs.extend(
-            _style_requests_for_block(lel, fresh_els[k]["start"]))
+            _style_requests_for_block(lel, fresh_els[k]["start"], preserve))
         styled += 1
     if style_reqs:
         try:
@@ -3137,6 +3463,8 @@ def sync_doc(file_id, md_path, tab_id=None):
         "comments_on_doc": len(all_comments),
         "advanced": advanced,
     }
+    if styles_dropped:
+        result["inline_styles_dropped"] = styles_dropped
     if recovery:
         result["note"] = (
             f"local md was edited during sync — NOT overwritten; merged "
@@ -3222,6 +3550,11 @@ def update_doc(file_id, file_path, title=None, no_highlights=False,
                 "named_ranges": sorted(named_ranges),
             }, ensure_ascii=False, indent=2))
             sys.exit(2)
+        # the flag alone is not enough: destroying comments is the document
+        # owner's call, never the agent's — gate mechanically
+        _require_human(
+            f"update --acknowledge-loss (destroys {len(all_comments)} "
+            f"comment(s) / {len(named_ranges)} named range(s))")
         # Acknowledged: back up first, verify placement, report id BEFORE
         # destruction (codex code review #8: pin and verify parents).
         backup_body = {"name": f"{meta.get('name', 'doc')}.pre-update-backup-"
@@ -3378,6 +3711,10 @@ def main():
     # comments command
     cm = sub.add_parser("comments", help="List comments on a Google Doc")
     cm.add_argument("file_id", help="Google Doc file ID or URL")
+    cm.add_argument("--output", default=None,
+                    help="Write the full JSON to a file and print a short "
+                         "receipt (large threads can exceed agent output "
+                         "limits and get silently truncated)")
 
     # reply command
     rp = sub.add_parser("reply", help="Post a reply to a comment")
@@ -3427,6 +3764,10 @@ def main():
     # suggestions command
     sg = sub.add_parser("suggestions", help="List suggestions on a Google Doc")
     sg.add_argument("file_id", help="Google Doc file ID or URL")
+    sg.add_argument("--output", default=None,
+                    help="Write the full JSON to a file and print a short "
+                         "receipt (large diffs can exceed agent output "
+                         "limits and get silently truncated)")
 
     # sync command (three-way merge)
     sy = sub.add_parser("sync", help="Three-way merge local .md into a Google Doc")
@@ -3457,7 +3798,7 @@ def main():
     elif args.command == "upload-file":
         upload_file(args.file, folder_id=args.folder, title=args.title)
     elif args.command == "comments":
-        list_comments(_extract_doc_id(args.file_id))
+        list_comments(_extract_doc_id(args.file_id), output=args.output)
     elif args.command == "reply":
         reply_comment(args.file_id, args.comment_id, args.text, resolve=args.resolve)
     elif args.command == "resolve":
@@ -3473,7 +3814,7 @@ def main():
         download_doc(args.file_id, fmt=args.format, output=args.output,
                      images_dir=args.images_dir)
     elif args.command == "suggestions":
-        list_suggestions(args.file_id)
+        list_suggestions(args.file_id, output=args.output)
     elif args.command == "sync":
         sync_doc(args.file_id, args.file)
     elif args.command == "update":
