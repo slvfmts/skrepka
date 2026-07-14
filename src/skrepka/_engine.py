@@ -31,7 +31,7 @@ SCOPES = [
 HIGHLIGHT_COLOR = {"red": 0.933, "green": 0.945, "blue": 1.0}
 HIGHLIGHT_PADDING = {"magnitude": 6, "unit": "PT"}
 
-# --- Characterization gates (empirical Docs API behavior; see docs/FINDINGS.md) ---
+# --- Characterization gates (phase 0, docs/FINDINGS.md) ---
 # Docs with anchored UI comments: whether a given operation class is verified
 # to keep comment anchors alive AND text intact.
 #   None  = unverified -> fail closed (operation class is blocked on such docs)
@@ -233,7 +233,8 @@ def _census_comments(drive_service, file_id):
             resp = drive_service.comments().list(
                 fileId=file_id,
                 fields="nextPageToken,comments(id,content,author/displayName,"
-                       "quotedFileContent,resolved,deleted,anchor)",
+                       "createdTime,quotedFileContent,resolved,deleted,anchor,"
+                       "replies(id,createdTime,author/displayName,deleted))",
                 includeDeleted=False,
                 pageSize=100,
                 pageToken=page_token,
@@ -1307,6 +1308,434 @@ def _map_anchors_to_doc(doc_tab, spans):
     return ranges, problems
 
 
+# ---------------------------------------------------------------------------
+# Anchor accounting + export canary (PLAN-sync-anchors v4)
+# ---------------------------------------------------------------------------
+
+_CANARY_NOTE = "(служебная строка синхронизации — можно удалить)"
+
+
+def _trunc_seconds(ts):
+    """Normalize an RFC3339 timestamp to whole seconds (docx w:date is the
+    API createdTime TRUNCATED to seconds — verified C11b, 5/5 live)."""
+    return re.sub(r"\.\d+(?=Z$|[+-]\d{2}:\d{2}$)", "", ts or "")
+
+
+def _docx_comment_records(docx_bytes):
+    """Parse word/comments.xml into [{docx_id, author, date_sec}].
+
+    Returns (records, problems). Contract (codex sync-anchors r3 #4):
+    every record must carry a non-empty w:id, UNIQUE across records —
+    a duplicate or missing id makes the comments.xml ⇄ document.xml join
+    unusable, so it is a problem (caller fails closed). A missing
+    comments.xml part is an empty record list (valid for a doc whose
+    anchored comments are all ghosts — accounting then fails closed on
+    the API side of the equality, which is the intent).
+    """
+    import io
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    w = _WORDML_NS
+    records, problems = [], []
+    try:
+        with zipfile.ZipFile(io.BytesIO(docx_bytes)) as z:
+            if "word/comments.xml" not in z.namelist():
+                return [], []
+            root = ET.fromstring(z.read("word/comments.xml"))
+    except Exception as e:
+        return [], [f"malformed docx comments part: {e}"]
+    seen_ids = set()
+    for c in root.findall(f"{w}comment"):
+        cid = c.get(f"{w}id")
+        if not cid:
+            problems.append("comments.xml entry without w:id")
+            continue
+        if cid in seen_ids:
+            problems.append(f"duplicate w:id {cid} in comments.xml")
+            continue
+        seen_ids.add(cid)
+        records.append({
+            "docx_id": cid,
+            "author": c.get(f"{w}author") or "",
+            "date_sec": _trunc_seconds(c.get(f"{w}date") or ""),
+        })
+    return records, problems
+
+
+def _account_anchored_comments(anchored, records, spans):
+    """Prove every anchored API comment is present in the docx export.
+
+    Ghosted threads vanish from the export ENTIRELY (C11a), and a stale
+    export missing a fresh comment looks exactly the same — so the only
+    honest policy is exact accounting: the multiset of
+    (author.displayName, createdTime→seconds) keys over all non-deleted
+    entries of anchored threads (parents AND replies) must EQUAL the
+    multiset over comments.xml records, and every record must join to
+    exactly one anchor span via w:id (bijection). Any shortfall, excess,
+    duplicate key (ambiguous — codex r3 #5) or broken join ⇒ problems
+    (caller blocks paragraph replaces/deletes entirely).
+
+    Returns (problems, metrics).
+    """
+    from collections import Counter
+
+    problems = []
+    api_keys = Counter()
+    resolved_n = 0
+    for c in anchored:
+        if c.get("resolved"):
+            resolved_n += 1
+        entries = [c] + [r for r in (c.get("replies") or [])
+                         if not r.get("deleted")]
+        for entry in entries:
+            author = (entry.get("author") or {}).get("displayName")
+            created = entry.get("createdTime")
+            if not author or not created:
+                problems.append(
+                    f"comment {c.get('id')} entry lacks author/createdTime "
+                    f"— cannot account for it")
+                continue
+            api_keys[(author, _trunc_seconds(created))] += 1
+    docx_keys = Counter((r["author"], r["date_sec"]) for r in records)
+    for key, n in api_keys.items():
+        if n > 1:
+            problems.append(
+                f"ambiguous accounting key (same author, same second) ×{n}: "
+                f"{key[0]!r} @ {key[1]}")
+    for key, n in docx_keys.items():
+        if n > 1 and key not in api_keys:  # api-side dupes already reported
+            problems.append(
+                f"ambiguous docx key (same author, same second) ×{n}: "
+                f"{key[0]!r} @ {key[1]}")
+    missing = api_keys - docx_keys
+    extra = docx_keys - api_keys
+    if missing:
+        problems.append(
+            "anchored comment entries missing from the export (ghost thread "
+            "or stale export — indistinguishable): "
+            + "; ".join(f"{a!r} @ {d}" for a, d in list(missing)[:5]))
+    if extra:
+        problems.append(
+            "export contains comment entries unknown to the API (stale "
+            "export): " + "; ".join(f"{a!r} @ {d}" for a, d in list(extra)[:5]))
+    # bijection: one span per comments.xml record, joined by w:id
+    span_ids = Counter()
+    for s in spans:
+        sid = s.get("docx_id")
+        if not sid:
+            problems.append("anchor span without a w:id — join impossible")
+            continue
+        span_ids[sid] += 1
+    record_ids = {r["docx_id"] for r in records}
+    for rid in sorted(record_ids):
+        if span_ids.get(rid, 0) != 1:
+            problems.append(
+                f"comments.xml entry {rid} has {span_ids.get(rid, 0)} anchor "
+                f"spans in document.xml (need exactly 1)")
+    for sid in sorted(set(span_ids) - record_ids, key=str):
+        problems.append(
+            f"anchor span {sid} has no comments.xml entry")
+    metrics = {
+        "api_anchored_live": len(anchored) - resolved_n,
+        "api_anchored_resolved": resolved_n,
+        "api_thread_entries": sum(api_keys.values()),
+        "docx_comment_entries": len(records),
+        "anchor_spans": len(spans),
+    }
+    return problems, metrics
+
+
+def _named_range_intervals(doc_tab):
+    """All named-range segments as protected intervals [(start, end, name)].
+
+    Named ranges are the machine-owned anchoring mechanism of `mark`/patch
+    targeting; silently destroying one breaks future patch ops. Contract
+    (codex sync-anchors r2 #5): a malformed segment (missing/non-int
+    indices, inverted bounds) while namedRanges exist ⇒ fail closed; each
+    valid segment is protected individually (no min/max across gaps).
+    """
+    out = []
+    for name, entry in (doc_tab.get("namedRanges") or {}).items():
+        nrs = entry.get("namedRanges") if isinstance(entry, dict) else None
+        if not isinstance(nrs, list) or not nrs:
+            _error(
+                f"named range {name!r} has an unrecognized structure — "
+                f"refusing structural edits (fail closed); release the "
+                f"mark or edit in the UI")
+        segments = 0
+        for nr in nrs:
+            ranges = nr.get("ranges") if isinstance(nr, dict) else None
+            if not isinstance(ranges, list):
+                _error(
+                    f"named range {name!r} has an unrecognized structure — "
+                    f"refusing structural edits (fail closed); release the "
+                    f"mark or edit in the UI")
+            for rng in ranges:
+                s = rng.get("startIndex") if isinstance(rng, dict) else None
+                e = rng.get("endIndex") if isinstance(rng, dict) else None
+                if not isinstance(s, int) or not isinstance(e, int) or s >= e:
+                    _error(
+                        f"named range {name!r} has a malformed segment "
+                        f"({s!r}..{e!r}) — refusing structural edits "
+                        f"(fail closed); release the mark or edit in the UI")
+                out.append((s, e, f"named range {name!r}"))
+                segments += 1
+        if not segments:
+            _error(
+                f"named range {name!r} exists but carries no ranges — "
+                f"refusing structural edits (fail closed); release the "
+                f"mark or edit in the UI")
+    return out
+
+
+def _find_protected_overlap(flat, protected):
+    """Check every text-removing request against protected intervals.
+
+    `protected` = [(start, end, label)] — union of comment anchor spans
+    and named-range segments. insertText is allowed (C5 verified);
+    deleteContentRange is checked for ANY overlap (sync removes whole
+    paragraphs, so an overlapping anchor is in practice fully covered —
+    C1: that ghosts the comment; the only reachable partial overlaps are
+    newline edge cases whose deleteContentRange survival semantics are
+    unverified, refused too). Any OTHER request type, or a malformed
+    range, fails closed too — a future text-destroying request type must
+    not slip through silently (codex r2 #6).
+
+    Returns None when everything is provably safe, else a refusal
+    message (the caller cleans up its canary before erroring out).
+    """
+    for req in flat:
+        if "insertText" in req:
+            continue
+        rng = (req.get("deleteContentRange") or {}).get("range")
+        if rng is None or len(req) != 1:
+            return (
+                f"internal: unexpected request type in the text batch "
+                f"({sorted(req.keys())}) — anchor protection cannot prove "
+                f"it safe (fail closed)")
+        s, e = rng.get("startIndex"), rng.get("endIndex")
+        if not isinstance(s, int) or not isinstance(e, int) or s >= e:
+            return (
+                f"internal: malformed deleteContentRange {s!r}..{e!r} in "
+                f"the text batch (fail closed)")
+        for ps, pe, label in protected:
+            if s < pe and ps < e:
+                return (
+                    f"a sync edit would rewrite text carrying {label} "
+                    f"(protected range [{ps}, {pe})) — that would destroy "
+                    f"it (C1). Leave that paragraph unchanged locally and "
+                    f"reply to the comment instead, or edit it in the "
+                    f"Google Docs UI.")
+    return None
+
+
+def _canary_delete_request(canary):
+    return {"deleteContentRange": {"range": {
+        "startIndex": canary["start"], "endIndex": canary["end"]}}}
+
+
+def _cleanup_canary(docs_service, file_id, canary):
+    """Best-effort removal of an orphaned canary paragraph.
+
+    Fresh read → the canary text must occur exactly once → pinned delete
+    of the preceding newline + the canary text (removes the canary
+    paragraph, restores the previous structure). Returns True on success;
+    False on ANY failure — callers then warn the user with the literal
+    canary text (it is self-describing and harmless junk, not data loss).
+    """
+    try:
+        doc = _safe_get_doc(docs_service, file_id)
+        _, doc_tab = _select_tab(doc, tab_id=None)
+        if _count_quote_occurrences(doc_tab, canary["text"]) != 1:
+            return False
+        s, e = _find_quote_in_doctab(doc_tab, canary["text"])
+        docs_service.documents().batchUpdate(
+            documentId=file_id,
+            body={"requests": [{"deleteContentRange": {"range": {
+                      "startIndex": s - 1, "endIndex": e}}}],
+                  "writeControl": _write_control(doc.get("revisionId"))},
+        ).execute()
+        return True
+    except Exception:
+        return False
+
+
+def _canary_present(docs_service, file_id, canary):
+    """Fresh-read probe: True/False, or None when the read itself failed."""
+    try:
+        doc = _safe_get_doc(docs_service, file_id)
+        _, doc_tab = _select_tab(doc, tab_id=None)
+        return _count_quote_occurrences(doc_tab, canary["text"]) > 0
+    except Exception:
+        return None
+
+
+def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
+                           doc_tab, anchored, named_intervals, body_end):
+    """Provably-fresh anchor map for structural edits on a commented doc.
+
+    Export freshness is not provable read-only (files.export takes no
+    revision), so a CANARY paragraph is inserted at the end of the doc,
+    pinned to the planning revision R0; an export that contains the
+    canary was generated after that insert, and a revisionId read equal
+    to R1 (the insert's revision) closes the window from above — the
+    export is exactly R0 + canary. The caller MUST delete the canary as
+    the FIRST request of its final atomic batch (pinned to R1): the
+    canary sits strictly at the doc end, so deleting it first restores
+    R0 coordinates for every other request.
+
+    Returns (snapshot, retry_reason): snapshot is
+    {"anchors", "fp1", "canary", "r1", "metrics"} on success;
+    (None, reason) after cleanup for retryable races. Hard failures
+    clean up the canary and _error (raises PatchOpError in per-op mode).
+    """
+    # a named range reaching the insertion point could be extended by the
+    # canary insert (uncharacterized) — refuse before mutating
+    for ps, pe, label in named_intervals:
+        if pe >= body_end - 1:
+            _error(
+                f"{label} reaches the end of the document — the sync "
+                f"canary cannot be inserted safely; release the mark or "
+                f"edit in the UI")
+    try:
+        fp1 = _comments_fingerprint(drive_service, file_id)
+    except Exception as e:
+        _error(f"comment census failed (nothing applied): "
+               f"{e.reason if hasattr(e, 'reason') else e}")
+
+    canary_text = (f"⚓ skrepka-canary-{uuid.uuid4().hex} {_CANARY_NOTE}")
+    payload = "\n" + canary_text  # own terminal paragraph (codex r3 #1)
+    canary = {"text": canary_text,
+              "start": body_end - 1,
+              "end": body_end - 1 + _utf16_len(payload)}
+    try:
+        resp = docs_service.documents().batchUpdate(
+            documentId=file_id,
+            body={"requests": [{"insertText": {
+                      "location": {"index": body_end - 1},
+                      "text": payload}}],
+                  "writeControl": _write_control(doc.get("revisionId"))},
+        ).execute()
+    except HttpError as e:
+        reason = e.reason if hasattr(e, "reason") else str(e)
+        status = getattr(getattr(e, "resp", None), "status", None)
+        if status is not None and status < 500:
+            # deterministic rejection of the pinned insert: nothing was
+            # inserted — a concurrent edit since the planning read;
+            # retryable for callers that can re-plan
+            return None, f"canary insert rejected (doc changed): {reason}"
+        return _canary_insert_ambiguous(docs_service, file_id, canary,
+                                        reason)
+    except Exception as e:
+        return _canary_insert_ambiguous(docs_service, file_id, canary,
+                                        str(e))
+    def _abort(msg):
+        cleaned = _cleanup_canary(docs_service, file_id, canary)
+        if not cleaned:
+            msg += (f" ВНИМАНИЕ: в конце документа осталась служебная "
+                    f"строка «{canary_text}» — удалите её вручную "
+                    f"(данные не потеряны).")
+        _error(msg)
+
+    # From here on the canary EXISTS in the doc: every exit — including an
+    # unexpected exception (even a structurally odd insert RESPONSE) —
+    # must go through cleanup (codex code-r1 #3, code-r2 #2).
+    try:
+        canary["r1"] = (resp.get("writeControl") or {}).get(
+            "requiredRevisionId")
+        docx_bytes = None
+        for attempt in range(3):
+            try:
+                docx_bytes = drive_service.files().export(
+                    fileId=file_id,
+                    mimeType="application/vnd.openxmlformats-officedocument"
+                             ".wordprocessingml.document").execute()
+            except Exception as e:
+                _abort(f"docx export failed: "
+                       f"{e.reason if hasattr(e, 'reason') else e}")
+            xml = None
+            try:
+                import io
+                import zipfile
+                with zipfile.ZipFile(io.BytesIO(docx_bytes)) as z:
+                    xml = z.read("word/document.xml").decode(
+                        "utf-8", "replace")
+            except Exception as e:
+                _abort(f"malformed docx export: {e}")
+            if canary_text in xml:
+                break
+            docx_bytes = None
+            time.sleep(1)
+        if docx_bytes is None:
+            _abort("export does not contain the freshness canary after 3 "
+                   "attempts — cannot prove the anchor map is current "
+                   "(fail closed)")
+        try:
+            doc_after = docs_service.documents().get(
+                documentId=file_id, fields="revisionId").execute()
+        except Exception as e:
+            _abort(f"revision re-read failed: "
+                   f"{e.reason if hasattr(e, 'reason') else e}")
+        if not canary["r1"] or doc_after.get("revisionId") != canary["r1"]:
+            # retryable — but only after a PROVEN cleanup, or the next
+            # attempt would orphan this canary forever (codex code-r1 #2)
+            if not _cleanup_canary(docs_service, file_id, canary):
+                _error(
+                    f"doc changed while preparing the anchor map, and the "
+                    f"canary cleanup failed. ВНИМАНИЕ: в конце документа "
+                    f"осталась служебная строка «{canary_text}» — удалите "
+                    f"её вручную (данные не потеряны).")
+            return None, "doc changed while preparing the anchor map"
+
+        spans, problems = _parse_docx_anchor_spans(docx_bytes)
+        # the canary paragraph itself carries no anchors and is not part
+        # of the R0 snapshot — it cannot match any R0 paragraph (fresh
+        # uuid), so it never enters the mapping
+        records, rec_problems = _docx_comment_records(docx_bytes)
+        acc_problems, metrics = _account_anchored_comments(
+            anchored, records, spans)
+        anchors, map_problems = _map_anchors_to_doc(doc_tab, spans)
+        all_problems = problems + rec_problems + acc_problems + map_problems
+        if all_problems:
+            _abort(
+                "anchor accounting/mapping failed — paragraph "
+                "replaces/deletes are blocked (fail closed): "
+                + "; ".join(all_problems[:4])
+                + ". Разрулите комментарии-призраки в UI (удалить/"
+                  "переоткрыть тред) или правьте документ в UI.")
+        for as_, ae, _atext, aid in anchors:
+            if as_ < canary["end"] and canary["start"] < ae:
+                _abort(
+                    f"a comment anchor (docx id {aid}) intersects the "
+                    f"canary paragraph — the trailing anchor extended over "
+                    f"the insert (unverified territory, fail closed); edit "
+                    f"in the UI")
+    except (PatchOpError, SystemExit):
+        raise  # _abort/_error already handled cleanup
+    except Exception as e:
+        _abort(f"anchor preflight failed unexpectedly: {e!r}")
+    metrics["canary"] = "confirmed"
+    return ({"anchors": anchors, "fp1": fp1, "canary": canary,
+             "r1": canary["r1"], "metrics": metrics}, None)
+
+
+def _canary_insert_ambiguous(docs_service, file_id, canary, reason):
+    """The canary insert got a 5xx/transport failure: it may or may not
+    have landed. Probe; a present canary is removed before retrying —
+    otherwise the next attempt would orphan it (codex code-r1 #1/#2)."""
+    present = _canary_present(docs_service, file_id, canary)
+    if present is False:
+        return None, f"canary insert did not land ({reason})"
+    if present is True and _cleanup_canary(docs_service, file_id, canary):
+        return None, (f"canary insert landed with a lost response "
+                      f"({reason}) — cleaned up")
+    _error(
+        f"canary insert outcome unknown ({reason}). ВНИМАНИЕ: в конце "
+        f"документа могла остаться служебная строка «{canary['text']}» — "
+        f"проверьте и удалите её вручную (данные не потеряны).")
+
+
 def _comments_fingerprint(drive_service, file_id):
     """Set of (id, deleted, resolved, anchored) for ALL comments, paginated.
     Raises on any error — callers treat that as fail-stop."""
@@ -1438,19 +1867,24 @@ def _resolve_replace_target(op, doc_tab, r):
 
 
 def _execute_replace_all(docs_service, file_id, tid, search_text, new_text,
-                         revision_id, source):
+                         revision_id, source, extra_requests_before=None):
     req = {"replaceAllText": {
         "containsText": {"text": search_text, "matchCase": True},
         "replaceText": new_text,
     }}
     if tid:
         req["replaceAllText"]["tabsCriteria"] = {"tabIds": [tid]}
+    requests = list(extra_requests_before or []) + [req]
     result = docs_service.documents().batchUpdate(
         documentId=file_id,
-        body={"requests": [req], "writeControl": _write_control(revision_id)},
+        body={"requests": requests,
+              "writeControl": _write_control(revision_id)},
     ).execute()
-    occ = (result.get("replies") or [{}])[0].get(
-        "replaceAllText", {}).get("occurrencesChanged", 0)
+    # the reply is located by TYPE, not position: a canary delete prepended
+    # to the batch shifts positional indices (codex sync-anchors r3 #2)
+    occ = next((r.get("replaceAllText", {}) for r in
+                (result.get("replies") or []) if "replaceAllText" in r),
+               {}).get("occurrencesChanged", 0)
     if occ != 1:
         # occ == 0: nothing changed; occ > 1: the doc HAS been modified in
         # multiple places — the report must not invite a blind retry.
@@ -1493,29 +1927,18 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
         ).execute()
         return
 
-    # ---- replace path (W8 sandwich) ----
+    # ---- replace path (W8 mapping + freshness canary, plan v4) ----
     last_reason = "unknown"
     for attempt in range(3):
-        # Everything before the final batch is read-only: an HTTP failure
+        # Everything before the canary insert is read-only: an HTTP failure
         # here means the op was definitely NOT applied (codex W8-r1 P2#5).
         try:
-            fp1 = _comments_fingerprint(drive_service, file_id)
-            doc1 = docs_service.documents().get(
-                documentId=file_id, fields="revisionId").execute()
-            docx_bytes = drive_service.files().export(
-                fileId=file_id,
-                mimeType="application/vnd.openxmlformats-officedocument"
-                         ".wordprocessingml.document").execute()
             doc = _safe_get_doc(docs_service, file_id)
         except Exception as e:
             raise PatchOpError(
                 f"W8 preflight read failed: "
                 f"{e.reason if hasattr(e, 'reason') else e}",
                 state="not_applied")
-        revision_id = doc.get("revisionId")
-        if revision_id != doc1.get("revisionId"):
-            last_reason = "doc changed during export"
-            continue
         if len(_collect_tabs(doc)) > 1:
             # DOCX ranges carry no tab identity (addendum p.6)
             _error("multi-tab document: anchor-mapped replaces are not "
@@ -1524,52 +1947,114 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
         _refuse_on_suggestions(doc_tab)
         r = _resolve_op(op, doc_tab, tid)
         search_text = _resolve_replace_target(op, doc_tab, r)
+        body_content = (doc_tab.get("body", {}) or {}).get("content", [])
+        body_end = body_content[-1]["endIndex"] if body_content else 2
+        named_intervals = _named_range_intervals(doc_tab)
+        _, anchored_now = _census_comments(drive_service, file_id)
 
-        spans, problems = _parse_docx_anchor_spans(docx_bytes)
-        anchors, mproblems = _map_anchors_to_doc(doc_tab, spans)
-        problems += mproblems
-        if problems:
-            _error(
-                f"anchor mapping failed (fail closed, {r['source']}): "
-                + "; ".join(problems[:3])
-            )
-        live_anchored = any(anch and not deleted
-                            for (_id, deleted, _res, anch) in fp1)
-        if live_anchored and not anchors:
-            _error(
-                f"doc has anchored comments in the API but the docx export "
-                f"contains no anchor ranges — cannot prove they are ghosts "
-                f"(C10 pending); replace blocked (fail closed). Use insert "
-                f"ops or edit in the UI."
-            )
-        for as_, ae, atext, aid in anchors:
+        snap, retry_reason = _fresh_anchor_snapshot(
+            docs_service, drive_service, file_id, doc, doc_tab,
+            anchored_now, named_intervals, body_end)
+        if snap is None:
+            last_reason = retry_reason
+            continue
+        canary = snap["canary"]
+
+        def _canary_msg(msg, cleaned):
+            if not cleaned:
+                msg += (f" ВНИМАНИЕ: в конце документа осталась служебная "
+                        f"строка «{canary['text']}» — удалите её вручную "
+                        f"(данные не потеряны).")
+            return msg
+
+        for as_, ae, atext, aid in snap["anchors"]:
+            # full coverage ghosts the comment (C1); PARTIAL overlap is
+            # verified safe for replaceAllText — the anchor shrinks
             if r["start"] <= as_ and ae <= r["end"]:
-                _error(
+                cleaned = _cleanup_canary(docs_service, file_id, canary)
+                _error(_canary_msg(
                     f"replacement fully covers the anchor of a live comment "
                     f"(docx id {aid}, anchored text «{atext[:60]}») — it "
                     f"would ghost the comment (C1). Split into two replaces "
                     f"so at least one ORIGINAL anchor character survives "
                     f"(repeating the same text in the replacement does NOT "
-                    f"help). ({r['source']})"
-                )
+                    f"help). ({r['source']})", cleaned))
         try:
             fp2 = _comments_fingerprint(drive_service, file_id)
         except Exception as e:
-            raise PatchOpError(
+            cleaned = _cleanup_canary(docs_service, file_id, canary)
+            raise PatchOpError(_canary_msg(
                 f"W8 final census failed: "
-                f"{e.reason if hasattr(e, 'reason') else e}",
+                f"{e.reason if hasattr(e, 'reason') else e}", cleaned),
                 state="not_applied")
-        if fp2 != fp1:
+        if fp2 != snap["fp1"]:
+            # retry only after a PROVEN cleanup — otherwise the next
+            # attempt orphans this canary forever (codex code-r1 #2)
+            if not _cleanup_canary(docs_service, file_id, canary):
+                raise PatchOpError(
+                    f"comments changed during mapping and the canary "
+                    f"cleanup failed. ВНИМАНИЕ: в конце документа осталась "
+                    f"служебная строка «{canary['text']}» — удалите её "
+                    f"вручную (данные не потеряны).",
+                    state="not_applied")
             last_reason = "comments changed during mapping"
             continue
-        # no other network calls between the final census and the write
-        _execute_replace_all(docs_service, file_id, tid, search_text,
-                             r["text"], revision_id, r["source"])
+        # no other network calls between the final census and the write;
+        # the batch deletes the canary FIRST (atomic with the replace)
+        try:
+            _execute_replace_all(
+                docs_service, file_id, tid, search_text, r["text"],
+                snap["r1"], r["source"],
+                extra_requests_before=[_canary_delete_request(canary)])
+        except PatchOpError:
+            raise  # occurrence mismatch: batch APPLIED, canary already gone
+        except HttpError as e:
+            reason = e.reason if hasattr(e, "reason") else str(e)
+            status = getattr(getattr(e, "resp", None), "status", None)
+            if status is not None and status < 500:
+                # deterministic rejection of a pinned atomic batch ⇒ the
+                # write did not land (codex sync-anchors r3 #3)
+                cleaned = _cleanup_canary(docs_service, file_id, canary)
+                raise PatchOpError(_canary_msg(
+                    f"anchor-safe replace batch rejected: {reason}",
+                    cleaned), state="not_applied")
+            raise PatchOpError(
+                *_ambiguous_batch_outcome(
+                    docs_service, file_id, canary,
+                    f"anchor-safe replace batch failed: {reason}"))
+        except Exception as e:
+            raise PatchOpError(
+                *_ambiguous_batch_outcome(
+                    docs_service, file_id, canary,
+                    f"anchor-safe replace batch failed (transport): {e}"))
         return
     _error(
         f"anchor-mapped replace kept failing preflight after 3 attempts "
         f"({last_reason}) — the doc is being edited concurrently; retry later"
     )
+
+
+def _ambiguous_batch_outcome(docs_service, file_id, canary, msg):
+    """Classify a timeout/5xx after an atomic batch whose FIRST request
+    deletes the canary. The canary still present ⇒ the batch did not land
+    (atomicity) ⇒ safe to clean up and report not_applied. Canary absent
+    or unreadable ⇒ outcome unknown — its absence alone is NOT proof of
+    full application (a collaborator could have removed the junk line);
+    callers must verify expected state (codex sync-anchors r3 #3).
+    Returns (message, state) for PatchOpError.
+    """
+    present = _canary_present(docs_service, file_id, canary)
+    if present is True:
+        cleaned = _cleanup_canary(docs_service, file_id, canary)
+        note = " (canary intact ⇒ batch not applied)"
+        if not cleaned:
+            note += (f" ВНИМАНИЕ: в конце документа осталась служебная "
+                     f"строка «{canary['text']}» — удалите её вручную.")
+        return msg + note, "not_applied"
+    if present is False:
+        return (msg + " (canary gone ⇒ batch likely applied — verify the "
+                      "doc before retrying)"), "unknown"
+    return msg + " (doc unreadable — outcome unknown)", "unknown"
 
 
 def patch_doc(file_id, ops_path, tab_id=None):
@@ -1944,6 +2429,37 @@ def _prepare_export_html(html):
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup.find_all(["style", "script"]):
         tag.decompose()
+    # Google's comment-export artifacts must not leak into the md: the
+    # Docs API text has no trace of comments, so a md carrying the inline
+    # <sup><a href="#cmntN">[a]</a></sup> markers or the trailing comment
+    # bodies could never round-trip (the sidecar would refuse sync on any
+    # commented doc). The #cmnt/#cmnt_ref anchors are Google's own export
+    # convention — real doc links export as #heading=/#bookmark= ids.
+    def _is_comment_body_p(node):
+        if getattr(node, "name", None) != "p":
+            # bare whitespace between comment paragraphs is fine
+            return isinstance(node, str) and not node.strip()
+        first_a = node.find("a", href=True)
+        return (first_a is not None
+                and re.match(r"^#cmnt_ref\d+$", first_a["href"] or ""))
+
+    for a in soup.find_all("a", href=re.compile(r"^#cmnt_ref\d+$")):
+        if getattr(a, "decomposed", False):
+            continue  # already removed with an earlier container
+        p_tag = a.find_parent("p")
+        target = p_tag if p_tag is not None else a
+        # remove the enclosing <div> ONLY when it holds nothing but
+        # comment bodies — a shared wrapper div must not lose real
+        # content (codex code-r1 #4)
+        div = p_tag.find_parent("div") if p_tag is not None else None
+        if div is not None and all(_is_comment_body_p(ch)
+                                   for ch in div.children):
+            div.decompose()
+        else:
+            target.decompose()
+    for a in soup.find_all("a", href=re.compile(r"^#cmnt\d+$")):
+        sup = a.find_parent("sup")
+        (sup if sup is not None else a).decompose()
     for a in soup.find_all("a", href=True):
         href = a["href"]
         # unwrap (possibly nested) redirect wrappers; parse_qs already
@@ -3159,22 +3675,38 @@ def sync_doc(file_id, md_path, tab_id=None):
         }, ensure_ascii=False))
         return
 
-    # --- gates: commented docs (W8 mapping not yet integrated into sync) ---
+    # --- protected ranges: named ranges + comment anchors (plan v4) ---
     all_comments, anchored = _census_comments(drive_service, file_id)
+    body_content = (doc_tab.get("body", {}) or {}).get("content", [])
+    body_end = body_content[-1]["endIndex"] if body_content else 2
+    # named ranges only guard REMOVALS (plan scope) — an insert/style-only
+    # sync must not trip over a malformed mark it cannot touch
+    named_intervals = (_named_range_intervals(doc_tab)
+                       if (replaced or deleted) else [])
+    snap = None
     if anchored and (replaced or deleted):
-        _error(
-            f"doc has {len(anchored)} anchored comment(s); paragraph "
-            f"replaces/deletes via sync are not yet anchor-mapped — use "
-            f"/gdocs-patch (it has export-based anchor protection) or the "
-            f"UI. Inserts and style-only changes are allowed."
-        )
+        # W8 export-based anchor map with a freshness canary: paragraph
+        # replaces/deletes are allowed as long as they touch no anchor
+        snap, retry_reason = _fresh_anchor_snapshot(
+            docs_service, drive_service, file_id, doc, doc_tab,
+            anchored, named_intervals, body_end)
+        if snap is None:
+            # retryable race, but re-planning is this whole function —
+            # a CLI re-run is the retry (nothing has been applied)
+            _error(f"{retry_reason} — re-run sync (nothing applied)")
+
+    def _canary_note(msg):
+        """Clean up the canary before erroring out of a pre-batch refusal."""
+        if snap is not None and not _cleanup_canary(
+                docs_service, file_id, snap["canary"]):
+            msg += (f" ВНИМАНИЕ: в конце документа осталась служебная "
+                    f"строка «{snap['canary']['text']}» — удалите её "
+                    f"вручную (данные не потеряны).")
+        return msg
 
     # --- map plan to remote positions ---
     def remote_el(i):
         return remote_els[r_map[i]]
-
-    body_content = (doc_tab.get("body", {}) or {}).get("content", [])
-    body_end = body_content[-1]["endIndex"] if body_content else 2
 
     action = {}
     for i, lel in replaced:
@@ -3302,6 +3834,10 @@ def sync_doc(file_id, md_path, tab_id=None):
         },
         "phases": [],
     }
+    if snap is not None:
+        journal["anchor_accounting"] = snap["metrics"]
+    if named_intervals:
+        journal["named_ranges_protected"] = len(named_intervals)
 
     def _fail_partial(reason, extra=None):
         journal["phases"].append({"phase": "failed", "reason": reason,
@@ -3324,29 +3860,109 @@ def sync_doc(file_id, md_path, tab_id=None):
     # --- apply text changes (single atomic batch) ---
     text_requests.sort(key=lambda pair: pair[0], reverse=True)
     flat = [req for _, reqs in text_requests for req in reqs]
-    rev_after_text = revision_id
+    if snap is not None:
+        # the canary delete goes FIRST: the canary sits strictly at the
+        # end of the doc, so removing it first restores R0 coordinates
+        # for every following request (plan v4 §1)
+        flat = [_canary_delete_request(snap["canary"])] + flat
+
+    # --- protected-interval check on the FINAL request list ---
+    protected = list(named_intervals)
+    if snap is not None:
+        protected += [
+            (as_, ae,
+             f"the anchor of a live comment (docx id {aid}, «{atext[:40]}»)")
+            for as_, ae, atext, aid in snap["anchors"]]
+    if flat and protected:
+        overlap = _find_protected_overlap(flat, protected)
+        if overlap:
+            _error(_canary_note(overlap))
+
+    rev_pin = snap["r1"] if snap is not None else revision_id
+    rev_after_text = rev_pin
+    # set when the batch response was lost but the canary is GONE: the
+    # batch most likely applied — positional verification then decides
+    # (plan v4 §3: recovery-as-success after a lost response)
+    outcome_uncertain = False
     if flat:
+        if snap is not None:
+            # comments must not have changed between the accounting census
+            # and the write; no other network calls after this check
+            try:
+                fp2 = _comments_fingerprint(drive_service, file_id)
+            except Exception as e:
+                _error(_canary_note(
+                    f"final comment census failed (nothing applied): "
+                    f"{e.reason if hasattr(e, 'reason') else e}"))
+            if fp2 != snap["fp1"]:
+                _error(_canary_note(
+                    "comments changed while preparing the sync — re-run "
+                    "(nothing applied)"))
         try:
             resp = docs_service.documents().batchUpdate(
                 documentId=file_id,
                 body={"requests": flat,
-                      "writeControl": _write_control(revision_id)},
+                      "writeControl": _write_control(rev_pin)},
             ).execute()
         except HttpError as e:
-            # atomic: nothing applied — plain error, no journal needed
-            _error(
-                f"sync text batch failed (nothing applied — atomic): "
-                f"{e.reason if hasattr(e, 'reason') else e}"
-            )
+            reason = e.reason if hasattr(e, "reason") else str(e)
+            status = getattr(getattr(e, "resp", None), "status", None)
+            if status is None or status >= 500:
+                if snap is not None:
+                    msg, state = _ambiguous_batch_outcome(
+                        docs_service, file_id, snap["canary"],
+                        f"sync text batch failed: {reason}")
+                    if state == "not_applied":
+                        _error(msg)  # proven by the intact canary
+                    journal["phases"].append({"phase": "text-batch",
+                                              "status": "ambiguous",
+                                              "error": reason})
+                    outcome_uncertain = True
+                else:
+                    journal["phases"].append({"phase": "text-batch",
+                                              "status": "unknown",
+                                              "error": reason})
+                    _fail_partial(f"text batch outcome unknown: {reason}")
+            else:
+                # deterministic 4xx on a pinned atomic batch: not applied
+                _error(_canary_note(
+                    f"sync text batch failed (nothing applied — atomic): "
+                    f"{reason}"))
         except Exception as e:
-            # transport failure after send: outcome ambiguous — journal it
-            journal["phases"].append({"phase": "text-batch",
-                                      "status": "unknown", "error": str(e)})
-            _fail_partial(f"text batch outcome unknown (transport): {e}")
-        rev_after_text = (resp.get("writeControl") or {}).get(
-            "requiredRevisionId") or rev_after_text
-        journal["phases"].append({"phase": "text-batch", "status": "ok",
-                                  "requests": len(flat)})
+            # transport failure after send: outcome ambiguous
+            if snap is not None:
+                msg, state = _ambiguous_batch_outcome(
+                    docs_service, file_id, snap["canary"],
+                    f"sync text batch failed (transport): {e}")
+                if state == "not_applied":
+                    _error(msg)  # proven by the intact canary
+                journal["phases"].append({"phase": "text-batch",
+                                          "status": "ambiguous",
+                                          "error": str(e)})
+                outcome_uncertain = True
+            else:
+                journal["phases"].append({"phase": "text-batch",
+                                          "status": "unknown",
+                                          "error": str(e)})
+                _fail_partial(
+                    f"text batch outcome unknown (transport): {e}")
+        if not outcome_uncertain:
+            try:
+                rev_after_text = (resp.get("writeControl") or {}).get(
+                    "requiredRevisionId") or rev_after_text
+            except (AttributeError, TypeError):
+                # structurally odd SUCCESS response: the batch did execute
+                # (same class as the insert-response case, codex code-r2
+                # #2 / code-r3 #1) — the post-batch revision is unknowable,
+                # so positional verification arbitrates, styles skipped
+                journal["phases"].append({"phase": "text-batch",
+                                          "status": "ambiguous",
+                                          "error": "unparseable response"})
+                outcome_uncertain = True
+            else:
+                journal["phases"].append({"phase": "text-batch",
+                                          "status": "ok",
+                                          "requests": len(flat)})
 
     # --- positional verification against the expected merged sequence ---
     try:
@@ -3355,10 +3971,12 @@ def sync_doc(file_id, md_path, tab_id=None):
         _fail_partial(f"cannot re-read doc after text batch: {e}")
     rev2 = doc2.get("revisionId")
     journal["revision_after_text"] = rev2
-    if rev2 != rev_after_text:
+    if rev2 != rev_after_text and not outcome_uncertain:
         # a collaborator edit landed between our text batch and this read;
         # a style-only edit would pass text verification but our style
-        # batch would then overwrite it (codex sync-r2 #3) — fail closed
+        # batch would then overwrite it (codex sync-r2 #3) — fail closed.
+        # In the lost-response case the post-batch revision is unknowable;
+        # the positional verification below is the arbiter instead.
         _fail_partial(
             f"doc revision moved right after the text batch "
             f"({rev_after_text} -> {rev2}) — concurrent edit; styles not "
@@ -3379,27 +3997,46 @@ def sync_doc(file_id, md_path, tab_id=None):
             f"post-apply verification failed: doc diverges from the "
             f"expected merged sequence at element {diverge} "
             f"(len {len(actual)} vs {len(expected)}) — a concurrent edit "
-            f"landed mid-sync",
+            f"landed mid-sync"
+            + (" (and the batch response was lost — verify the doc)"
+               if outcome_uncertain else ""),
             {"diverge_at": diverge})
+    if outcome_uncertain:
+        # lost response, canary gone, and the doc matches the expected
+        # merged sequence exactly — the batch is proven applied
+        rev_after_text = rev2
+        journal["phases"].append({"phase": "text-batch",
+                                  "status": "recovered-after-lost-response",
+                                  "requests": len(flat)})
 
     # --- style pass: positions taken positionally from fresh_els ---
     styled = 0
-    style_reqs = []
-    for k, lel, preserve in style_slots:
-        style_reqs.extend(
-            _style_requests_for_block(lel, fresh_els[k]["start"], preserve))
-        styled += 1
-    if style_reqs:
-        try:
-            docs_service.documents().batchUpdate(
-                documentId=file_id,
-                body={"requests": style_reqs,
-                      "writeControl": _write_control(rev2)},
-            ).execute()
-        except Exception as e:
-            _fail_partial(f"style batch failed: {e}")
-        journal["phases"].append({"phase": "style-batch", "status": "ok",
-                                  "blocks": styled})
+    if outcome_uncertain:
+        # the lost response hides whether a collaborator edited STYLES
+        # between our batch and the re-read (text is positionally proven,
+        # styles are not) — running the style pass could overwrite their
+        # edit (codex code-r2 #1). Skip it and report honestly.
+        journal["phases"].append({"phase": "style-batch",
+                                  "status": "skipped-after-lost-response",
+                                  "blocks": len(style_slots)})
+    else:
+        style_reqs = []
+        for k, lel, preserve in style_slots:
+            style_reqs.extend(
+                _style_requests_for_block(lel, fresh_els[k]["start"],
+                                          preserve))
+            styled += 1
+        if style_reqs:
+            try:
+                docs_service.documents().batchUpdate(
+                    documentId=file_id,
+                    body={"requests": style_reqs,
+                          "writeControl": _write_control(rev2)},
+                ).execute()
+            except Exception as e:
+                _fail_partial(f"style batch failed: {e}")
+            journal["phases"].append({"phase": "style-batch",
+                                      "status": "ok", "blocks": styled})
 
     # --- lifecycle: advance md + sidecar to the merged remote state ---
     advanced, advance_error, recovery = False, None, None
@@ -3463,6 +4100,17 @@ def sync_doc(file_id, md_path, tab_id=None):
         "comments_on_doc": len(all_comments),
         "advanced": advanced,
     }
+    if snap is not None:
+        result["anchor_accounting"] = snap["metrics"]
+    if outcome_uncertain:
+        result["recovered_after_lost_response"] = True
+        if style_slots:
+            result["style_pass_skipped"] = len(style_slots)
+            result["style_note"] = (
+                "ответ текстового батча был потерян; текст доказан "
+                "позиционной проверкой, но стилевой проход пропущен, чтобы "
+                "не затереть возможную параллельную правку — проверьте "
+                "оформление изменённых абзацев в UI")
     if styles_dropped:
         result["inline_styles_dropped"] = styles_dropped
     if recovery:
