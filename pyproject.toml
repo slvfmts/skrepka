@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "skrepka"
+version = "0.9.0.dev0"
+description = "Careful collaborative editing for Google Docs: reply to comments and edit text without ghosting anchors, keep styles alive, three-way-sync local markdown."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Slava Ufimtsev" }]
+keywords = ["google-docs", "comments", "editing", "markdown", "sync", "claude"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business",
+    "Topic :: Text Processing :: Markup :: Markdown",
+]
+dependencies = [
+    "google-api-python-client>=2.100",
+    "google-auth-oauthlib>=1.0",
+    "google-auth-httplib2>=0.1",
+    "beautifulsoup4>=4.12",
+    "markdownify>=0.11",
+    "markdown-it-py>=3.0",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+svg = ["cairosvg>=2.7"]
+dev = ["pytest>=8", "ruff>=0.4"]
+
+[project.scripts]
+skrepka = "skrepka.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/slvfmts/skrepka"
+Issues = "https://github.com/slvfmts/skrepka/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/skrepka"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,29 @@
+# credentials & tokens — never commit
+credentials.json
+token.json
+*.token.json
+.env
+.env.*
+
+# skrepka runtime artifacts
+*.gdocs-base.json
+*.gdocs-sync-journal.json
+*.merged.md
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# os / editors
+.DS_Store
+.idea/
+.vscode/
+
+# generated diagnostics / media sources
+doctor-report*.json
+*.gif.src/
