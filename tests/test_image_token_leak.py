@@ -32,3 +32,43 @@ def test_token_NOT_attached_to_deceptive_hosts(engine):
         "https://169.254.169.254/latest/meta-data",
     ):
         assert not engine._is_google_auth_image_host(url), url
+
+
+def test_no_fetch_for_external_or_private_hosts(engine, monkeypatch):
+    """The SSRF guard must not even ISSUE a request to a non-Google host —
+    predicate-only checks miss the actual network call (codex R3 #2)."""
+    import requests
+    calls = []
+
+    class FakeResp:
+        status_code = 200
+        headers = {"content-type": "image/png"}
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, n):
+            yield b"\x89PNG\r\n\x1a\n"
+
+    def fake_get(url, **kw):
+        calls.append(url)
+        assert kw.get("allow_redirects") is False  # redirects disabled
+        return FakeResp()
+
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    html = (
+        '<img src="http://169.254.169.254/latest/meta-data/">'
+        '<img src="https://google.com.attacker.example/x.png">'
+        '<img src="https://attacker.example/?u=googleusercontent.com">'
+        '<img src="https://lh3.googleusercontent.com/legit.png">'
+    )
+    class C:
+        token = "TESTTOKEN"
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        out, count = engine._download_images_from_html(html, d + "/imgs", C())
+    # only the genuine Google host was fetched
+    assert calls == ["https://lh3.googleusercontent.com/legit.png"]
+    assert "169.254.169.254" not in "".join(calls)
+    assert count == 1

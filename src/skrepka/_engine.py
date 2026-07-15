@@ -2573,8 +2573,18 @@ def _is_google_auth_image_host(url):
         ".googleusercontent.com")
 
 
+_MAX_IMAGE_BYTES = 25 * 1024 * 1024
+
+
 def _download_images_from_html(html, images_dir, creds):
-    """Download images referenced in HTML, save locally, rewrite src to local paths."""
+    """Download images referenced in HTML, save locally, rewrite src to local paths.
+
+    SSRF-safe (codex R3 #2): we ONLY fetch images whose hostname is an exact
+    Google image host — the place a Doc's own images live after export. Any
+    other src (an external/attacker URL, or one pointing at a private/loopback
+    address) is left untouched, never fetched. Redirects are disabled so a
+    Google URL cannot be bounced to an internal address, and the body is
+    size-capped."""
     from bs4 import BeautifulSoup
     import requests as req
 
@@ -2585,27 +2595,36 @@ def _download_images_from_html(html, images_dir, creds):
         src = img.get("src", "")
         if not src:
             continue
+        if not _is_google_auth_image_host(src):
+            # external/unknown host — do not fetch (SSRF vector); keep as-is
+            continue
         count += 1
         ext = ".png"
         fname = f"image_{count:03d}{ext}"
         local_path = os.path.join(images_dir, fname)
         try:
-            headers = {}
-            if _is_google_auth_image_host(src):
-                headers["Authorization"] = f"Bearer {creds.token}"
-            resp = req.get(src, headers=headers, timeout=30)
+            headers = {"Authorization": f"Bearer {creds.token}"}
+            resp = req.get(src, headers=headers, timeout=30,
+                           allow_redirects=False, stream=True)
             resp.raise_for_status()
             ct = resp.headers.get("content-type", "")
+            if not ct.startswith("image/"):
+                raise ValueError(f"not an image (content-type {ct!r})")
             if "jpeg" in ct or "jpg" in ct:
                 ext = ".jpg"
                 fname = f"image_{count:03d}{ext}"
                 local_path = os.path.join(images_dir, fname)
+            body, total = [], 0
+            for chunk in resp.iter_content(65536):
+                total += len(chunk)
+                if total > _MAX_IMAGE_BYTES:
+                    raise ValueError("image exceeds size limit")
+                body.append(chunk)
             with open(local_path, "wb") as f:
-                f.write(resp.content)
+                f.write(b"".join(body))
             img["src"] = os.path.join(os.path.basename(images_dir), fname)
         except Exception as e:
-            _warn(f"Failed to download image {src[:80]}: {e}")
-            img["src"] = src
+            _warn(f"Failed to download image #{count}: {e}")
     return str(soup), count
 
 
