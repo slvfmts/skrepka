@@ -14,14 +14,12 @@ import uuid
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 
-CONFIG_DIR = os.path.expanduser("~/.config/gdocs-uploader")
-CREDENTIALS_FILE = os.path.join(CONFIG_DIR, "credentials.json")
-TOKEN_FILE = os.path.join(CONFIG_DIR, "token.json")
+from skrepka import config
+
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/documents",
@@ -135,22 +133,89 @@ def _emit_json(payload, output=None, summary=None):
 
 
 def get_creds():
-    """Authenticate and return credentials."""
-    creds = None
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+    """Load stored credentials, refreshing when possible.
+
+    Interactive OAuth lives ONLY in `skrepka init` (a single human-run entry
+    point) — normal commands never open a browser or block on consent
+    (plan R2 r1 #6). A present write-ahead commit marker means a prior
+    init/reauth crashed mid-activation, so every reader fails closed here
+    (r3 #3). The token is stored inside an envelope alongside its scope
+    provenance; a refresh rewrites the envelope atomically, preserving
+    provenance (r3 #1).
+    """
+    try:
+        config.require_no_pending_init()
+        env = config.read_token_envelope()
+    except config.PendingInitError as e:
+        _error(str(e))
+    except config.ConfigError as e:
+        _error(str(e))
+    if env is None:
+        hint = ""
+        if config.detect_legacy():
+            hint = (" (found an old gdocs-uploader config; skrepka uses a new "
+                    "location — run init to set it up here)")
+        _error("not signed in — run `skrepka init` first" + hint)
+
+    creds = Credentials.from_authorized_user_info(env["token"], SCOPES)
+    if not creds.valid:
+        if creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                _error(f"could not refresh access — run `skrepka init "
+                       f"--reauth`: {e}")
+            _persist_refreshed_token(creds, env)
         else:
-            if not os.path.exists(CREDENTIALS_FILE):
-                _error(f"credentials not found at {CREDENTIALS_FILE}")
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-        fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(creds.to_json())
+            _error("stored credentials are not usable — run `skrepka init "
+                   "--reauth`")
     return creds
+
+
+def _persist_refreshed_token(creds, env):
+    """Rewrite the token envelope after a refresh, keeping provenance bound
+    to the refresh token (r3 #1).
+
+    Compare-and-swap guard (code-r1 #5): a concurrent `init --reauth` may have
+    replaced the stored grant while we were refreshing; only persist if the
+    on-disk refresh token still matches the one we started from, otherwise our
+    freshly minted access token is for a superseded grant — drop it.
+    """
+    token_dict = json.loads(creds.to_json())
+    final_scopes = None
+    # serialize the compare-and-swap against activation so a concurrent reauth
+    # cannot interleave between the re-read and the write (code-r2 #1)
+    with config.lock():
+        try:
+            config.require_no_pending_init()
+            current = config.read_token_envelope()
+        except config.ConfigError:
+            return  # a reauth is in flight (marker) or the store changed
+        if current is None:
+            return  # the grant was removed while we refreshed — do not revive
+        started = config.refresh_token_hash(env.get("token") or {})
+        on_disk = config.refresh_token_hash(current.get("token") or {})
+        if started != on_disk:
+            return  # superseded by another process's reauth — keep theirs
+        # base provenance on the FRESHEST on-disk copy, not our stale env, so
+        # a concurrent refresh cannot roll back a newer attestation (r3 #3)
+        prov = dict(current.get("provenance") or {})
+        # re-verify granted scopes if the refresh response carried them; an
+        # explicitly EMPTY list must overwrite the old set (code-r1 #7/r2 #9)
+        granted = getattr(creds, "granted_scopes", None)
+        if granted is not None:
+            prov["granted_scopes"] = list(granted)
+        prov["refresh_token_hash"] = config.refresh_token_hash(token_dict)
+        try:
+            config.write_token_envelope(token_dict, prov)
+        except config.ConfigError as e:
+            _error(str(e))
+        final_scopes = prov.get("granted_scopes")
+    # a refresh that returned a REDUCED grant must not be silently usable
+    # (code-r3 #4) — block and direct the user to reauth
+    if final_scopes is not None and not all(s in final_scopes for s in SCOPES):
+        _error("this sign-in no longer grants all the access skrepka needs — "
+               "run `skrepka init --reauth`")
 
 
 def get_drive_service(creds):
