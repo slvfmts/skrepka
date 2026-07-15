@@ -777,3 +777,23 @@ def test_resume_skips_fresh_journal(store, setup_mod, monkeypatch):
     resolved, pending = setup_mod.resume_pending_smoke()
     assert resolved == 0 and pending == 1
     assert deletes == []  # the in-flight file was left alone
+
+
+def test_init_no_credentials_shows_guide(store, setup_mod, monkeypatch, capsys):
+    # a TTY with no --credentials must show the console guide and ask the user
+    # to re-run with the downloaded JSON (guide must be reachable first)
+    class FakeTTY:
+        def isatty(self):
+            return True
+
+        def readline(self):
+            return "\n"
+    monkeypatch.setattr(setup_mod.sys, "stdin", FakeTTY())
+    fake_err = __import__("io").StringIO()
+    fake_err.isatty = lambda: True
+    monkeypatch.setattr(setup_mod.sys, "stderr", fake_err)
+    code = setup_mod.cmd_init([])  # no --credentials
+    assert code == 2
+    assert json.loads(capsys.readouterr().out)["status"] == "needs_credentials"
+    guide = fake_err.getvalue()
+    assert "Desktop app" in guide and "--credentials" in guide

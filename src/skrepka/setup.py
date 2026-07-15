@@ -794,19 +794,25 @@ def cmd_init(argv):
             return 2 if carried_pending else 0
 
         if not args.credentials:
-            raise SetupError(
-                "need_credentials",
-                "pass --credentials PATH pointing at the OAuth Desktop client "
-                "JSON you downloaded from Google Cloud Console")
+            # first-time users have no JSON yet — the whole point of running
+            # init is to be shown HOW to create it. Print the guide and tell
+            # them to re-run with the downloaded file (the guide must be
+            # reachable before you have credentials, not after).
+            _print_console_guide(args.no_browser)
+            print("\nOnce you've downloaded the Desktop-client JSON, run:\n"
+                  "  skrepka init --credentials /path/to/client_secret.json",
+                  file=sys.stderr)
+            emit_json({"action": "init", "status": "needs_credentials"})
+            return 2
+
         raw = _read_credentials_file(args.credentials)
         snapshot = validate_credentials_bytes(raw)
         snapshot_bytes = json.dumps(snapshot, ensure_ascii=False).encode()
 
-        _print_console_guide(args.no_browser)
-        print("When you have the Desktop-client JSON, press Enter to sign in "
-              "with Google…", file=sys.stderr)
-        sys.stdin.readline()
-
+        # credentials supplied ⇒ the user already went through the console
+        # guide — go straight to sign-in
+        print("Signing in with Google — a browser window will open…",
+              file=sys.stderr)
         creds, token_dict, granted = run_oauth(
             snapshot, args.no_browser, reauth=args.reauth)
         provenance = _provenance(snapshot, token_dict, granted)
