@@ -708,7 +708,7 @@ def resume_pending_smoke():
 _CONSOLE = "https://console.cloud.google.com"
 
 
-def _print_console_guide(no_browser):
+def _print_console_guide():
     steps = [
         ("Create or select a Google Cloud project",
          f"{_CONSOLE}/projectcreate"),
@@ -741,14 +741,10 @@ def _print_console_guide(no_browser):
           "avoid that. Either way the browser will warn the app is "
           "\"unverified\"; that is expected for your own client — click "
           "Advanced → Go to … to continue.\n", file=sys.stderr)
-    if not no_browser:
-        import webbrowser
-        for _text, url in steps:
-            try:
-                webbrowser.open(url)
-                break  # open only the first page; the rest are linked above
-            except Exception:
-                pass
+    # We deliberately do NOT open the browser here — running init to read the
+    # steps should not hijack your browser. The only step that opens a browser
+    # is the actual Google sign-in (run_oauth), and even that honours
+    # --no-browser.
 
 
 def cmd_init(argv):
@@ -805,7 +801,7 @@ def cmd_init(argv):
             # init is to be shown HOW to create it. Print the guide and tell
             # them to re-run with the downloaded file (the guide must be
             # reachable before you have credentials, not after).
-            _print_console_guide(args.no_browser)
+            _print_console_guide()
             print("\nOnce you've downloaded the Desktop-client JSON, run:\n"
                   "  skrepka init --credentials /path/to/client_secret.json",
                   file=sys.stderr)
