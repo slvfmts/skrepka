@@ -2553,6 +2553,26 @@ def _prepare_export_html(html):
     return re.sub(r'@import\s+url\([^)]*\)\s*;?', '', out)
 
 
+def _is_google_auth_image_host(url):
+    """True only for an HTTPS URL whose HOSTNAME is an exact Google image host.
+    The OAuth token is attached ONLY to these — a substring test like
+    `"google.com" in src` would leak the Drive token to a URL such as
+    `https://google.com.attacker.example/x` embedded in a downloaded doc
+    (codex R3 #1, token exfiltration)."""
+    from urllib.parse import urlparse
+    try:
+        p = urlparse(url)
+    except ValueError:
+        return False
+    if p.scheme != "https" or p.username or p.password:
+        return False
+    host = (p.hostname or "").lower()
+    if host in ("drive.google.com", "docs.google.com"):
+        return True
+    return host == "googleusercontent.com" or host.endswith(
+        ".googleusercontent.com")
+
+
 def _download_images_from_html(html, images_dir, creds):
     """Download images referenced in HTML, save locally, rewrite src to local paths."""
     from bs4 import BeautifulSoup
@@ -2571,7 +2591,7 @@ def _download_images_from_html(html, images_dir, creds):
         local_path = os.path.join(images_dir, fname)
         try:
             headers = {}
-            if "googleusercontent.com" in src or "google.com" in src:
+            if _is_google_auth_image_host(src):
                 headers["Authorization"] = f"Bearer {creds.token}"
             resp = req.get(src, headers=headers, timeout=30)
             resp.raise_for_status()
