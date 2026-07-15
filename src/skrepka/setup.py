@@ -716,24 +716,31 @@ def _print_console_guide(no_browser):
          f"{_CONSOLE}/apis/library/docs.googleapis.com"),
         ("Enable the Google Drive API",
          f"{_CONSOLE}/apis/library/drive.googleapis.com"),
-        ("Configure the OAuth consent screen (Branding → Audience → Data "
-         "Access → Test users). Pick Internal only if this project belongs "
-         "to a Google Cloud Organization; otherwise External and add "
-         "yourself as a Test user. Under Data Access add BOTH scopes: "
-         "…/auth/drive and …/auth/documents",
+        ("Set up the OAuth consent screen (pick your new project at the top "
+         "first). Two tabs in the left menu:\n"
+         "        • Audience: User type = External (the only choice on a "
+         "personal Gmail account). Leave Publishing status = In production "
+         "(then no Test users are needed and the sign-in won't expire); if "
+         "it shows Testing, either add your own address under Test users or "
+         "click Back to production.\n"
+         "        • Data Access → Add or remove scopes → paste BOTH of these "
+         "into \"Manually add scopes\", then Add to table and Update:\n"
+         "            https://www.googleapis.com/auth/drive\n"
+         "            https://www.googleapis.com/auth/documents",
          f"{_CONSOLE}/auth/overview"),
-        ("Create an OAuth client → Application type = Desktop app → download "
-         "the JSON", f"{_CONSOLE}/auth/clients"),
+        ("Clients tab → Create client → Application type = Desktop app → "
+         "download the JSON", f"{_CONSOLE}/auth/clients"),
     ]
     print("\nFirst-time Google setup (about 15–30 minutes; skrepka cannot do "
           "these steps for you — that would need project-management access it "
           "deliberately never requests):", file=sys.stderr)
     for i, (text, url) in enumerate(steps, 1):
         print(f"  {i}. {text}\n     {url}", file=sys.stderr)
-    print("\nHeads up (External + Testing): Google issues a refresh token "
-          "that expires after 7 days until you publish the app to Production. "
-          "You can just re-run `skrepka init --reauth` when it lapses.\n",
-          file=sys.stderr)
+    print("\nHeads up: in Testing mode Google issues a sign-in that expires "
+          "after 7 days — keep the app In production (the usual default) to "
+          "avoid that. Either way the browser will warn the app is "
+          "\"unverified\"; that is expected for your own client — click "
+          "Advanced → Go to … to continue.\n", file=sys.stderr)
     if not no_browser:
         import webbrowser
         for _text, url in steps:
