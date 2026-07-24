@@ -1,6 +1,6 @@
 # skrepka 📎
 
-**Careful collaborative editing for Google Docs.** Reply to your client's comments and edit the text — without turning their comments into ghosts, without flattening styles, and with three-way sync between local markdown and the live document.
+**Careful collaborative editing for Google Docs.** Reply to your client's comments and edit the text — without turning their comments into ghosts and without flattening styles.
 
 > Status: 0.9 pre-release. The engine has passed multi-round cross-model code review and live characterization testing against the real Google Docs API; packaging, onboarding wizard, and docs are in progress. Not yet published to PyPI.
 
@@ -18,8 +18,10 @@ skrepka encodes the empirically verified safe paths (see `docs/FINDINGS.md`) beh
 
 - `skrepka comments / reply` — read and answer comments from the CLI (or via the Claude Code plugin).
 - `skrepka patch` — surgical text edits that keep live comment anchors alive (docx-export anchor mapping; full-coverage replacements are refused).
-- `skrepka download / sync` — download the doc as markdown with a merge base, edit locally, sync back: only changed paragraphs are touched, collaborator edits are conflict-checked (including style-only edits).
+- `skrepka download` — export the doc as markdown for local reading or editing.
 - `skrepka upload / update` — create docs from markdown; destructive full updates are blocked when the doc has comments, unless explicitly acknowledged (with automatic backup).
+
+> Local-markdown → doc round-trip (`sync`) ships as **experimental** in 0.9 and is not part of the supported workflow yet.
 
 ## Install (pre-release)
 
