@@ -1,37 +1,74 @@
 # skrepka 📎
 
-**Careful collaborative editing for Google Docs.** Reply to your client's comments and edit the text — without turning their comments into ghosts and without flattening styles.
+**Аккуратная совместная правка Google Документов.** Отвечайте на комментарии
+заказчика и правьте текст — не превращая его комментарии в «призраков» и не сплющивая
+оформление.
 
-> Status: 0.9 pre-release. The engine has passed multi-round cross-model code review and live characterization testing against the real Google Docs API; packaging, onboarding wizard, and docs are in progress. Not yet published to PyPI.
+*[In English](README.en.md) · [Приватность](PRIVACY.md) · [Безопасность](SECURITY.md)*
 
-## Why
+> **Статус: предрелиз 0.9.** Движок прошёл многораундовое кросс-модельное ревью кода и
+> живую характеризацию на настоящем Google Docs API. Упаковка, мастер настройки и
+> документация — в работе. В PyPI пока не опубликовано.
 
-Editing a Google Doc programmatically is easy. Editing it **without destroying the conversation** is not:
+## Зачем
 
-- a full re-upload turns every comment into an invisible ghost (alive in the API, gone from the UI);
-- deleting a text range that overlaps a comment anchor corrupts the text;
-- a replacement that fully covers an anchor silently kills the comment thread.
+Программно поменять Google Документ — легко. Поменять его, **не разрушив разговор в
+комментариях**, — нет:
 
-skrepka encodes the empirically verified safe paths (see `docs/FINDINGS.md`) behind fail-closed guards: operations that would lose someone's work are refused with an explanation, not «forced».
+- полная перезагрузка документа превращает каждый комментарий в невидимого призрака
+  (жив в API, исчез из интерфейса);
+- удаление куска текста, пересекающего якорь комментария, портит текст;
+- замена, полностью накрывающая якорь, молча убивает тред.
 
-## What it does
+skrepka зашивает эмпирически проверенные безопасные пути (см. [docs/FINDINGS.md](docs/FINDINGS.md))
+за fail-closed предохранители: операцию, которая потеряла бы чью-то работу, она
+**отклоняет с объяснением**, а не продавливает.
 
-- `skrepka comments / reply` — read and answer comments from the CLI (or via the Claude Code plugin).
-- `skrepka patch` — surgical text edits that keep live comment anchors alive (docx-export anchor mapping; full-coverage replacements are refused).
-- `skrepka download` — export the doc as markdown for local reading or editing.
-- `skrepka upload / update` — create docs from markdown; destructive full updates are blocked when the doc has comments, unless explicitly acknowledged (with automatic backup).
+## Для кого
 
-> Local-markdown → doc round-trip (`sync`) ships as **experimental** in 0.9 and is not part of the supported workflow yet.
+Для редакторов, копирайтеров и контент-менеджеров, которые ведут документы вместе с
+заказчиками в Google Docs и работают через ИИ-агента (Claude Code, Codex). Не нужно
+быть разработчиком: вся сложность спрятана в мастер `skrepka init`.
 
-## Install (pre-release)
+## Что умеет
+
+Основной сценарий 0.9 — **«разобрать комментарии заказчика и поправить текст на месте»**:
+
+- `skrepka comments` / `reply` — читать и отвечать на комментарии из CLI (ими же
+  пользуется ИИ-агент). Резолвит треды только человек, не агент.
+- `skrepka patch` — точечные правки текста, сохраняющие живые якоря комментариев
+  (полное накрытие якоря отклоняется — с подсказкой, как переписать).
+- `skrepka download` — выгрузить документ в markdown для чтения или локальной правки.
+- `skrepka upload` / `update` — создавать документы из markdown; деструктивные полные
+  обновления блокируются, если в документе есть комментарии (пока вы явно это не
+  подтвердите — с автоматическим бэкапом).
+
+> Локальный цикл markdown → документ (`sync`) в 0.9 идёт как **экспериментальный** и
+> пока не входит в поддержанный сценарий. См. [docs/LIMITATIONS.md](docs/LIMITATIONS.md).
+
+## Установка (предрелиз)
 
 ```bash
-pipx install skrepka   # after first PyPI release
-skrepka init           # guided Google authorization (15–30 min first time)
+pipx install skrepka   # после первого релиза в PyPI
+skrepka init           # мастер авторизации в Google (первый раз — 15–30 минут)
+skrepka doctor         # диагностика: креды, токен, scope, доступ к API
 ```
 
-Docs: `docs/QUICKSTART.md` (авторизация по шагам), `docs/LIMITATIONS.md`, `PRIVACY.md`, `SECURITY.md` — in progress.
+`skrepka init` — интерактивный мастер: показывает шаги с прямыми ссылками на нужные
+страницы Google Cloud Console, проверяет результат через API и в конце делает
+smoke-тест. Пошагово — в [docs/QUICKSTART.md](docs/QUICKSTART.md).
 
-## License
+Почему нужно заводить собственный проект Google (а не «просто войти») и что это значит
+для ваших данных — честно расписано в [PRIVACY.md](PRIVACY.md).
+
+## Документация
+
+- [docs/QUICKSTART.md](docs/QUICKSTART.md) — авторизация в Google по шагам.
+- [docs/LIMITATIONS.md](docs/LIMITATIONS.md) — что 0.9 осознанно не делает.
+- [PRIVACY.md](PRIVACY.md) — какие данные и куда уходят.
+- [SECURITY.md](SECURITY.md) — модель угроз, защиты, как сообщить об уязвимости.
+- [docs/FINDINGS.md](docs/FINDINGS.md) — как на самом деле ведёт себя Docs API с комментариями.
+
+## Лицензия
 
 MIT
