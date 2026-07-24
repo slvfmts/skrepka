@@ -719,10 +719,10 @@ def _print_console_guide():
         ("Set up the OAuth consent screen (pick your new project at the top "
          "first). Two tabs in the left menu:\n"
          "        • Audience: User type = External (the only choice on a "
-         "personal Gmail account). Leave Publishing status = In production "
-         "(then no Test users are needed and the sign-in won't expire); if "
-         "it shows Testing, either add your own address under Test users or "
-         "click Back to production.\n"
+         "personal Gmail account). Set Publishing status = In production "
+         "(then no Test users are needed and the sign-in won't expire). A new "
+         "app often starts in Testing — click Publish app; otherwise either "
+         "add your own address under Test users or click Back to production.\n"
          "        • Data Access → Add or remove scopes → paste this scope "
          "into \"Manually add scopes\", then Add to table and Update:\n"
          "            https://www.googleapis.com/auth/drive",
@@ -736,8 +736,8 @@ def _print_console_guide():
     for i, (text, url) in enumerate(steps, 1):
         print(f"  {i}. {text}\n     {url}", file=sys.stderr)
     print("\nHeads up: in Testing mode Google issues a sign-in that expires "
-          "after 7 days — keep the app In production (the usual default) to "
-          "avoid that. Either way the browser will warn the app is "
+          "after 7 days — publish the app (In production) to avoid that. "
+          "Either way the browser will warn the app is "
           "\"unverified\"; that is expected for your own client — click "
           "Advanced → Go to … to continue.\n", file=sys.stderr)
     # We deliberately do NOT open the browser here — running init to read the

@@ -1,5 +1,6 @@
 # credentials & tokens — never commit
 credentials.json
+client_secret_*.json
 token.json
 *.token.json
 .env

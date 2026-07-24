@@ -11,8 +11,10 @@ Safety:
     endpoint — never in a URL, a log line, or an exception message. Redirects
     are disabled so a 3xx cannot carry the token to another origin.
   * `revoke` and `forget` are destructive; run non-interactively they REFUSE
-    unless `--yes` is passed, so an agent cannot silently revoke a grant or wipe
-    a user's data.
+    unless `--yes` is passed, so a stray non-interactive call cannot wipe data
+    by accident. `--yes` is a deliberate human action; agents are contractually
+    forbidden from invoking these (see agents/CONTRACT.md). This is a
+    cooperative boundary, not a mechanical block on a determined caller.
   * `revoke` treats only an unambiguous success (HTTP 200, or 400 invalid_token
     = already dead) as revoked; any ambiguous outcome KEEPS the local token.
   * Exactly one JSON object goes to stdout; narration goes to stderr.

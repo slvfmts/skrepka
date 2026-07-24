@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ruff==0.16.0
+      - run: ruff check src/ tests/
+
+  leaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # gitleaks scans the whole history below
+      # Run the CLI directly, not gitleaks-action: the action scans only the
+      # event's commit range (and needs GITHUB_TOKEN), whereas `gitleaks git`
+      # scans the entire history — the invariant SECURITY.md actually promises.
+      - name: gitleaks (full history)
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.0/gitleaks_8.30.0_linux_x64.tar.gz \
+            | tar -xz gitleaks
+          ./gitleaks git --redact --no-banner .
+
+  test:
+    name: pytest (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux 3.11 + 3.13 bracket the supported range; one macOS job (3.12)
+        # exercises the Unix-specific symlink/O_NOFOLLOW paths in safeio on the
+        # platform skrepka is developed on. Every runner ships a working
+        # pyexpat, so the docx/sync anchor tests run here (they cannot on the
+        # local broken-pyexpat Python).
+        include:
+          - os: ubuntu-latest
+            python: "3.11"
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: macos-latest
+            python: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # The optional `svg` extra (cairosvg) needs system libcairo and is not
+      # exercised by the offline suite, so keep it out of CI.
+      - run: pip install -e ".[dev]"
+      - run: python -m pytest -q
+
+  build:
+    name: build + metadata check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install build twine
+      - run: python -m build
+      # twine check validates the long-description/metadata PyPI will render.
+      - run: twine check dist/*
+      # Guard the sdist allowlist: the private working context must never ship.
+      # A tarfile walk fails CLOSED (a broken tar or a missing sdist errors);
+      # the old `tar | grep -q` passed silently if tar itself failed.
+      - name: assert sdist excludes private paths
+        run: |
+          python - <<'PY'
+          import glob, sys, tarfile
+          sd = glob.glob("dist/*.tar.gz")
+          if len(sd) != 1:
+              sys.exit(f"expected exactly one sdist, got {sd}")
+          with tarfile.open(sd[0]) as t:
+              bad = [m.name for m in t.getmembers()
+                     if any(p in m.name for p in ("/internal/", "/venv/", "/.venv/"))]
+          if bad:
+              sys.exit(f"private paths leaked into sdist: {bad}")
+          print("sdist guard OK:", sd[0])
+          PY

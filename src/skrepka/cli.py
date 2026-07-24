@@ -15,6 +15,40 @@ _INSTALL_HINT = (
     "skrepka is not fully installed (missing dependencies) — reinstall with "
     "`pipx install skrepka` or `uv tool install skrepka`")
 
+# Curated top-level help. The engine and the setup/privacy modules each own
+# their own argparse, so no single parser lists every command; without this,
+# `skrepka --help` would hide `init` — the first command a new user needs.
+_TOP_HELP = """skrepka — careful collaborative editing for Google Docs.
+
+Setup:
+  init         Guided Google authorization (run this first)
+  doctor       Diagnose credentials, token, scopes, and API access
+
+Comments & edits:
+  comments     List comments on a doc
+  reply        Post a reply to a comment
+  resolve      Resolve a comment thread (asks for confirmation)
+  comment      Create a document-level comment
+  patch        Apply anchor-safe text edits (keeps comment anchors alive)
+  mark         Create a named range around a text fragment
+  suggestions  List suggestions on a doc
+
+Documents:
+  upload       Create a Google Doc from a .md file
+  download     Export a Google Doc as markdown
+  update       Update an existing Google Doc
+  upload-file  Upload file(s) as-is (no Google Doc conversion)
+  sync         Three-way merge a local .md into a doc (experimental)
+
+Data & privacy:
+  logout       Remove the local token (keeps your OAuth client)
+  revoke       Revoke the token with Google, then remove it locally
+  forget       Remove the local token/credentials/journals (and, with
+               --sidecars PATH, a document's sidecar)
+
+Run `skrepka <command> --help` for details on a command.
+"""
+
 
 def _bootstrap_error(msg):
     sys.stdout.write(json.dumps({"error": msg}) + "\n")
@@ -24,6 +58,13 @@ def _bootstrap_error(msg):
 def main():
     argv = sys.argv[1:]
     cmd = argv[0] if argv else None
+
+    # Bare `skrepka`, or a lone help request, prints the curated overview and
+    # exits 0. `help <cmd>` / `-h <extra>` are NOT swallowed here: they fall
+    # through so an unknown top-level token still fails loudly.
+    if not argv or argv in (["-h"], ["--help"], ["help"]):
+        sys.stdout.write(_TOP_HELP)
+        sys.exit(0)
 
     if cmd == "init":
         try:

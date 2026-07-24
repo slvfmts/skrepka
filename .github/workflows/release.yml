@@ -1,0 +1,94 @@
+name: Release to PyPI
+
+# Publishes on an annotated version tag, e.g. `git tag -a v0.9.0 -m 0.9.0 && git push --tags`.
+# The tag name (minus the leading `v`) MUST equal skrepka.__version__ / the
+# pyproject version, or the run fails before building.
+#
+# ONE-TIME SETUP (maintainer, on the PyPI side — no secrets stored in the repo):
+#   The `skrepka` project does not exist on PyPI yet, so you cannot use a
+#   project-scoped publisher. Configure a PENDING publisher on your ACCOUNT's
+#   publishing page (PyPI → Your account → Publishing → Add a pending publisher):
+#     PyPI project name: skrepka
+#     owner: slvfmts   repo: skrepka
+#     workflow: release.yml   environment: pypi
+#   PyPI creates the project on the first successful OIDC upload. After that the
+#   pending publisher becomes a normal project publisher.
+#   Also enable 2FA on the account and create a GitHub environment named `pypi`
+#   (Settings → Environments).
+#   Docs: https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: validate + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history for the leak scan and tag inspection
+      - name: reject lightweight tags
+        run: |
+          if [ "$(git cat-file -t "$GITHUB_REF_NAME")" != "tag" ]; then
+            echo "::error::$GITHUB_REF_NAME is a lightweight tag; use an annotated tag (git tag -a)"; exit 1
+          fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e ".[dev]" build twine ruff==0.16.0
+      - name: tag must match the built package version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          # importlib.metadata reflects the version the wheel/sdist actually
+          # carry (resolved from pyproject/__init__), so a drift in either source
+          # is caught, not just the __init__ string.
+          VER="$(python -c 'import importlib.metadata as m; print(m.version("skrepka"))')"
+          if [ "$TAG" != "$VER" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match built version ($VER)"; exit 1
+          fi
+      - run: ruff check src/ tests/
+      - run: python -m pytest -q
+      - run: python -m build
+      - run: twine check dist/*
+      - name: assert sdist excludes private paths
+        run: |
+          python - <<'PY'
+          import glob, sys, tarfile
+          sd = glob.glob("dist/*.tar.gz")
+          if len(sd) != 1:
+              sys.exit(f"expected exactly one sdist, got {sd}")
+          with tarfile.open(sd[0]) as t:
+              bad = [m.name for m in t.getmembers()
+                     if any(p in m.name for p in ("/internal/", "/venv/", "/.venv/"))]
+          if bad:
+              sys.exit(f"private paths leaked into sdist: {bad}")
+          print("sdist guard OK:", sd[0])
+          PY
+      - name: gitleaks (full history)
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.0/gitleaks_8.30.0_linux_x64.tar.gz \
+            | tar -xz gitleaks
+          ./gitleaks git --redact --no-banner .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: publish to PyPI
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # OIDC token for Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

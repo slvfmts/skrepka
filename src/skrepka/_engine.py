@@ -100,7 +100,7 @@ def _require_human(operation):
     normally non-interactive, so requiring a TTY confirmation stops the
     accidental/default agent path before any API call. It is NOT a
     security boundary: an agent could set the env var or allocate a PTY —
-    forbidding that is the agent contract's job (skills/CONTRACT.md), and
+    forbidding that is the agent contract's job (agents/CONTRACT.md), and
     an agent holding the OAuth token could bypass this CLI entirely.
     A human running non-interactively (their own scripts/CI) can
     pre-authorize with SKREPKA_ASSUME_HUMAN=1.
@@ -3641,7 +3641,7 @@ def sync_doc(file_id, md_path, tab_id=None):
     tabs = _collect_tabs(doc)
     if len(tabs) > 1:
         _error("multi-tab document: sync v1 is single-tab only")
-    tid, doc_tab = tabs[0][0], tabs[0][2]
+    _tid, doc_tab = tabs[0][0], tabs[0][2]
     _refuse_on_suggestions(doc_tab)
     remote_els = _doc_elements(doc_tab)
 
