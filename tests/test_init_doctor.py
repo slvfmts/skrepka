@@ -229,6 +229,15 @@ def _flag_credentials(flag):
 
 # --- scope provenance from token response (r2 #2, r3 #1) ---
 
+def test_scopes_is_drive_only_least_privilege():
+    # R3 least-privilege policy: `drive` alone authorizes every call skrepka
+    # makes, so `documents` was dropped and must not creep back. This is a
+    # literal guard — a widened request (e.g. re-adding documents) fails here
+    # rather than silently expanding what users are asked to grant (code-r4 #3).
+    from skrepka._engine import SCOPES
+    assert SCOPES == ["https://www.googleapis.com/auth/drive"]
+
+
 def test_run_oauth_reads_granted_scope_field(setup_mod, monkeypatch):
     from skrepka._engine import SCOPES
 
@@ -256,13 +265,13 @@ def test_run_oauth_reads_granted_scope_field(setup_mod, monkeypatch):
 
 
 def test_run_oauth_partial_consent_refused(setup_mod, monkeypatch):
-    from skrepka._engine import SCOPES
-
     class FakeFlow:
         credentials = type("C", (), {
             "refresh_token": "rt",
             "to_json": lambda self: json.dumps({"refresh_token": "rt"})})()
-        oauth2session = type("S", (), {"token": {"scope": SCOPES[0]}})()
+        # server granted an empty/unrelated scope set — a required scope is
+        # missing regardless of how many scopes skrepka requests
+        oauth2session = type("S", (), {"token": {"scope": ""}})()
 
         def run_local_server(self, **kw):
             return self.credentials
@@ -618,7 +627,7 @@ def test_persist_refresh_blocks_reduced_scope(store, capsys):
         {"granted_scopes": list(engine.SCOPES)})
 
     class Creds:
-        granted_scopes = [engine.SCOPES[0]]  # refresh returned a REDUCED grant
+        granted_scopes = []  # refresh returned a REDUCED grant (missing a required scope)
 
         def to_json(self):
             return json.dumps({"refresh_token": "RT", "token": "fresh_at"})
@@ -628,6 +637,9 @@ def test_persist_refresh_blocks_reduced_scope(store, capsys):
     with pytest.raises(SystemExit):
         engine._persist_refreshed_token(Creds(), started)
     assert "--reauth" in json.loads(capsys.readouterr().out)["error"]
+    # the reduced token must NOT have been persisted — otherwise the next run
+    # loads "fresh_at" as a valid token and skips this gate entirely (code-r4 #1)
+    assert store.read_token_envelope()["token"]["token"] == "old_at"
 
 
 def test_reconcile_removes_orphan_token(store, setup_mod):

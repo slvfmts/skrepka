@@ -27,6 +27,10 @@ TOKEN_NAME = "token.json"          # holds the envelope (token + provenance)
 MARKER_NAME = "commit.pending"     # write-ahead marker; barrier for readers
 JOURNAL_PREFIX = "smoke-"          # per-nonce cleanup journals
 
+# Suffix of the merge-base sidecar written next to a downloaded markdown file
+# (single source of truth, shared by the engine and the `forget` command).
+SIDECAR_SUFFIX = ".gdocs-base.json"
+
 _MAX_SECRET_BYTES = 256 * 1024     # credentials/token are a few KB; cap hard
 
 

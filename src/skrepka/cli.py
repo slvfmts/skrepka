@@ -45,6 +45,16 @@ def main():
             _bootstrap_error(_INSTALL_HINT)
         sys.exit(setup.doctor_main(argv[1:]))
 
+    if cmd in ("logout", "revoke", "forget"):
+        try:
+            from skrepka import privacy
+        except ImportError:
+            _bootstrap_error(_INSTALL_HINT)
+        entry = {"logout": privacy.logout_main,
+                 "revoke": privacy.revoke_main,
+                 "forget": privacy.forget_main}[cmd]
+        sys.exit(entry(argv[1:]))
+
     try:
         from skrepka._engine import main as engine_main
     except ImportError:

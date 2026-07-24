@@ -18,11 +18,18 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 
-from skrepka import config
+from skrepka import config, safeio
 
 SCOPES = [
+    # `drive` alone authorizes every call skrepka makes. Docs documents.get and
+    # documents.batchUpdate list `drive` as an accepted scope; the Drive
+    # comments/replies/permissions endpoints REQUIRE a Drive scope and do NOT
+    # accept the narrower `documents` scope at all. So `documents` grants
+    # nothing skrepka uses — least privilege keeps this to a single scope
+    # (verified against Google docs + cross-model review, 2026-07-20). Do not
+    # re-add `documents`. `drive.file` is not an option either: it only reaches
+    # app-created or user-picked files, never arbitrary docs opened by ID/URL.
     "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/documents",
 ]
 
 # Light indigo background for :::highlight blocks (#EEF2FF)
@@ -123,9 +130,11 @@ def _emit_json(payload, output=None, summary=None):
     if not output:
         print(text)
         return
-    with open(output, "w", encoding="utf-8") as f:
-        f.write(text + "\n")
-    receipt = {"written": os.path.abspath(output),
+    # hardened write: refuse a symlinked target or any symlinked parent
+    # component, atomic replace (safeio, r3 #9) — an --output path the agent
+    # was handed must never overwrite an unrelated file through a symlink
+    written_path = safeio.atomic_write(output, text + "\n")
+    receipt = {"written": written_path,
                "bytes": len(text.encode("utf-8")) + 1}
     if summary:
         receipt.update(summary)
@@ -182,7 +191,7 @@ def _persist_refreshed_token(creds, env):
     freshly minted access token is for a superseded grant — drop it.
     """
     token_dict = json.loads(creds.to_json())
-    final_scopes = None
+    reduced = False
     # serialize the compare-and-swap against activation so a concurrent reauth
     # cannot interleave between the re-read and the write (code-r2 #1)
     with config.lock():
@@ -206,14 +215,21 @@ def _persist_refreshed_token(creds, env):
         if granted is not None:
             prov["granted_scopes"] = list(granted)
         prov["refresh_token_hash"] = config.refresh_token_hash(token_dict)
-        try:
-            config.write_token_envelope(token_dict, prov)
-        except config.ConfigError as e:
-            _error(str(e))
         final_scopes = prov.get("granted_scopes")
-    # a refresh that returned a REDUCED grant must not be silently usable
-    # (code-r3 #4) — block and direct the user to reauth
-    if final_scopes is not None and not all(s in final_scopes for s in SCOPES):
+        # a refresh that returned a REDUCED grant must NEVER be persisted
+        # (code-r4 #1): if we wrote it, the next invocation would load the
+        # fresh access token as `valid` and return it from get_creds without
+        # re-checking scopes — silently accepting a reduced grant. Skip the
+        # write and leave the old (now-expired) token on disk so every run
+        # re-refreshes and fails closed here until the user reauths (code-r3 #4).
+        if final_scopes is not None and not all(s in final_scopes for s in SCOPES):
+            reduced = True
+        else:
+            try:
+                config.write_token_envelope(token_dict, prov)
+            except config.ConfigError as e:
+                _error(str(e))
+    if reduced:
         _error("this sign-in no longer grants all the access skrepka needs — "
                "run `skrepka init --reauth`")
 
@@ -2589,42 +2605,47 @@ def _download_images_from_html(html, images_dir, creds):
     import requests as req
 
     soup = BeautifulSoup(html, "html.parser")
-    os.makedirs(images_dir, exist_ok=True)
+    # open the images dir once via a symlink-refusing traversal (created 0700
+    # if missing); every image is written relative to this verified dir fd, so
+    # neither the dir nor a predictable filename can be a symlink we follow
+    # (safeio, r3 #9)
+    dir_fd = safeio.secure_open_parent(os.path.join(images_dir, "img"),
+                                       create=True)
     count = 0
-    for img in soup.find_all("img"):
-        src = img.get("src", "")
-        if not src:
-            continue
-        if not _is_google_auth_image_host(src):
-            # external/unknown host — do not fetch (SSRF vector); keep as-is
-            continue
-        count += 1
-        ext = ".png"
-        fname = f"image_{count:03d}{ext}"
-        local_path = os.path.join(images_dir, fname)
-        try:
-            headers = {"Authorization": f"Bearer {creds.token}"}
-            resp = req.get(src, headers=headers, timeout=30,
-                           allow_redirects=False, stream=True)
-            resp.raise_for_status()
-            ct = resp.headers.get("content-type", "")
-            if not ct.startswith("image/"):
-                raise ValueError(f"not an image (content-type {ct!r})")
-            if "jpeg" in ct or "jpg" in ct:
-                ext = ".jpg"
-                fname = f"image_{count:03d}{ext}"
-                local_path = os.path.join(images_dir, fname)
-            body, total = [], 0
-            for chunk in resp.iter_content(65536):
-                total += len(chunk)
-                if total > _MAX_IMAGE_BYTES:
-                    raise ValueError("image exceeds size limit")
-                body.append(chunk)
-            with open(local_path, "wb") as f:
-                f.write(b"".join(body))
-            img["src"] = os.path.join(os.path.basename(images_dir), fname)
-        except Exception as e:
-            _warn(f"Failed to download image #{count}: {e}")
+    try:
+        for img in soup.find_all("img"):
+            src = img.get("src", "")
+            if not src:
+                continue
+            if not _is_google_auth_image_host(src):
+                # external/unknown host — do not fetch (SSRF vector); keep as-is
+                continue
+            count += 1
+            ext = ".png"
+            fname = f"image_{count:03d}{ext}"
+            try:
+                headers = {"Authorization": f"Bearer {creds.token}"}
+                resp = req.get(src, headers=headers, timeout=30,
+                               allow_redirects=False, stream=True)
+                resp.raise_for_status()
+                ct = resp.headers.get("content-type", "")
+                if not ct.startswith("image/"):
+                    raise ValueError(f"not an image (content-type {ct!r})")
+                if "jpeg" in ct or "jpg" in ct:
+                    ext = ".jpg"
+                    fname = f"image_{count:03d}{ext}"
+                body, total = [], 0
+                for chunk in resp.iter_content(65536):
+                    total += len(chunk)
+                    if total > _MAX_IMAGE_BYTES:
+                        raise ValueError("image exceeds size limit")
+                    body.append(chunk)
+                safeio.write_at(dir_fd, fname, b"".join(body))
+                img["src"] = os.path.join(os.path.basename(images_dir), fname)
+            except Exception as e:
+                _warn(f"Failed to download image #{count}: {e}")
+    finally:
+        os.close(dir_fd)
     return str(soup), count
 
 
@@ -2688,8 +2709,7 @@ def download_doc(file_id, fmt="md", output=None, images_dir=None):
         # normalize NBSP that Google's HTML export injects for plain spaces
         text = re.sub(r'\n{3,}', '\n\n', text)
         text = text.lstrip('\n').replace(" ", " ")
-        with open(output, "w", encoding="utf-8") as f:
-            f.write(text)
+        safeio.atomic_write(output, text)  # symlink-safe (r3 #9)
         result = {"file": output, "format": "md", "title": doc_name, "images": img_count}
         if img_count:
             result["images_dir"] = images_dir
@@ -2709,8 +2729,7 @@ def download_doc(file_id, fmt="md", output=None, images_dir=None):
         except HttpError as e:
             _error(f"export failed: {e.reason if hasattr(e, 'reason') else e}")
         content = data if isinstance(data, bytes) else data.encode("utf-8")
-        with open(output, "wb") as f:
-            f.write(content)
+        safeio.atomic_write(output, content)  # symlink-safe (r3 #9)
         result = {"file": output, "format": fmt, "title": doc_name}
 
     print(json.dumps(result, ensure_ascii=False))
@@ -2823,7 +2842,7 @@ def list_suggestions(file_id, output=None):
 # ---------------------------------------------------------------------------
 
 SIDECAR_SCHEMA_VERSION = 2
-SIDECAR_SUFFIX = ".gdocs-base.json"
+SIDECAR_SUFFIX = config.SIDECAR_SUFFIX  # single source of truth (shared w/ forget)
 
 # Heading namedStyleType <-> markdown level
 _HEADING_STYLES = {f"HEADING_{i}": i for i in range(1, 7)}
@@ -2981,12 +3000,11 @@ def _opaque_hash(el):
 
 
 def _write_journal(md_path, journal):
-    """Atomically write the sync recovery journal; returns its path."""
+    """Atomically write the sync recovery journal; returns its path. Symlink-safe
+    via safeio (the predictable `.gdocs-sync-journal.json.tmp` was an overwrite
+    vector — codex r3-io #P1)."""
     path = md_path + ".gdocs-sync-journal.json"
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(journal, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, path)
+    safeio.atomic_write(path, json.dumps(journal, ensure_ascii=False, indent=1))
     return path
 
 
@@ -3129,12 +3147,12 @@ def _element_key(el):
 
 
 def _write_sidecar(md_output_path, payload):
+    # hardened write: a predictable `.gdocs-base.json.tmp` next to the user's
+    # .md was the classic symlink-overwrite vector — go through safeio (r3 #9)
     path = md_output_path + SIDECAR_SUFFIX
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, path)
-    return path
+    text = json.dumps(payload, ensure_ascii=False, indent=1)
+    safeio.atomic_write(path, text)
+    return path  # preserve the exact prior return (caller-relative) path
 
 
 def _export_html_snapshot(drive_service, docs_service, file_id):
@@ -4159,12 +4177,17 @@ def sync_doc(file_id, md_path, tab_id=None):
         # crash-safe: build BOTH temps first; only then check the local file
         # hash IMMEDIATELY before the first rename (codex sync-r2 #4) and
         # commit md -> sidecar, journaling each subphase (codex sync-r2 #6)
+        # symlink-/hardlink-safe staging: a planted `<md>.tmp` / `<md>.gdocs-
+        # base.json.tmp` must not be followed or truncated (codex r3-io #P1).
+        # atomic_write stages via an unpredictable O_EXCL temp and renames onto
+        # these predictable names (rename replaces the NAME, never writing
+        # through a symlink or a hard link); the os.replace commit below then
+        # advances them, preserving the staged-then-decide recovery logic.
         tmp_md = md_path + ".tmp"
         tmp_sc = sidecar_path + ".tmp"
-        with open(tmp_md, "w", encoding="utf-8") as f:
-            f.write(new_md)
-        with open(tmp_sc, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=1)
+        safeio.atomic_write(tmp_md, new_md)
+        safeio.atomic_write(
+            tmp_sc, json.dumps(payload, ensure_ascii=False, indent=1))
         with open(md_path, "r", encoding="utf-8") as f:
             current_md = f.read()
         if _sha256_str(current_md) != local_md_sha:

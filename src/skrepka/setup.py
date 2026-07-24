@@ -314,8 +314,8 @@ def run_oauth(snapshot, no_browser, reauth=False, timeout_seconds=300):
     if missing:
         raise SetupError(
             "partial_consent",
-            "you did not grant all required access; skrepka needs both the "
-            "Drive and Docs scopes — run init again and leave both checked")
+            "you did not grant the access skrepka needs; it requires the "
+            "Drive scope — run init again and leave it checked")
     if not creds.refresh_token:
         raise SetupError(
             "no_refresh_token",
@@ -723,10 +723,9 @@ def _print_console_guide():
          "(then no Test users are needed and the sign-in won't expire); if "
          "it shows Testing, either add your own address under Test users or "
          "click Back to production.\n"
-         "        • Data Access → Add or remove scopes → paste BOTH of these "
+         "        • Data Access → Add or remove scopes → paste this scope "
          "into \"Manually add scopes\", then Add to table and Update:\n"
-         "            https://www.googleapis.com/auth/drive\n"
-         "            https://www.googleapis.com/auth/documents",
+         "            https://www.googleapis.com/auth/drive",
          f"{_CONSOLE}/auth/overview"),
         ("Clients tab → Create client → Application type = Desktop app → "
          "download the JSON", f"{_CONSOLE}/auth/clients"),
