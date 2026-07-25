@@ -1,0 +1,12 @@
+{
+  "name": "skrepka",
+  "description": "Careful collaborative editing of Google Docs for AI agents — read and answer comments, apply anchor-safe text edits, upload/download markdown, without destroying comment anchors or styles.",
+  "author": {
+    "name": "Slava Ufimtsev",
+    "url": "https://github.com/slvfmts/skrepka"
+  },
+  "homepage": "https://github.com/slvfmts/skrepka",
+  "repository": "https://github.com/slvfmts/skrepka",
+  "license": "MIT",
+  "keywords": ["google-docs", "markdown", "comments", "editing", "agents"]
+}

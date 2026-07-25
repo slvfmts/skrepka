@@ -1,0 +1,13 @@
+{
+  "name": "skrepka",
+  "owner": {
+    "name": "Slava Ufimtsev"
+  },
+  "plugins": [
+    {
+      "name": "skrepka",
+      "source": "./",
+      "description": "Careful collaborative editing of Google Docs for AI agents — read and answer comments, apply anchor-safe text edits, upload/download markdown."
+    }
+  ]
+}

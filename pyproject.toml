@@ -59,6 +59,8 @@ include = [
     "/src",
     "/tests",
     "/agents",
+    "/skills",
+    "/.claude-plugin",
     "/docs",
     "/README.md",
     "/README.en.md",

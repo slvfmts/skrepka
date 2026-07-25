@@ -61,9 +61,21 @@ smoke-тест. Пошагово — в [docs/QUICKSTART.md](docs/QUICKSTART.md)
 Почему нужно заводить собственный проект Google (а не «просто войти») и что это значит
 для ваших данных — честно расписано в [PRIVACY.md](PRIVACY.md).
 
+## Плагин для агента
+
+skrepka поставляет скиллы для **Claude Code** и **OpenAI Codex** (единое дерево
+[`skills/`](skills) в открытом формате `SKILL.md`): попросите «отработай комментарии»,
+«выгрузи в markdown», «разбери предложения» — агент сам вызовет нужные команды в
+правильном порядке. В каждый скилл вшито ядро безопасности (с CI-проверкой
+байт-равенства). Установка для обоих рантаймов и список сценариев — в
+[docs/PLUGIN.md](docs/PLUGIN.md). Agentic-использование 0.9 — beta / hardened preview,
+не верифицированное Google приложение; поведенческая приёмка ядра ещё не прогнана
+(см. [agents/CONTRACT.md](agents/CONTRACT.md)).
+
 ## Документация
 
 - [docs/QUICKSTART.md](docs/QUICKSTART.md) — авторизация в Google по шагам.
+- [docs/PLUGIN.md](docs/PLUGIN.md) — скиллы для Claude Code и Codex: установка и сценарии.
 - [docs/LIMITATIONS.md](docs/LIMITATIONS.md) — что 0.9 осознанно не делает.
 - [PRIVACY.md](PRIVACY.md) — какие данные и куда уходят.
 - [SECURITY.md](SECURITY.md) — модель угроз, защиты, как сообщить об уязвимости.
