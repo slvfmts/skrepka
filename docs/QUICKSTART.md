@@ -15,73 +15,159 @@ OAuth-клиент. Готового «войти через Google» здесь
 - Браузер и терминал.
 - ~15–30 минут на первую настройку.
 
+**Замечание.** Google периодически меняет консоль, поэтому кнопки могут стоять чуть иначе,
+чем на снимках. Общий порядок остаётся тем же.
+
 ## Шаг 1. Создать проект Google Cloud
 
 Откройте <https://console.cloud.google.com/projectcreate>, задайте имя проекта (любое,
-например `skrepka`) и создайте его. Затем **выберите этот проект** в переключателе
+например `Skrepka`) и нажмите **Create**. Затем **выберите этот проект** в переключателе
 вверху страницы — все следующие шаги должны идти в нём.
+
+![Создание проекта](img/quickstart/01-create-project.png)
 
 ## Шаг 2. Включить Google Docs API
 
 Откройте <https://console.cloud.google.com/apis/library/docs.googleapis.com> и нажмите
-**Enable**. (Включение API — это не то же самое, что разрешение доступа; разрешение вы
-дадите позже одним scope.)
+**Enable**.
+
+![Включение Google Docs API](img/quickstart/02-enable-docs-api.png)
 
 ## Шаг 3. Включить Google Drive API
 
 Откройте <https://console.cloud.google.com/apis/library/drive.googleapis.com> и нажмите
 **Enable**.
 
-## Шаг 4. Настроить OAuth consent screen
+![Включение Google Drive API](img/quickstart/03-enable-drive-api.png)
+
+**Важно про доступ.** Включить API — это разрешить проекту **обращаться** к службе, а не
+выдать доступ к вашим файлам. Сам доступ вы дадите ниже одним пунктом. Обе службы нужны:
+к Docs — для текста документа, к Drive — для комментариев и файлов; при этом одного
+разрешения `drive` хватает для обеих.
+
+## Шаг 4. Настроить экран согласия и доступ
 
 Откройте <https://console.cloud.google.com/auth/overview> (проверьте, что вверху выбран
-ваш проект). В левом меню — две вкладки:
+ваш проект).
 
-- **Audience.** User type = **External** (единственный вариант для личного Gmail).
-  Убедитесь, что Publishing status = **In production**. Новое приложение часто заводится
-  в режиме **Testing** — тогда опубликуйте его (**Publish app**); в противном случае
-  придётся добавлять свой адрес в Test users, а выданный вход будет протухать каждые
-  7 дней.
-- **Data Access → Add or remove scopes.** В поле **«Manually add scopes»** вставьте
-  **ровно один** scope, нажмите **Add to table**, затем **Update**:
+### 4.1. Пройти мастер «Get started»
 
-  ```
-  https://www.googleapis.com/auth/drive
-  ```
+На новом проекте платформа ещё не настроена — нажмите **Get started**.
 
-  Больше ничего не добавляйте: одного `drive` достаточно и для работы с документами
-  (Docs API), и для комментариев/доступов. Более узкий `drive.file` не подходит — он
-  ломает работу с чужим документом по ссылке.
+![Google Auth Platform — Get started](img/quickstart/04-get-started.png)
+
+Мастер проведёт через несколько коротких экранов:
+
+- **App Information.** App name — любое (например `Skrepka`; это имя увидите на экране
+  согласия при входе). User support email — ваш адрес.
+- **Audience.** Выберите **External** — единственный вариант для личного Gmail.
+
+  ![Audience — External](img/quickstart/05-audience-external.png)
+
+- **Contact Information.** Ваш email для уведомлений Google о проекте.
+- **Finish.** Поставьте галочку согласия с политикой и нажмите **Continue** → **Create**.
+
+  ![Finish — согласие с политикой](img/quickstart/06-finish-agree.png)
+
+### 4.2. Добавить один доступ (scope)
+
+Слева откройте вкладку **Data Access** → **Add or remove scopes**. В поле
+**«Manually add scopes»** вставьте **ровно один** scope, нажмите **Add to table**, затем
+**Update**:
+
+```
+https://www.googleapis.com/auth/drive
+```
+
+Больше ничего не добавляйте: одного `drive` достаточно и для работы с документами, и для
+комментариев. Более узкий `drive.file` не подходит — он ломает работу с чужим документом
+по ссылке.
+
+![Добавление scope drive](img/quickstart/07-add-drive-scope.png)
+
+Появится окно **«Verification required»** — просто нажмите **Continue**. Поля про
+justification, demo-видео и предложение отправить приложение на проверку (verification)
+**заполнять и отправлять не нужно**: для личного использования проверка Google не
+требуется (см. 4.4).
+
+![Verification required — Continue](img/quickstart/08-verification-popup.png)
+
+### 4.3. Опубликовать приложение (Publish app)
+
+Слева откройте **Audience**. Если Publishing status = **Testing**, нажмите **Publish app**
+и подтвердите **Confirm** в окне «Push to production».
+
+![Publish app](img/quickstart/09-publish-app.png)
+
+![Push to production — Confirm](img/quickstart/10-push-to-production.png)
+
+Зачем: в режиме Testing выданный вход протухает каждые 7 дней. В Production он живёт
+долго, а «непроверенным» приложение при этом остаётся — для вас как владельца этого
+достаточно.
+
+### 4.4. Про плашку «требуется верификация» — игнорировать
+
+Из-за доступа `drive` консоль будет предлагать отправить приложение на проверку Google.
+Для личного использования это **не нужно** и делать этого не надо: вы пользуетесь своим
+приложением сами. Единственное следствие — на шаге 6 при входе Google покажет экран
+«приложение не проверено», где вы нажмёте «всё равно продолжить».
 
 ## Шаг 5. Создать OAuth-клиент (Desktop)
 
-Откройте <https://console.cloud.google.com/auth/clients> → **Create client** →
-Application type = **Desktop app** → создайте и **скачайте JSON**. Это файл вида
-`client_secret_….json`. Держите его в надёжном месте и **не коммитьте** в git.
+Слева откройте **Clients** → **Create client** → Application type = **Desktop app** →
+задайте имя → **Create**.
+
+![Создание Desktop-клиента](img/quickstart/11-create-desktop-client.png)
+
+В открывшемся окне нажмите **Download JSON** — сохранится файл вида `client_secret_….json`.
+Держите его в надёжном месте и **не коммитьте** в git.
+
+![Скачать JSON](img/quickstart/12-download-json.png)
 
 ## Шаг 6. Запустить `skrepka init`
 
+В терминале наберите команду **с пробелом в конце** и не жмите Enter:
+
 ```bash
-skrepka init --credentials /путь/к/client_secret_….json
+skrepka init --credentials 
 ```
 
-Откроется браузер для входа в Google. Дальше вы увидите предупреждение, что приложение
+Затем **перетащите** скачанный `client_secret_….json` из Finder прямо в окно терминала —
+путь подставится сам. Теперь нажмите Enter.
+
+Откроется браузер для входа в Google. Вы увидите предупреждение, что приложение
 **не проверено Google** — **это ожидаемо для вашего собственного клиента**. Нажмите
-**Дополнительные настройки → Перейти на страницу … (небезопасно)**, а на экране согласия
-предоставьте запрошенный доступ (**один** пункт про файлы Google Диска) и нажмите
-**Продолжить**.
+**Advanced** (внизу слева), затем ссылку **«Go to … (unsafe)»**. Кнопку «Back to safety»
+не нажимайте — она отменяет.
+
+![Приложение не проверено — Advanced → Go to … (unsafe)](img/quickstart/13-unverified-advanced.png)
+
+На экране согласия предоставьте запрошенный доступ (**один** пункт про файлы Google Диска)
+и нажмите **Continue**.
+
+![Экран согласия — Continue](img/quickstart/14-consent-allow.png)
 
 По завершении skrepka сделает smoke-тест (создаст тест-документ, добавит к нему
 комментарий, приберёт за собой) и выведет `All set.` — настройка окончена.
 
-## Проверка и типичные проблемы
+Проверьте результат командой:
 
-- **`skrepka doctor`** — диагностика: креды, токен, scope, включённость нужных API.
-  Запускайте первым делом при любых сбоях.
-- **Вход протухает через 7 дней.** Значит проект в режиме **Testing** — переведите его
-  **In production** (Шаг 4) и выполните `skrepka init` заново.
+```bash
+skrepka doctor
+```
+
+Все проверки должны быть `[ok]`.
+
+![skrepka doctor — всё ok](img/quickstart/15-doctor-ok.png)
+
+## Типичные проблемы
+
+- **Вход протухает через 7 дней.** Значит проект остался в режиме **Testing** —
+  опубликуйте его (Шаг 4.3) и выполните `skrepka init` заново.
 - **«…API is not enabled».** Вернитесь к Шагам 2–3 и включите нужный API, затем
   повторите. После включения API может пройти минута-другая, прежде чем он заработает.
+- **`command not found: skrepka`.** Команда не в пути — используйте полный путь, например
+  `~/.local/bin/skrepka init --credentials …`.
 - **Скачали не тот клиент.** Нужен именно **Desktop app**. Service-account ключ или
   Web-клиент skrepka отклонит с подсказкой.
 

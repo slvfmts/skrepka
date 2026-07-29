@@ -55,6 +55,9 @@ packages = ["src/skrepka"]
 # contract, and public docs. Never the `internal/` working context (plans,
 # backups, screenshots, test doc IDs) or the local venv.
 [tool.hatch.build.targets.sdist]
+# Screenshots under docs/img are for GitHub rendering only — pointless in the
+# installed package, and they would bloat the sdist by several MB.
+exclude = ["/docs/img"]
 include = [
     "/src",
     "/tests",
