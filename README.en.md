@@ -1,63 +1,40 @@
 # skrepka 📎
 
-**Careful collaborative editing for Google Docs.** Reply to your client's comments and
-edit the text — without turning their comments into ghosts and without flattening styles.
+Your AI co-author in Google Docs.
 
-*The primary documentation is in Russian: [README.md](README.md). This is a short summary.*
+An AI agent in your terminal reads your client's comments, replies to them, and edits the text. The comments and formatting stay in place.
 
-> **Status: 0.9 pre-release.** The engine has passed multi-round cross-model code review
-> and live characterization against the real Google Docs API. Packaging, the onboarding
-> wizard, and docs are in progress. Not yet published to PyPI.
+*In Russian: [README.md](README.md).*
 
 ## Why
 
-Editing a Google Doc programmatically is easy. Editing it **without destroying the
-conversation** is not:
+When software edits a Google Doc, comments are easy to lose. You change the text and your client's comments vanish from the document. skrepka does not do that. It only takes safe paths, and it refuses any operation that would destroy someone's work, telling you why.
 
-- a full re-upload turns every comment into an invisible ghost (alive in the API, gone
-  from the UI);
-- deleting a text range that overlaps a comment anchor corrupts the text;
-- a replacement that fully covers an anchor silently kills the comment thread.
+## Who it is for
 
-skrepka encodes the empirically verified safe paths (see [docs/FINDINGS.md](docs/FINDINGS.md))
-behind fail-closed guards: an operation that would lose someone's work is **refused with
-an explanation**, not forced.
+For editors, copywriters, and content managers. You run documents with clients in Google Docs and work through an AI agent such as Claude Code or Codex. You do not need to be a developer; the `skrepka init` wizard sets up access for you.
 
 ## What it does
 
-The core 0.9 workflow is **"work through your client's comments and fix the text in place"**:
+Most of the time you reach for skrepka to work through a client's comments and fix the text in place. You tell the agent to handle the comments, it reads the threads, replies on point, and makes the edits. You close the threads yourself; the agent never resolves them. skrepka also exports a document to markdown and pushes edits back, creates documents from markdown, and reviews suggested changes.
 
-- `skrepka comments / reply` — read and answer comments from the CLI (the same CLI the
-  AI agent drives). Only a human resolves threads, never the agent.
-- `skrepka patch` — surgical text edits that keep live comment anchors alive
-  (full-coverage replacements are refused, with a hint on how to rewrite).
-- `skrepka download` — export the doc as markdown for local reading or editing.
-- `skrepka upload / update` — create docs from markdown; destructive full updates are
-  blocked when the doc has comments unless explicitly acknowledged (with an automatic
-  backup).
+## Getting started
 
-> The local markdown → doc round-trip (`sync`) ships as **experimental** in 0.9 and is
-> not part of the supported workflow yet.
+1. `pipx install skrepka`
+2. `skrepka init` sets up Google access; the wizard takes 15 to 30 minutes and is walked through with screenshots in [docs/QUICKSTART.md](docs/QUICKSTART.md)
+3. Connect the skills to your agent, see [docs/PLUGIN.md](docs/PLUGIN.md)
 
-## Install (pre-release)
-
-```bash
-pipx install skrepka   # after the first PyPI release
-skrepka init           # guided Google authorization (15–30 min the first time)
-skrepka doctor         # diagnose credentials, token, scopes, API access
-```
-
-You bring your **own** Google OAuth client (your own Cloud project) — skrepka ships no
-shared verified app. Why, and what it means for your data, is spelled out honestly in
-[PRIVACY.md](PRIVACY.md).
+You use your own Google project and act under your own account. skrepka has no server; it does not store or see your data ([PRIVACY.md](PRIVACY.md)).
 
 ## Docs
 
-- [docs/QUICKSTART.md](docs/QUICKSTART.md) — step-by-step Google authorization.
-- [docs/LIMITATIONS.md](docs/LIMITATIONS.md) — what 0.9 deliberately does not do.
-- [PRIVACY.md](PRIVACY.md) — what data goes where.
-- [SECURITY.md](SECURITY.md) — threat model, protections, how to report a vulnerability.
-- [docs/FINDINGS.md](docs/FINDINGS.md) — how the Docs API actually behaves with comments.
+| File | What's inside |
+|---|---|
+| [docs/QUICKSTART.md](docs/QUICKSTART.md) | Step-by-step Google authorization |
+| [docs/PLUGIN.md](docs/PLUGIN.md) | Connecting the skills to your agent |
+| [docs/LIMITATIONS.md](docs/LIMITATIONS.md) | What 0.9 deliberately does not do |
+| [PRIVACY.md](PRIVACY.md) | What data goes where |
+| [SECURITY.md](SECURITY.md) | Threat model and how to report a vulnerability |
 
 ## License
 
