@@ -815,6 +815,14 @@ def post_process_images(docs_service, drive_service, doc_id, images, folder_id=N
             _warn(f"image marker '{marker}' is not unique in doc — skipped")
             continue
 
+        # Re-check at use time: _resolve_upload_image vetted this path while
+        # reading the markdown, and the file could have been swapped for a
+        # symlink out of the tree since (TOCTOU). full_path is already a
+        # realpath, so any new link in the chain shows up as a mismatch.
+        if os.path.realpath(full_path) != full_path or not os.path.isfile(full_path):
+            _warn(f"image {rel_path} changed on disk since it was read — skipped")
+            continue
+
         # Convert SVG → PNG if needed
         tmp_png = None
         if full_path.endswith(".svg"):
@@ -866,6 +874,56 @@ def post_process_images(docs_service, drive_service, doc_id, images, folder_id=N
                     pass
 
 
+# Raster only, deliberately. SVG is a document format: cairosvg and the
+# `qlmanage` fallback both resolve references inside the file, so an `<image
+# xlink:href="http://…">` or `file:///etc/passwd` in an SVG would make skrepka
+# fetch it — breaking the "no outbound connections except Google" promise in
+# SECURITY.md. 0.9 refuses .svg instead of rendering it unsandboxed; convert to
+# PNG yourself (docs/LIMITATIONS.md).
+_UPLOAD_IMAGE_EXTS = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff",
+})
+
+
+def _resolve_upload_image(md_dir, path):
+    """Resolve a markdown image reference to a local file that is safe to
+    upload, or None to leave the reference in the text untouched.
+
+    The markdown reaching this point is UNTRUSTED: it can come straight out of
+    a downloaded document, and document text is written by third parties (see
+    agents/CONTRACT.md §2.3). Left unchecked, `![x](/home/you/.ssh/id_rsa)` or
+    `![x](../../../etc/passwd)` would be uploaded to Drive and published as
+    `anyone:reader` for the duration of the insert — an arbitrary local file
+    read with a public window, landing inside `--folder` when one is given.
+    So containment is enforced here, fail closed:
+
+    - absolute paths, `~`-paths and anything with a URL scheme are refused;
+    - the path must resolve — symlinks included — inside the .md file's own
+      directory tree;
+    - the target must be a regular file carrying an image extension.
+
+    A refused reference is simply left as literal markdown, exactly like a
+    reference to a file that does not exist.
+    """
+    from urllib.parse import urlparse
+
+    if not path or os.path.isabs(path) or path.startswith("~"):
+        return None
+    if urlparse(path).scheme:  # remote URL, not a local file
+        return None
+    base = os.path.realpath(md_dir)
+    full = os.path.realpath(os.path.join(base, path))
+    # realpath resolved the whole chain, so a symlink aimed out of the tree
+    # fails this containment test rather than sneaking past it
+    if full != base and not full.startswith(base + os.sep):
+        return None
+    if os.path.splitext(full)[1].lower() not in _UPLOAD_IMAGE_EXTS:
+        return None
+    if not os.path.isfile(full):
+        return None
+    return full
+
+
 def _prepare_md_for_upload(md_path):
     """Replace ![alt](path) with text markers and return (temp_path, images_list)."""
     with open(md_path, "r") as f:
@@ -876,8 +934,8 @@ def _prepare_md_for_upload(md_path):
 
     def replace_image(m):
         alt, path = m.group(1), m.group(2)
-        full_path = os.path.join(md_dir, path)
-        if os.path.exists(full_path):
+        full_path = _resolve_upload_image(md_dir, path)
+        if full_path:
             # full-uuid suffix guarantees marker uniqueness in the doc, so
             # the exact-substring deletion in post_process_images is
             # unambiguous; regenerate on (astronomically unlikely) collision
@@ -887,7 +945,7 @@ def _prepare_md_for_upload(md_path):
                     break
             images.append((marker, alt, path, full_path))
             return marker
-        return m.group(0)  # keep original if file not found
+        return m.group(0)  # keep original: missing file, or refused as unsafe
 
     new_text = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", replace_image, md_text)
 

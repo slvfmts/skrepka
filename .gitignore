@@ -19,6 +19,11 @@ dist/
 build/
 .venv/
 venv/
+.pytest_cache/
+.ruff_cache/
+
+# maintainer working context — never published (see pyproject sdist allowlist)
+internal/
 
 # os / editors
 .DS_Store

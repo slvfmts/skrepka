@@ -1,30 +1,34 @@
 # skrepka 📎
 
-Your AI co-author in Google Docs.
-
-An AI agent in your terminal reads your client's comments, replies to them, and edits the text. The comments and formatting stay in place.
+An AI co-author in Google Docs. The agent works from your terminal inside the document itself: it reads the comments, replies to them, and edits the text in place.
 
 *In Russian: [README.md](README.md).*
 
 ## Why
 
-When software edits a Google Doc, comments are easy to lose. You change the text and your client's comments vanish from the document. skrepka does not do that. It only takes safe paths, and it refuses any operation that would destroy someone's work, telling you why.
+Working on text with an AI usually means two windows: the document and a chat with the agent. Copy a paragraph into the chat, paste the answer back, fix the formatting by hand. While the text travels back and forth, edits and comments get lost.
+
+skrepka removes the copying. You leave ordinary comments in the text about structure, logic, and wording. Then you point the agent at the document; it reads the threads, replies, and edits the text in place. Your client shows up, comments in the same document, and the work continues the same way. The comments survive: anchors stay put, and only a human closes a thread.
 
 ## Who it is for
 
-For editors, copywriters, and content managers. You run documents with clients in Google Docs and work through an AI agent such as Claude Code or Codex. You do not need to be a developer; the `skrepka init` wizard sets up access for you.
+Editors, copywriters, and content managers who run and sign off documents in Google Docs and bring an AI agent into the work: Claude Code, Codex, or another one. You do not need to be a developer; the `skrepka init` wizard sets up Google access for you.
 
 ## What it does
 
-Most of the time you reach for skrepka to work through a client's comments and fix the text in place. You tell the agent to handle the comments, it reads the threads, replies on point, and makes the edits. You close the threads yourself; the agent never resolves them. skrepka also exports a document to markdown and pushes edits back, creates documents from markdown, and reviews suggested changes.
+The main scenario is working through comments. You tell the agent to handle the comments; it reads the threads, replies to the point, and edits the text.
+
+skrepka also exports a document to markdown and pushes edits back, creates documents from markdown, and reviews suggested changes. Full list of scenarios in [docs/PLUGIN.md](docs/PLUGIN.md).
 
 ## Getting started
 
-1. `pipx install skrepka`
-2. `skrepka init` sets up Google access; the wizard takes 15 to 30 minutes and is walked through with screenshots in [docs/QUICKSTART.md](docs/QUICKSTART.md)
-3. Connect the skills to your agent, see [docs/PLUGIN.md](docs/PLUGIN.md)
+1. Install skrepka: `pipx install skrepka`.
+2. Set up Google access: `skrepka init`. First-time setup takes 15 to 30 minutes; the walkthrough with screenshots is in [docs/QUICKSTART.md](docs/QUICKSTART.md).
+3. Connect the skills to your agent: [docs/PLUGIN.md](docs/PLUGIN.md).
 
-You use your own Google project and act under your own account. skrepka has no server; it does not store or see your data ([PRIVACY.md](PRIVACY.md)).
+Then ask the agent to work through the comments in a test document.
+
+You create your own Google Cloud project and act under your own account. skrepka has no server and no telemetry: its author never sees your documents or your tokens. Details in [PRIVACY.md](PRIVACY.md).
 
 ## Docs
 
