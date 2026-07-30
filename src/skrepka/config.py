@@ -122,6 +122,13 @@ def _check_dir_chain(path):
 def ensure_config_dir():
     """Create the config dir 0700 if needed and validate the parent chain."""
     d = config_dir()
+    # Validate the EXISTING parent chain first. `os.makedirs(exist_ok=True)`
+    # happily walks a symlinked `~/.config` and would create — or chmod — a
+    # directory outside the chain we mean to trust, and the check further down
+    # would then be inspecting the wrong place.
+    parent = os.path.dirname(d)
+    if os.path.exists(parent):
+        _check_dir_chain(parent)
     try:
         os.makedirs(d, mode=0o700, exist_ok=True)
     except OSError as e:

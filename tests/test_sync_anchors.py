@@ -362,7 +362,8 @@ def test_accounting_resolved_absent_from_export_is_clean(engine):
     accounting bug shipped: one closed thread blocked every replace forever."""
     anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z",
                             resolved=True)]
-    problems, metrics = engine._account_anchored_comments(anchored, [], [])
+    problems, metrics = engine._account_anchored_comments(
+        anchored, [], [], skip_resolved=True)
     assert problems == []
     assert metrics["api_anchored_resolved"] == 1
     assert metrics["api_anchored_live"] == 0
@@ -375,10 +376,20 @@ def test_accounting_resolved_alongside_live_thread(engine):
     records = [{"docx_id": "0", "author": "A",
                 "date_sec": "2026-01-01T00:00:01Z"}]
     problems, metrics = engine._account_anchored_comments(
-        anchored, records, _spans("0"))
+        anchored, records, _spans("0"), skip_resolved=True)
     assert problems == []
     assert metrics["api_anchored_live"] == 1
     assert metrics["api_anchored_resolved"] == 1
+
+
+def test_accounting_resolved_still_counted_without_the_flag(engine):
+    """The exclusion is opt-in, and only the replaceAllText path opts in.
+    Deletion-based callers (sync) keep counting resolved threads, because
+    deleteContentRange treats anchors differently and its effect on a hidden
+    resolved anchor was never measured — so they keep failing closed."""
+    anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z", resolved=True)]
+    problems, _ = engine._account_anchored_comments(anchored, [], [])
+    assert any("missing from the export" in p for p in problems)
 
 
 def test_accounting_live_thread_still_blocks_when_missing(engine):

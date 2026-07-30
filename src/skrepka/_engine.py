@@ -777,8 +777,14 @@ def _upload_image_to_drive(drive_service, image_path, folder_id=None):
         return (f"https://drive.google.com/uc?id={file_id}", file_id, perm_id)
     except BaseException:
         # deleting the file drops any ACL with it, so an unknown permission id
-        # is not a problem here
-        _cleanup_staging_image(drive_service, file_id, None)
+        # is not a problem here. `_cleanup_staging_image` only catches
+        # `Exception`, so a KeyboardInterrupt raised *inside* cleanup would
+        # otherwise replace the original failure and hide why we got here.
+        try:
+            _cleanup_staging_image(drive_service, file_id, None)
+        except BaseException as ce:
+            _warn(f"staging image {file_id} may still exist and be publicly "
+                  f"readable — cleanup itself failed: {ce}")
         raise
 
 
@@ -1522,18 +1528,29 @@ def _docx_comment_records(docx_bytes):
     return records, problems
 
 
-def _account_anchored_comments(anchored, records, spans):
+def _account_anchored_comments(anchored, records, spans,
+                               skip_resolved=False):
     """Prove every anchored API comment is present in the docx export.
 
     Ghosted threads vanish from the export ENTIRELY (C11a), and a stale
-    export missing a fresh comment looks exactly the same — so the only
-    honest policy is exact accounting: the multiset of
-    (author.displayName, createdTime→seconds) keys over all non-deleted
-    entries of anchored threads (parents AND replies) must EQUAL the
-    multiset over comments.xml records, and every record must join to
-    exactly one anchor span via w:id (bijection). Any shortfall, excess,
-    duplicate key (ambiguous — codex r3 #5) or broken join ⇒ problems
-    (caller blocks paragraph replaces/deletes entirely).
+    export missing a fresh comment looks exactly the same — so every live
+    anchored entry must be shown to be present. Keys are
+    (author.displayName, createdTime→seconds) over non-deleted entries of
+    anchored threads (parents AND replies), and:
+
+      * a SHORTFALL against comments.xml is a ghost or a stale export;
+      * EXCESS is allowed only where the key maps to exactly ONE API entry —
+        that is a thread anchored to several fragments (C11e). With two
+        entries sharing a key we cannot attribute records to threads, so a
+        multi-anchor neighbour could cover for a ghost: that stays refused;
+      * a key the API does not know at all means the export is stale;
+      * every record must join to exactly one anchor span via w:id.
+
+    `skip_resolved` excludes resolved threads, which Google omits from the
+    export entirely (C11c). Only the caller that edits via `replaceAllText`
+    passes it: that is the path where a resolved anchor was measured to
+    survive full coverage (C11d). Deletion-based paths have not been measured
+    and keep counting resolved threads, i.e. keep failing closed.
 
     Returns (problems, metrics).
     """
@@ -1545,18 +1562,21 @@ def _account_anchored_comments(anchored, records, spans):
     for c in anchored:
         if c.get("resolved"):
             resolved_n += 1
-            # Google omits resolved threads from the export ENTIRELY — no
-            # comments.xml record, no range (C11c, measured 2026-07-30).
-            # Counting them was a permanent shortfall that read as a ghost and
-            # blocked every replace in the document, so closing one thread
-            # disabled editing for good.
-            #
-            # Excluding them is safe, and that was measured rather than
-            # inferred: with the thread resolved, a replaceAllText fully
-            # covering its anchor left the anchor intact — on re-open the
-            # thread came back alive and attached to the replacement text, not
-            # ghosted (C11d). There is nothing to orphan here.
-            continue
+            if skip_resolved:
+                # Google omits resolved threads from the export ENTIRELY — no
+                # comments.xml record, no range (C11c, measured 2026-07-30).
+                # Counting them was a permanent shortfall that read as a ghost
+                # and blocked every replace, so closing one thread disabled
+                # editing for that document for good.
+                #
+                # Excluding them was measured, not inferred — but only for
+                # `replaceAllText`: with the thread resolved, a replace fully
+                # covering its anchor left the anchor intact, and re-opening
+                # brought the thread back alive on the replacement text (C11d).
+                # Deletion-based paths do not pass skip_resolved, because
+                # deleteContentRange treats anchors differently (C2) and its
+                # effect on a hidden resolved anchor has NOT been measured.
+                continue
         entries = [c] + [r for r in (c.get("replies") or [])
                          if not r.get("deleted")]
         for entry in entries:
@@ -1761,7 +1781,8 @@ def _canary_present(docs_service, file_id, canary):
 
 
 def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
-                           doc_tab, anchored, named_intervals, body_end):
+                           doc_tab, anchored, named_intervals, body_end,
+                           skip_resolved=False):
     """Provably-fresh anchor map for structural edits on a commented doc.
 
     Export freshness is not provable read-only (files.export takes no
@@ -1883,7 +1904,7 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
         # uuid), so it never enters the mapping
         records, rec_problems = _docx_comment_records(docx_bytes)
         acc_problems, metrics = _account_anchored_comments(
-            anchored, records, spans)
+            anchored, records, spans, skip_resolved=skip_resolved)
         anchors, map_problems = _map_anchors_to_doc(doc_tab, spans)
         all_problems = problems + rec_problems + acc_problems + map_problems
         if all_problems:
@@ -2141,9 +2162,11 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
         named_intervals = _named_range_intervals(doc_tab)
         _, anchored_now = _census_comments(drive_service, file_id)
 
+        # this path edits through replaceAllText only — the case where a
+        # resolved thread's anchor was measured to survive full coverage
         snap, retry_reason = _fresh_anchor_snapshot(
             docs_service, drive_service, file_id, doc, doc_tab,
-            anchored_now, named_intervals, body_end)
+            anchored_now, named_intervals, body_end, skip_resolved=True)
         if snap is None:
             last_reason = retry_reason
             continue

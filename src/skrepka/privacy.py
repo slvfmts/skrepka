@@ -84,13 +84,20 @@ def _token_bearing(files):
             + _smoke_tokens(files) + _token_crash_temps(files))
 
 
-def _usable_token_targets(files):
-    """Token-bearing artifacts, then the write-ahead marker LAST.
+def _remove_tokens_then_marker(files):
+    """Remove every token-bearing artifact, and the marker ONLY if they all
+    went. Returns (removed, failed).
 
-    The marker is a barrier that makes readers fail closed, so if a delete
-    fails partway through, the marker must still be standing rather than
-    exposing a half-dismantled sign-in."""
-    return _token_bearing(files) + [config.MARKER_NAME]
+    The marker is a barrier that makes readers fail closed. `_remove_existing`
+    records a failure and keeps going, so a single list with the marker at the
+    end still deleted the barrier while a usable token stayed behind — the
+    worst of both. Two phases make the ordering an actual guarantee."""
+    removed, failed = _remove_existing(_token_bearing(files))
+    if failed:
+        # keep the barrier: a reader must not see a half-dismantled sign-in
+        return removed, failed
+    m_removed, m_failed = _remove_existing([config.MARKER_NAME])
+    return removed + m_removed, m_failed
 
 
 def _exists(name):
@@ -141,8 +148,7 @@ def _cleanup_after_revoke(revoked_hash):
             return {"superseded": True, "verifiable": True,
                     "removed": [], "failed": [], "token_present": True}
         files = _dir_files()
-        targets = _usable_token_targets(files)
-        removed, failed = _remove_existing(targets)
+        removed, failed = _remove_tokens_then_marker(files)
         return {"superseded": False, "verifiable": True,
                 "removed": removed, "failed": failed,
                 "token_present": _exists(config.TOKEN_NAME)}
@@ -166,9 +172,8 @@ def cmd_logout(argv):
     setup._SafeArgParser(prog="skrepka logout").parse_args(argv)
     with config.lock():
         files = _dir_files()
-        # every USABLE token, marker last (see _usable_token_targets)
-        targets = _usable_token_targets(files)
-        removed, failed = _remove_existing(targets)
+        # every USABLE token; the marker only if they all went
+        removed, failed = _remove_tokens_then_marker(files)
     _emit({
         "action": "logout",
         "status": "signed_out" if not failed else "signed_out_incomplete",
