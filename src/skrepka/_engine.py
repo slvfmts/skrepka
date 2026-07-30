@@ -745,8 +745,22 @@ def _upload_image_to_drive(drive_service, image_path, folder_id=None):
         body=file_metadata, media_body=media, fields="id",
         supportsAllDrives=True,
     ).execute()
-    file_id = img_file["id"]
+    # A malformed create response leaves a file in Drive whose id we never
+    # learn — nothing can clean that up, so say so plainly instead of dying on
+    # a KeyError. The guarantee below starts once we hold an id.
+    file_id = (img_file or {}).get("id")
+    if not file_id:
+        raise PatchOpError(
+            "drive.files.create returned no file id — a staging image may "
+            "have been created and cannot be cleaned up automatically; "
+            "check your Drive for a stray upload")
 
+    # From here the file EXISTS in Drive and is about to become publicly
+    # readable, so every exit path must remove it. `BaseException` is
+    # deliberate: a KeyboardInterrupt between granting the ACL and returning
+    # the tuple would otherwise leave a world-readable file whose id the
+    # caller never receives (its `staged_id` stays None). Cleanup is
+    # best-effort and never swallows the original exception.
     try:
         perm = drive_service.permissions().create(
             fileId=file_id,
@@ -754,15 +768,18 @@ def _upload_image_to_drive(drive_service, image_path, folder_id=None):
             supportsAllDrives=True,
             fields="id",
         ).execute()
-    except HttpError:
-        try:
-            drive_service.files().delete(
-                fileId=file_id, supportsAllDrives=True).execute()
-        except HttpError as e2:
-            _warn(f"orphan staging file {file_id} could not be deleted: {e2}")
+        perm_id = (perm or {}).get("id")
+        if not perm_id:
+            # the ACL may well exist despite the malformed reply — treat it as
+            # a failure so the file is deleted rather than left public
+            raise PatchOpError(
+                "drive.permissions.create returned no permission id")
+        return (f"https://drive.google.com/uc?id={file_id}", file_id, perm_id)
+    except BaseException:
+        # deleting the file drops any ACL with it, so an unknown permission id
+        # is not a problem here
+        _cleanup_staging_image(drive_service, file_id, None)
         raise
-
-    return (f"https://drive.google.com/uc?id={file_id}", file_id, perm.get("id"))
 
 
 def _cleanup_staging_image(drive_service, file_id, permission_id):
@@ -839,7 +856,10 @@ def post_process_images(docs_service, drive_service, doc_id, images, folder_id=N
             try:
                 image_uri, staged_id, staged_perm = _upload_image_to_drive(
                     drive_service, png_path, folder_id)
-            except HttpError as e:
+            except (HttpError, PatchOpError) as e:
+                # PatchOpError here means a malformed Drive reply (no file id /
+                # no permission id); the staging file was already cleaned up
+                # where its id was known. Skip this image, keep the rest.
                 _warn(f"Image upload failed for {full_path}: {e}")
                 continue
 
@@ -1525,6 +1545,18 @@ def _account_anchored_comments(anchored, records, spans):
     for c in anchored:
         if c.get("resolved"):
             resolved_n += 1
+            # Google omits resolved threads from the export ENTIRELY — no
+            # comments.xml record, no range (C11c, measured 2026-07-30).
+            # Counting them was a permanent shortfall that read as a ghost and
+            # blocked every replace in the document, so closing one thread
+            # disabled editing for good.
+            #
+            # Excluding them is safe, and that was measured rather than
+            # inferred: with the thread resolved, a replaceAllText fully
+            # covering its anchor left the anchor intact — on re-open the
+            # thread came back alive and attached to the replacement text, not
+            # ghosted (C11d). There is nothing to orphan here.
+            continue
         entries = [c] + [r for r in (c.get("replies") or [])
                          if not r.get("deleted")]
         for entry in entries:
@@ -1537,27 +1569,45 @@ def _account_anchored_comments(anchored, records, spans):
                 continue
             api_keys[(author, _trunc_seconds(created))] += 1
     docx_keys = Counter((r["author"], r["date_sec"]) for r in records)
+
+    # One thread may be anchored to several non-adjacent fragments, and the
+    # export emits a record per (entry × anchor). So a live single-entry thread
+    # on three anchors legitimately yields three records with the same key, and
+    # exact multiset equality reported that as a stale export, blocking the
+    # document (C11e).
+    #
+    # Excess is therefore allowed — but ONLY where the key belongs to exactly
+    # one API entry. With two entries sharing a key, a multi-anchor neighbour's
+    # surplus can make up for a ghosted thread's absence (api=2, docx=2 from a
+    # single two-anchor thread), and nothing in the export attributes records
+    # to threads. That case stays fail-closed, as it is today.
     for key, n in api_keys.items():
         if n > 1:
             problems.append(
                 f"ambiguous accounting key (same author, same second) ×{n}: "
-                f"{key[0]!r} @ {key[1]}")
+                f"{key[0]!r} @ {key[1]} — cannot attribute export records to "
+                f"threads, refusing")
     for key, n in docx_keys.items():
         if n > 1 and key not in api_keys:  # api-side dupes already reported
             problems.append(
                 f"ambiguous docx key (same author, same second) ×{n}: "
                 f"{key[0]!r} @ {key[1]}")
+    # shortfall: a live entry with no record at all, or fewer records than
+    # entries sharing that key — still a ghost or a stale export
     missing = api_keys - docx_keys
-    extra = docx_keys - api_keys
+    # excess of a KNOWN key is a multi-anchor thread, not a mismatch; only a
+    # key the API does not know at all means the export is stale
+    unknown = Counter({k: n for k, n in docx_keys.items()
+                       if k not in api_keys})
     if missing:
         problems.append(
             "anchored comment entries missing from the export (ghost thread "
             "or stale export — indistinguishable): "
             + "; ".join(f"{a!r} @ {d}" for a, d in list(missing)[:5]))
-    if extra:
+    if unknown:
         problems.append(
             "export contains comment entries unknown to the API (stale "
-            "export): " + "; ".join(f"{a!r} @ {d}" for a, d in list(extra)[:5]))
+            "export): " + "; ".join(f"{a!r} @ {d}" for a, d in list(unknown)[:5]))
     # bijection: one span per comments.xml record, joined by w:id
     span_ids = Counter()
     for s in spans:

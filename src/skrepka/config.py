@@ -132,8 +132,22 @@ def ensure_config_dir():
         raise ConfigError(f"{d} is a symlink — refusing (fail closed)")
     if st.st_uid != os.getuid():
         raise ConfigError(f"{d} is not owned by you — refusing")
-    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        os.chmod(d, 0o700)
+    # Tighten on ANY group/other bit, not just write: a 0755 dir let other
+    # local accounts list the store and stat the token, which the 0700 promise
+    # in PRIVACY.md/SECURITY.md rules out. Verify the result rather than
+    # assuming chmod took.
+    if st.st_mode & 0o077:
+        try:
+            os.chmod(d, 0o700)
+        except OSError as e:
+            raise ConfigError(
+                f"{d} is accessible to other users (mode "
+                f"{stat.S_IMODE(st.st_mode):04o}) and could not be tightened: "
+                f"{e}")
+        if os.lstat(d).st_mode & 0o077:
+            raise ConfigError(
+                f"{d} is still accessible to other users after chmod — "
+                f"refusing (fail closed)")
     _check_dir_chain(d)
     return d
 
@@ -159,7 +173,44 @@ def _open_read_nofollow(path):
     if st.st_size > _MAX_SECRET_BYTES:
         os.close(fd)
         raise ConfigError(f"{path} is implausibly large — refusing")
+    # Mode is checked on the OPEN fd, so nothing can be swapped underneath
+    # between the check and the read.
+    #
+    # Group/other WRITE is not a confidentiality problem but an integrity one:
+    # another account could have replaced the contents, and chmod does not
+    # revoke a descriptor they already hold open. Repairing and carrying on
+    # would mask that, so refuse.
+    #
+    # Group/other READ is exposure that already happened; refusing here would
+    # only lock you out of your own store, so tighten via the fd and say so —
+    # silence would hide that the secret may have been read.
+    mode = stat.S_IMODE(st.st_mode)
+    if mode & (stat.S_IWGRP | stat.S_IWOTH):
+        os.close(fd)
+        raise ConfigError(
+            f"{path} is writable by other users (mode {mode:04o}) — its "
+            f"contents cannot be trusted; delete it and re-run "
+            f"`skrepka init --reauth`")
+    if mode & 0o077:
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError as e:
+            os.close(fd)
+            raise ConfigError(
+                f"{path} is readable by other users (mode {mode:04o}) and "
+                f"could not be tightened: {e}")
+        _warn_mode(path, mode)
     return fd
+
+
+def _warn_mode(path, mode):
+    """One-line warning to stderr; stdout stays machine-readable."""
+    import sys
+    print(json.dumps({"warning": (
+        f"{path} was readable by other users (mode {mode:04o}); tightened to "
+        f"0600. If this machine has other accounts, treat the sign-in as "
+        f"possibly exposed and consider `skrepka revoke`.")},
+        ensure_ascii=False), file=sys.stderr)
 
 
 def read_secret_bytes(name):
@@ -239,10 +290,37 @@ def lock():
     """Exclusive advisory lock serializing token activation and refresh so a
     read-compare-write cannot interleave with a concurrent reauth (code-r2 #1).
     Unix-only (Windows is out of 0.9 scope)."""
-    d = config_dir()
-    os.makedirs(d, mode=0o700, exist_ok=True)
+    # Validate the parent chain and tighten the dir BEFORE touching anything
+    # inside it. `logout` and `forget` take this lock before any protected
+    # read, so without this they were the one path into a swapped config dir
+    # that skipped every check.
+    d = ensure_config_dir()
     lock_path = os.path.join(d, ".lock")
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    # O_NOFOLLOW: a symlink at .lock must not redirect the open. O_CLOEXEC:
+    # never leak the descriptor into a child process.
+    try:
+        fd = os.open(lock_path,
+                     os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     0o600)
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.EMLINK):
+            raise ConfigError(f"{lock_path} is a symlink — refusing")
+        raise ConfigError(f"cannot open {lock_path}: {e}")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ConfigError(f"{lock_path} is not a regular file — refusing")
+        if st.st_uid != os.getuid():
+            raise ConfigError(f"{lock_path} is not owned by you — refusing")
+        # A lock another account can write is a denial-of-service handle: they
+        # can hold flock forever. Ours to repair, so repair it — refusing here
+        # would stop `logout`/`forget` from deleting secrets, which makes a
+        # permissions problem *extend* a secret's life.
+        if stat.S_IMODE(st.st_mode) & 0o077:
+            os.fchmod(fd, 0o600)
+    except BaseException:
+        os.close(fd)
+        raise
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield

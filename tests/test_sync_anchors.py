@@ -355,16 +355,66 @@ def test_accounting_deleted_reply_not_expected(engine):
     assert problems == []
 
 
-def test_accounting_resolved_counted(engine):
+def test_accounting_resolved_absent_from_export_is_clean(engine):
+    """Google omits resolved threads from the export entirely — measured on a
+    live document 2026-07-30. The previous version of this test put the
+    resolved thread in `records`, asserting the opposite, which is why the
+    accounting bug shipped: one closed thread blocked every replace forever."""
     anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z",
                             resolved=True)]
+    problems, metrics = engine._account_anchored_comments(anchored, [], [])
+    assert problems == []
+    assert metrics["api_anchored_resolved"] == 1
+    assert metrics["api_anchored_live"] == 0
+
+
+def test_accounting_resolved_alongside_live_thread(engine):
+    """The live thread is accounted for; the resolved one is simply absent."""
+    anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z"),
+                api_comment("c2", "A", "2026-01-01T00:00:09Z", resolved=True)]
     records = [{"docx_id": "0", "author": "A",
                 "date_sec": "2026-01-01T00:00:01Z"}]
     problems, metrics = engine._account_anchored_comments(
         anchored, records, _spans("0"))
     assert problems == []
+    assert metrics["api_anchored_live"] == 1
     assert metrics["api_anchored_resolved"] == 1
-    assert metrics["api_anchored_live"] == 0
+
+
+def test_accounting_live_thread_still_blocks_when_missing(engine):
+    """Regression guard: excluding resolved must not weaken ghost detection."""
+    anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z")]
+    problems, _ = engine._account_anchored_comments(anchored, [], [])
+    assert any("missing from the export" in p for p in problems)
+
+
+def test_accounting_multi_anchor_excess_is_allowed(engine):
+    """One thread anchored to three fragments yields three export records with
+    the same key. Exact multiset equality called that a stale export and
+    blocked the document."""
+    anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z")]
+    records = [{"docx_id": str(i), "author": "A",
+                "date_sec": "2026-01-01T00:00:01Z"} for i in range(3)]
+    problems, _ = engine._account_anchored_comments(
+        anchored, records, _spans("0", "1", "2"))
+    assert problems == []
+
+
+def test_accounting_multi_anchor_excess_cannot_mask_a_ghost(engine):
+    """The counterexample both reviewers found independently against the first
+    draft of this fix: a live two-anchor thread and a ghosted thread sharing
+    one (author, second) key give api=2, docx=2. A plain `docx >= api` rule
+    passes and the ghost's anchor is left unprotected. The duplicate key must
+    keep failing closed."""
+    anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z"),
+                api_comment("c2", "A", "2026-01-01T00:00:01Z")]  # ghosted
+    records = [{"docx_id": "0", "author": "A",
+                "date_sec": "2026-01-01T00:00:01Z"},
+               {"docx_id": "1", "author": "A",
+                "date_sec": "2026-01-01T00:00:01Z"}]  # both from c1
+    problems, _ = engine._account_anchored_comments(
+        anchored, records, _spans("0", "1"))
+    assert any("ambiguous" in p for p in problems)
 
 
 def test_accounting_record_without_span_breaks_bijection(engine):

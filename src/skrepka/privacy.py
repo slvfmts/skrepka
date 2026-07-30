@@ -59,6 +59,40 @@ def _smoke_tokens(files):
             if f.startswith(setup.TOKEN_PREFIX) and f.endswith(".json")]
 
 
+def _token_crash_temps(files):
+    """Crash temps whose base name is a TOKEN file.
+
+    `_crash_temps` matches every atomic-write leftover, including temps of
+    `credentials.json` and of the recovery client. `logout` promises to keep
+    the OAuth client, so it must not sweep those — only the ones that can hold
+    a refresh token."""
+    bases = (config.TOKEN_NAME, setup.RECOVERY_TOKEN)
+    return [f for f in _crash_temps(files)
+            if f.startswith(tuple(f".{b}." for b in bases))
+            or f.startswith(f".{setup.TOKEN_PREFIX}")]
+
+
+def _token_bearing(files):
+    """Every on-disk artifact that can still authenticate as you (no marker).
+
+    logout, the cleanup after revoke, and forget must agree on this list;
+    keeping three hand-written copies is how `recovery.token.json` and the
+    crash temps ended up in forget only. After an interrupted reauth those hold
+    a working refresh token, so leaving them behind broke logout's promise that
+    the agent can no longer reach Google."""
+    return ([config.TOKEN_NAME, setup.RECOVERY_TOKEN]
+            + _smoke_tokens(files) + _token_crash_temps(files))
+
+
+def _usable_token_targets(files):
+    """Token-bearing artifacts, then the write-ahead marker LAST.
+
+    The marker is a barrier that makes readers fail closed, so if a delete
+    fails partway through, the marker must still be standing rather than
+    exposing a half-dismantled sign-in."""
+    return _token_bearing(files) + [config.MARKER_NAME]
+
+
 def _exists(name):
     return os.path.lexists(os.path.join(config.config_dir(), name))
 
@@ -107,7 +141,7 @@ def _cleanup_after_revoke(revoked_hash):
             return {"superseded": True, "verifiable": True,
                     "removed": [], "failed": [], "token_present": True}
         files = _dir_files()
-        targets = [config.TOKEN_NAME, config.MARKER_NAME] + _smoke_tokens(files)
+        targets = _usable_token_targets(files)
         removed, failed = _remove_existing(targets)
         return {"superseded": False, "verifiable": True,
                 "removed": removed, "failed": failed,
@@ -132,8 +166,8 @@ def cmd_logout(argv):
     setup._SafeArgParser(prog="skrepka logout").parse_args(argv)
     with config.lock():
         files = _dir_files()
-        # every USABLE token: the active token plus each smoke/cleanup token
-        targets = [config.TOKEN_NAME, config.MARKER_NAME] + _smoke_tokens(files)
+        # every USABLE token, marker last (see _usable_token_targets)
+        targets = _usable_token_targets(files)
         removed, failed = _remove_existing(targets)
     _emit({
         "action": "logout",
@@ -176,8 +210,19 @@ def cmd_revoke(argv):
         return 1
     refresh_token = ((env or {}).get("token") or {}).get("refresh_token")
     if not refresh_token:
-        _emit({"action": "revoke", "status": "nothing_to_revoke",
-               "note": "no stored sign-in with a refresh token to revoke"})
+        # There is nothing to revoke server-side, but an interrupted reauth can
+        # leave a recovery/smoke token behind that still authenticates. Revoke
+        # must not imply those are gone — name them and point at logout.
+        leftovers = [n for n in _token_bearing(_dir_files())
+                     if n != config.TOKEN_NAME and _exists(n)]
+        payload = {"action": "revoke", "status": "nothing_to_revoke",
+                   "note": "no stored sign-in with a refresh token to revoke"}
+        if leftovers:
+            payload["local_tokens_still_present"] = leftovers
+            payload["note"] += (
+                "; other local token files remain and may still work — "
+                "run `skrepka logout` (or `forget`) to remove them")
+        _emit(payload)
         return 0
 
     confirmed = _confirm(
@@ -285,10 +330,20 @@ def _forget_targets():
     journals/tokens, recovery files, and atomic-write crash temps. `.lock` and
     the config dir itself are deliberately NOT included."""
     files = _dir_files()
-    known = ([config.TOKEN_NAME, config.CREDENTIALS_NAME, config.MARKER_NAME,
-              setup.RECOVERY_CRED, setup.RECOVERY_TOKEN]
-             + _smoke_journals(files) + _smoke_tokens(files))
-    return [t for t in known if _exists(t)] + _crash_temps(files)
+    # same token list as logout/revoke (single source), plus the client side,
+    # the journals and any remaining crash temps; marker last as everywhere
+    known = (_token_bearing(files)
+             + [config.CREDENTIALS_NAME, setup.RECOVERY_CRED]
+             + _smoke_journals(files) + _crash_temps(files)
+             + [config.MARKER_NAME])
+    out, seen = [], set()
+    for name in known:
+        if name in seen:
+            continue
+        seen.add(name)
+        if _exists(name):
+            out.append(name)
+    return out
 
 
 def cmd_forget(argv):
