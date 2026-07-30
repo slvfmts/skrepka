@@ -34,6 +34,12 @@ jobs:
           fetch-depth: 0  # full history for the leak scan and tag inspection
       - name: reject lightweight tags
         run: |
+          # actions/checkout leaves refs/tags/<name> pointing straight at the
+          # commit, so `git cat-file -t` reports "commit" even for a properly
+          # annotated tag — the check rejected every release until this fetch
+          # was added. Re-fetch the real tag object before inspecting it.
+          git fetch --force --no-recurse-submodules origin \
+            "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
           if [ "$(git cat-file -t "$GITHUB_REF_NAME")" != "tag" ]; then
             echo "::error::$GITHUB_REF_NAME is a lightweight tag; use an annotated tag (git tag -a)"; exit 1
           fi
