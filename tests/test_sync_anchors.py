@@ -399,6 +399,109 @@ def test_accounting_live_thread_still_blocks_when_missing(engine):
     assert any("missing from the export" in p for p in problems)
 
 
+# ---------------------------------------------------------------------------
+# issue #12: one census feeds both the accounting and the fingerprint
+# ---------------------------------------------------------------------------
+
+def _reply(rid, author, created, action="", deleted=False):
+    return {"id": rid, "createdTime": created,
+            "author": {"displayName": author},
+            "action": action, "deleted": deleted}
+
+
+def test_census_fingerprint_comes_from_the_same_read(engine):
+    """The accounting data and fp1 must be one snapshot, not two reads.
+    Two reads left a gap no check covered: comments could move between the
+    census the accounting trusted and the fp1/fp2 sandwich."""
+    drive = DriveStub([api_comment("c1", "A", CREATED)], lambda: b"")
+    live, anchored, fp = engine._census_comments(drive, "doc1")
+    assert drive._list_calls == 1
+    assert [c["id"] for c in live] == ["c1"]
+    assert [c["id"] for c in anchored] == ["c1"]
+    # fp2 is taken through a different entry point — same shape, comparable
+    assert fp == engine._comments_fingerprint(drive, "doc1")
+
+
+def test_census_asks_for_the_fields_the_fingerprint_needs(engine):
+    """Guards the request itself: trimming `fields` or flipping includeDeleted
+    would silently weaken the fingerprint while every other test still passes,
+    because the stubs hand back whatever the fixtures declare."""
+    seen = {}
+
+    class Recording(DriveStub):
+        def list(self, **kw):
+            seen.update(kw)
+            return super().list(**kw)
+
+    engine._census_comments(Recording([api_comment("c1", "A", CREATED)],
+                                      lambda: b""), "doc1")
+    assert seen["includeDeleted"] is True
+    # the reply sub-selection is asserted whole: checking for bare "deleted"
+    # or "createdTime" would be satisfied by the parent comment's own fields
+    assert "replies(id,createdTime,author/displayName,deleted,action)" \
+        in seen["fields"]
+    for f in ("resolved", "quotedFileContent", "anchor"):
+        assert f in seen["fields"]
+
+
+def test_fingerprint_notices_a_new_reply(engine):
+    """The old fingerprint carried only (id, deleted, resolved, anchored) of
+    parent threads, so a reply could appear or vanish invisibly — while the
+    accounting keys count reply entries and the export emits a record per
+    entry. Adding a reply must change the fingerprint."""
+    before = [api_comment("c1", "A", CREATED)]
+    after = [api_comment("c1", "A", CREATED,
+                         replies=[_reply("r1", "B", "2026-07-14T00:00:05Z")])]
+    assert (engine._fingerprint_from_census(before)
+            != engine._fingerprint_from_census(after))
+
+
+def test_fingerprint_notices_a_resolve_reopen_round_trip(engine):
+    """Resolving and reopening in the UI appends a reply per action, so the
+    thread comes back with resolved=False but two extra reply records. The
+    fingerprint sees them; a parents-only fingerprint would read the round
+    trip as no change at all."""
+    before = [api_comment("c1", "A", CREATED)]
+    after = [api_comment("c1", "A", CREATED, replies=[
+        _reply("r1", "A", "2026-07-14T00:00:05Z", action="resolve"),
+        _reply("r2", "A", "2026-07-14T00:00:06Z", action="reopen"),
+    ])]
+    assert (engine._fingerprint_from_census(before)
+            != engine._fingerprint_from_census(after))
+
+
+def test_census_keeps_deleted_comments_out_of_the_live_view(engine):
+    """Reading with includeDeleted=True serves the fingerprint; every other
+    consumer must still see only live comments, exactly as before."""
+    raw = [api_comment("c1", "A", CREATED),
+           dict(api_comment("c2", "A", "2026-07-14T00:00:09Z"), deleted=True)]
+    drive = DriveStub(raw, lambda: b"")
+    live, anchored, fp = engine._census_comments(drive, "doc1")
+    assert [c["id"] for c in live] == ["c1"]
+    assert [c["id"] for c in anchored] == ["c1"]
+    assert any(t[1] == "c2" for t in fp)  # deleted entry still fingerprinted
+
+
+def test_patch_blocks_when_only_a_reply_changes(engine, monkeypatch):
+    """End to end for #12: a reply landing between the census and the write
+    must abort the replace. Before the fix the fingerprint ignored replies,
+    so this exact race went through unnoticed."""
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    docs.fail_cleanup = True
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        _docx_builder(docs, ANCHORED_PARAS, ANCHORED_COMMENTS),
+        comments_after=[api_comment("c1", "A", CREATED, replies=[
+            _reply("r1", "B", "2026-07-14T00:00:05Z")])],
+        switch_after_lists=1)  # list 1 = census+fp1, list 2 = fp2
+    monkeypatch.setattr(engine.time, "sleep", lambda s: None)
+    op = {"op": "replace_quote", "quote": "Bravo", "with": "Bravo2"}
+    with pytest.raises(engine.PatchOpError) as exc:
+        engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
+    assert exc.value.state == "not_applied"
+
+
 def test_accounting_multi_anchor_excess_is_allowed(engine):
     """One thread anchored to three fragments yields three export records with
     the same key. Exact multiset equality called that a stale export and
@@ -445,7 +548,119 @@ def test_accounting_entry_without_created_time(engine):
     anchored = [{"id": "c1", "author": {"displayName": "A"},
                  "quotedFileContent": {"value": "x"}, "replies": []}]
     problems, _ = engine._account_anchored_comments(anchored, [], [])
-    assert any("lacks author/createdTime" in p for p in problems)
+    assert any("without author/createdTime" in p for p in problems)
+    # the refusal names the thread, not a bare author@second pair (#10)
+    assert any("c1 «x»" in p for p in problems)
+
+
+# ---------------------------------------------------------------------------
+# issue #10: readable refusals + range-confined blocking
+# ---------------------------------------------------------------------------
+
+def test_comment_label_names_id_and_quote(engine):
+    c = {"id": "AAABBB", "quotedFileContent": {"value": "  хранит своё\nи "
+                                                        "умеет своё  "}}
+    assert engine._comment_label(c) == "AAABBB «хранит своё и умеет своё»"
+
+
+def test_comment_label_truncates_and_survives_a_missing_quote(engine):
+    long = {"id": "c1", "quotedFileContent": {"value": "я" * 80}}
+    assert engine._comment_label(long) == "c1 «" + "я" * 40 + "…»"
+    assert engine._comment_label({"id": "c2"}) == "c2 (без цитаты)"
+
+
+def test_missing_thread_refusal_names_the_thread(engine):
+    """The old message was «'slv fmts' @ 2026-07-30T12:46:33Z» — useless on a
+    doc where one person wrote everything inside one minute (#10)."""
+    anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z")]
+    anchored[0]["quotedFileContent"] = {"value": "хранит своё"}
+    problems, _ = engine._account_anchored_comments(anchored, [], [])
+    msg = next(p for p in problems if "missing from the export" in p)
+    assert "c1 «хранит своё»" in msg
+    assert "'A' @" not in msg
+
+
+def test_scope_leaves_a_coordinateless_problem_global(engine):
+    """A thread missing from the export has no span, so there is nothing to
+    confine the refusal to — it must keep blocking the document."""
+    problems = ["anchored comment entries missing from the export: c1 «x»"]
+    global_problems, blocked = engine._scope_anchor_problems(problems, [])
+    assert global_problems == problems
+    assert blocked == []
+
+
+def test_record_with_several_spans_stays_global(engine):
+    """Tempting to confine to those spans, but the docx parser already calls
+    such a document globally broken, and a w:id whose markers do not pair up
+    1:1 has exactly the unreliable offsets we would be confining to."""
+    anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z")]
+    records = [{"docx_id": "0", "author": "A",
+                "date_sec": "2026-01-01T00:00:01Z"}]
+    problems, _ = engine._account_anchored_comments(
+        anchored, records, _spans("0", "0"))
+    p = next(p for p in problems if "anchor spans in document.xml" in p)
+    assert getattr(p, "docx_ids", ()) == ()
+
+
+def test_scope_confines_a_problem_that_maps_to_a_position(engine):
+    p = engine._AnchorProblem("anchor span 9 has no comments.xml entry", ("9",))
+    anchors = [(10, 15, "Bravo", "9"), (30, 37, "Charlie", "0")]
+    global_problems, blocked = engine._scope_anchor_problems([p], anchors)
+    assert global_problems == []
+    assert len(blocked) == 1
+    start, end, label = blocked[0]
+    assert (start, end) == (10, 15)
+    assert "docx id 9" in label and "Bravo" in label
+
+
+def test_scope_falls_back_to_global_when_the_id_does_not_map(engine):
+    """An anchor we cannot place is an anchor we cannot avoid."""
+    p = engine._AnchorProblem("anchor span 9 has no comments.xml entry", ("9",))
+    global_problems, blocked = engine._scope_anchor_problems(
+        [p], [(30, 37, "Charlie", "0")])
+    assert global_problems == [p]
+    assert blocked == []
+
+
+def test_patch_refuses_only_the_paragraph_holding_the_odd_anchor(
+        engine, monkeypatch, capsys):
+    """Bravo carries an export span with no comments.xml entry. That op is
+    refused — and the refusal says so instead of blocking the document."""
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        _docx_builder(docs, [("Alpha", []), ("Bravo", [("9", 0, 5)]),
+                             ("Charlie", [("0", 0, 7)])],
+                      [("0", "A", CREATED_SEC)]))
+    monkeypatch.setattr(engine.time, "sleep", lambda s: None)
+    op = {"op": "replace_quote", "quote": "Bravo", "with": "Bravo2"}
+    with pytest.raises(SystemExit):
+        engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
+    err = json.loads(capsys.readouterr().out)["error"]
+    assert "refusing THIS operation" in err
+    assert "docx id 9" in err
+    assert _no_content_mutation(docs)
+    assert docs.canary_text is None
+
+
+def test_patch_still_applies_away_from_the_odd_anchor(engine, monkeypatch):
+    """Same document, an op nowhere near the unaccounted span: it goes
+    through. Before #10 this raised too — one murky thread froze everything."""
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        _docx_builder(docs, [("Alpha", []), ("Bravo", [("9", 0, 5)]),
+                             ("Charlie", [("0", 0, 7)])],
+                      [("0", "A", CREATED_SEC)]))
+    monkeypatch.setattr(engine.time, "sleep", lambda s: None)
+    op = {"op": "replace_quote", "quote": "Alpha", "with": "Alpha2"}
+    engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
+    main = next(b for b in docs.batches if any("replaceAllText" in r
+                                               for r in b))
+    assert "deleteContentRange" in main[0]  # canary delete first
+    assert "replaceAllText" in main[1]
 
 
 # ---------------------------------------------------------------------------
@@ -952,7 +1167,9 @@ def test_patch_fp2_change_with_failing_cleanup_raises(engine, monkeypatch,
         _docx_builder(docs, ANCHORED_PARAS, ANCHORED_COMMENTS),
         comments_after=[api_comment("c1", "A", CREATED),
                         api_comment("c9", "Z", "2026-07-14T00:00:00.5Z")],
-        switch_after_lists=2)  # census, fp1, then fp2 sees a new comment
+        # one census now yields both the accounting data and fp1 (#12),
+        # so the second list IS fp2 and it sees a new comment
+        switch_after_lists=1)
     monkeypatch.setattr(engine.time, "sleep", lambda s: None)
     op = {"op": "replace_quote", "quote": "Bravo", "with": "Bravo2"}
     with pytest.raises(engine.PatchOpError) as exc:

@@ -299,41 +299,87 @@ def _scan_suggestions(node):
     return None
 
 
+_COMMENT_FIELDS = (
+    "nextPageToken,comments(id,content,author/displayName,createdTime,"
+    "quotedFileContent,resolved,deleted,anchor,"
+    "replies(id,createdTime,author/displayName,deleted,action))"
+)
+
+
+def _list_comments_raw(drive_service, file_id):
+    """Paginated comments.list carrying every field the accounting AND the
+    freshness fingerprint need, deleted entries included. Raises on API
+    errors — callers decide between fail-closed and fail-stop."""
+    out = []
+    page_token = None
+    while True:
+        resp = drive_service.comments().list(
+            fileId=file_id,
+            fields=_COMMENT_FIELDS,
+            includeDeleted=True,
+            pageSize=100,
+            pageToken=page_token,
+        ).execute()
+        out.extend(resp.get("comments", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            return out
+
+
+def _fingerprint_from_census(raw_comments):
+    """Fingerprint a comment-state snapshot, threads AND replies.
+
+    Replies are in deliberately (issue #12). Two reasons: the accounting
+    keys count reply entries, so a reply appearing or being deleted shifts
+    the export records the accounting is matched against; and resolving or
+    reopening a thread in the UI appends a reply of its own, which makes a
+    resolve→reopen round trip visible instead of cancelling out.
+    """
+    out = set()
+    for c in raw_comments:
+        out.add((
+            "c", c.get("id"), bool(c.get("deleted")), bool(c.get("resolved")),
+            (c.get("author") or {}).get("displayName"), c.get("createdTime"),
+            bool(c.get("quotedFileContent") or c.get("anchor")),
+        ))
+        for r in (c.get("replies") or []):
+            out.add((
+                "r", r.get("id"), bool(r.get("deleted")), c.get("id"),
+                (r.get("author") or {}).get("displayName"),
+                r.get("createdTime"), r.get("action") or "",
+            ))
+    return out
+
+
 def _census_comments(drive_service, file_id):
     """List ALL comments (incl. resolved) with pagination; fail closed.
 
-    Returns (all_comments, anchored_comments). A comment counts as anchored
-    when it carries quotedFileContent or an anchor field. quotedFileContent
-    is a stale snapshot — it is NEVER used to locate anchors, only to decide
-    whether the doc contains anchored comments at all.
+    Returns (all_comments, anchored_comments, fingerprint). A comment counts
+    as anchored when it carries quotedFileContent or an anchor field.
+    quotedFileContent is a stale snapshot — it is NEVER used to locate
+    anchors, only to decide whether the doc contains anchored comments at all.
+
+    The fingerprint comes from THIS read, not a second one (issue #12).
+    Accounting used to run on the census while freshness was fingerprinted by
+    a separate call, so the state the accounting trusted was never the state
+    the fp1/fp2 sandwich proved stable — comments could move in the gap
+    between the two reads and no check would see it.
     """
-    out = []
-    page_token = None
     try:
-        while True:
-            resp = drive_service.comments().list(
-                fileId=file_id,
-                fields="nextPageToken,comments(id,content,author/displayName,"
-                       "createdTime,quotedFileContent,resolved,deleted,anchor,"
-                       "replies(id,createdTime,author/displayName,deleted))",
-                includeDeleted=False,
-                pageSize=100,
-                pageToken=page_token,
-            ).execute()
-            out.extend(resp.get("comments", []))
-            page_token = resp.get("nextPageToken")
-            if not page_token:
-                break
+        raw = _list_comments_raw(drive_service, file_id)
     except HttpError as e:
         _error(
             f"cannot list comments (fail closed, no writes performed): "
             f"{e.reason if hasattr(e, 'reason') else e}"
         )
+    # deleted entries serve the fingerprint only; every other consumer sees
+    # the same live-comment view it saw before
+    out = [c for c in raw if not c.get("deleted")]
     anchored = [
         c for c in out
-        if not c.get("deleted") and (c.get("quotedFileContent") or c.get("anchor"))
+        if c.get("quotedFileContent") or c.get("anchor")
     ]
-    return out, anchored
+    return out, anchored, _fingerprint_from_census(raw)
 
 
 def _extract_runs_full(content):
@@ -1528,6 +1574,52 @@ def _docx_comment_records(docx_bytes):
     return records, problems
 
 
+class _AnchorProblem(str):
+    """An accounting problem that knows WHICH export entries it is about.
+
+    Subclasses `str` so every message-matching path keeps working unchanged.
+    `docx_ids` is the set of comments.xml ids the problem is confined to; a
+    problem carrying ids can be turned into document coordinates and blocks
+    only the operations that touch them (issue #10). A plain `str` problem has
+    no coordinates and keeps blocking the whole document.
+    """
+
+    def __new__(cls, text, docx_ids=()):
+        obj = super().__new__(cls, text)
+        obj.docx_ids = tuple(docx_ids)
+        return obj
+
+
+def _comment_label(c):
+    """Human-readable identity of a thread for refusal messages.
+
+    «'slv fmts' @ 2026-07-30T12:46:33Z» is unreadable on a document where one
+    person wrote every comment inside a minute (issue #10), so refusals name
+    the comment id and the first words of its quote instead. quotedFileContent
+    is a stale snapshot and stays banned from every safety decision — this is
+    display only.
+    """
+    quote = " ".join(
+        ((c.get("quotedFileContent") or {}).get("value") or "").split())
+    if len(quote) > 40:
+        quote = quote[:40].rstrip() + "…"
+    cid = c.get("id") or "?"
+    return f"{cid} «{quote}»" if quote else f"{cid} (без цитаты)"
+
+
+def _describe_keys(keys, key_owners):
+    """Name the threads behind accounting keys, deduplicated, id-first."""
+    seen, out = set(), []
+    for key in keys:
+        for c in key_owners.get(key, ()):
+            label = _comment_label(c)
+            if label not in seen:
+                seen.add(label)
+                out.append(label)
+    return "; ".join(out[:5]) if out else "; ".join(
+        f"{a!r} @ {d}" for a, d in list(keys)[:5])
+
+
 def _account_anchored_comments(anchored, records, spans,
                                skip_resolved=False):
     """Prove every anchored API comment is present in the docx export.
@@ -1554,10 +1646,11 @@ def _account_anchored_comments(anchored, records, spans,
 
     Returns (problems, metrics).
     """
-    from collections import Counter
+    from collections import Counter, defaultdict
 
     problems = []
     api_keys = Counter()
+    key_owners = defaultdict(list)  # accounting key → threads that produced it
     resolved_n = 0
     for c in anchored:
         if c.get("resolved"):
@@ -1584,10 +1677,12 @@ def _account_anchored_comments(anchored, records, spans,
             created = entry.get("createdTime")
             if not author or not created:
                 problems.append(
-                    f"comment {c.get('id')} entry lacks author/createdTime "
-                    f"— cannot account for it")
+                    f"comment {_comment_label(c)} has an entry without "
+                    f"author/createdTime — cannot account for it")
                 continue
-            api_keys[(author, _trunc_seconds(created))] += 1
+            key = (author, _trunc_seconds(created))
+            api_keys[key] += 1
+            key_owners[key].append(c)
     docx_keys = Counter((r["author"], r["date_sec"]) for r in records)
 
     # One thread may be anchored to several non-adjacent fragments, and the
@@ -1604,9 +1699,9 @@ def _account_anchored_comments(anchored, records, spans,
     for key, n in api_keys.items():
         if n > 1:
             problems.append(
-                f"ambiguous accounting key (same author, same second) ×{n}: "
-                f"{key[0]!r} @ {key[1]} — cannot attribute export records to "
-                f"threads, refusing")
+                f"ambiguous accounting key (same author, same second) ×{n} — "
+                f"cannot attribute export records to threads, refusing: "
+                f"{_describe_keys([key], key_owners)}")
     for key, n in docx_keys.items():
         if n > 1 and key not in api_keys:  # api-side dupes already reported
             problems.append(
@@ -1620,11 +1715,18 @@ def _account_anchored_comments(anchored, records, spans,
     unknown = Counter({k: n for k, n in docx_keys.items()
                        if k not in api_keys})
     if missing:
+        # Deliberately NOT scoped to an operation range (issue #10): a thread
+        # missing from the export has no span in document.xml, so there are no
+        # coordinates to confine the refusal to. Anything could be sitting
+        # anywhere, so every replace stays blocked.
         problems.append(
             "anchored comment entries missing from the export (ghost thread "
             "or stale export — indistinguishable): "
-            + "; ".join(f"{a!r} @ {d}" for a, d in list(missing)[:5]))
+            + _describe_keys(missing, key_owners))
     if unknown:
+        # Also global. An export record the API does not know means the export
+        # and the API disagree about what exists; the span it maps to is not
+        # the extent of the doubt.
         problems.append(
             "export contains comment entries unknown to the API (stale "
             "export): " + "; ".join(f"{a!r} @ {d}" for a, d in list(unknown)[:5]))
@@ -1638,13 +1740,25 @@ def _account_anchored_comments(anchored, records, spans,
         span_ids[sid] += 1
     record_ids = {r["docx_id"] for r in records}
     for rid in sorted(record_ids):
-        if span_ids.get(rid, 0) != 1:
-            problems.append(
-                f"comments.xml entry {rid} has {span_ids.get(rid, 0)} anchor "
-                f"spans in document.xml (need exactly 1)")
-    for sid in sorted(set(span_ids) - record_ids, key=str):
+        n = span_ids.get(rid, 0)
+        if n == 1:
+            continue
+        # Stays global either way. n == 0: the record has no span at all (an
+        # anchor outside document.xml — a footnote, a header — or a ghost),
+        # nothing to point at. n > 1: tempting to confine to those spans, but
+        # _parse_docx_anchor_spans already reports the same document as
+        # globally broken ("comment range {id}: N starts / M ends"), and a
+        # w:id whose markers do not pair up 1:1 has unreliable offsets — the
+        # coordinates we would confine the refusal to are the untrustworthy
+        # part.
         problems.append(
-            f"anchor span {sid} has no comments.xml entry")
+            f"comments.xml entry {rid} has {n} anchor spans in document.xml "
+            f"(need exactly 1)")
+    for sid in sorted(set(span_ids) - record_ids, key=str):
+        # A span with no record is a local defect of the w:id join: it sits at
+        # known coordinates and every other span still joins cleanly.
+        problems.append(_AnchorProblem(
+            f"anchor span {sid} has no comments.xml entry", (sid,)))
     metrics = {
         "api_anchored_live": len(anchored) - resolved_n,
         "api_anchored_resolved": resolved_n,
@@ -1653,6 +1767,55 @@ def _account_anchored_comments(anchored, records, spans,
         "anchor_spans": len(spans),
     }
     return problems, metrics
+
+
+def _scope_anchor_problems(problems, anchors):
+    """Split accounting problems into document-wide and range-confined ones.
+
+    Returns (global_problems, blocked) where `blocked` is
+    [(start, end, label)] in the `_find_protected_overlap` shape:
+    TEXT-REMOVING operations overlapping those ranges are refused, the rest of
+    the document stays editable (issue #10 — one murky thread used to forbid
+    every edit).
+
+    Inserts are exempt, like they are for healthy anchors, and for a stronger
+    reason than C5: ghosting needs every anchored character gone, and
+    insertText removes nothing. Whatever the span really is, adding text
+    inside it cannot destroy it.
+
+    A problem only earns a range when EVERY export entry it names maps to a
+    document position. One unmapped id and it goes back to blocking the whole
+    document: an anchor we cannot place is an anchor we cannot avoid.
+
+    Only one problem class reaches here with ids today — an anchor span with
+    no comments.xml entry. The others are either coordinate-free by nature
+    (a thread absent from the export) or already reported as globally broken
+    by the docx parser.
+    """
+    by_id = {}
+    for as_, ae, atext, aid in anchors:
+        by_id.setdefault(aid, []).append((as_, ae, atext))
+
+    global_problems, blocked = [], []
+    for p in problems:
+        ids = getattr(p, "docx_ids", ())
+        if not ids:
+            global_problems.append(p)
+            continue
+        placed = []
+        for i in ids:
+            if not by_id.get(i):
+                placed = None
+                break
+            placed.extend((s, e, t, i) for s, e, t in by_id[i])
+        if placed is None:
+            global_problems.append(p)
+            continue
+        for s, e, t, i in placed:
+            blocked.append((s, e, (
+                f"an unaccounted comment anchor (docx id {i}, «{t[:40]}») — "
+                f"{p}")))
+    return global_problems, blocked
 
 
 def _named_range_intervals(doc_tab):
@@ -1782,7 +1945,7 @@ def _canary_present(docs_service, file_id, canary):
 
 def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
                            doc_tab, anchored, named_intervals, body_end,
-                           skip_resolved=False):
+                           *, fp1, skip_resolved=False):
     """Provably-fresh anchor map for structural edits on a commented doc.
 
     Export freshness is not provable read-only (files.export takes no
@@ -1794,6 +1957,10 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
     the FIRST request of its final atomic batch (pinned to R1): the
     canary sits strictly at the doc end, so deleting it first restores
     R0 coordinates for every other request.
+
+    `fp1` is the fingerprint of the very census that produced `anchored`
+    (issue #12) — the caller passes both from one read, so the state the
+    accounting trusts is exactly the state the fp1/fp2 sandwich proves stable.
 
     Returns (snapshot, retry_reason): snapshot is
     {"anchors", "fp1", "canary", "r1", "metrics"} on success;
@@ -1808,13 +1975,7 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
                 f"{label} reaches the end of the document — the sync "
                 f"canary cannot be inserted safely; release the mark or "
                 f"edit in the UI")
-    try:
-        fp1 = _comments_fingerprint(drive_service, file_id)
-    except Exception as e:
-        _error(f"comment census failed (nothing applied): "
-               f"{e.reason if hasattr(e, 'reason') else e}")
-
-    canary_text = (f"⚓ skrepka-canary-{uuid.uuid4().hex} {_CANARY_NOTE}")
+    canary_text = f"⚓ skrepka-canary-{uuid.uuid4().hex} {_CANARY_NOTE}"
     payload = "\n" + canary_text  # own terminal paragraph (codex r3 #1)
     canary = {"text": canary_text,
               "start": body_end - 1,
@@ -1907,11 +2068,12 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
             anchored, records, spans, skip_resolved=skip_resolved)
         anchors, map_problems = _map_anchors_to_doc(doc_tab, spans)
         all_problems = problems + rec_problems + acc_problems + map_problems
-        if all_problems:
+        global_problems, blocked = _scope_anchor_problems(all_problems, anchors)
+        if global_problems:
             _abort(
                 "anchor accounting/mapping failed — paragraph "
                 "replaces/deletes are blocked (fail closed): "
-                + "; ".join(all_problems[:4])
+                + "; ".join(global_problems[:4])
                 + ". Разрулите комментарии-призраки в UI (удалить/"
                   "переоткрыть тред) или правьте документ в UI.")
         for as_, ae, _atext, aid in anchors:
@@ -1926,8 +2088,9 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
     except Exception as e:
         _abort(f"anchor preflight failed unexpectedly: {e!r}")
     metrics["canary"] = "confirmed"
+    metrics["blocked_anchors"] = len(blocked)
     return ({"anchors": anchors, "fp1": fp1, "canary": canary,
-             "r1": canary["r1"], "metrics": metrics}, None)
+             "r1": canary["r1"], "metrics": metrics, "blocked": blocked}, None)
 
 
 def _canary_insert_ambiguous(docs_service, file_id, canary, reason):
@@ -1947,24 +2110,13 @@ def _canary_insert_ambiguous(docs_service, file_id, canary, reason):
 
 
 def _comments_fingerprint(drive_service, file_id):
-    """Set of (id, deleted, resolved, anchored) for ALL comments, paginated.
-    Raises on any error — callers treat that as fail-stop."""
-    out = set()
-    page_token = None
-    while True:
-        resp = drive_service.comments().list(
-            fileId=file_id,
-            fields="nextPageToken,comments(id,deleted,resolved,"
-                   "quotedFileContent,anchor)",
-            includeDeleted=True, pageSize=100, pageToken=page_token,
-        ).execute()
-        for c in resp.get("comments", []):
-            out.add((c.get("id"), bool(c.get("deleted")),
-                     bool(c.get("resolved")),
-                     bool(c.get("quotedFileContent") or c.get("anchor"))))
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            return out
+    """Re-read the comment state and fingerprint it (the fp2 side).
+
+    Reads through the same helper as the census, so fp1 — which the census
+    now hands out directly — and fp2 are the same shape over the same fields
+    and compare like for like. Raises on any error; callers treat that as
+    fail-stop."""
+    return _fingerprint_from_census(_list_comments_raw(drive_service, file_id))
 
 
 def _refuse_on_suggestions(doc_tab):
@@ -2160,13 +2312,14 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
         body_content = (doc_tab.get("body", {}) or {}).get("content", [])
         body_end = body_content[-1]["endIndex"] if body_content else 2
         named_intervals = _named_range_intervals(doc_tab)
-        _, anchored_now = _census_comments(drive_service, file_id)
+        _, anchored_now, fp1 = _census_comments(drive_service, file_id)
 
         # this path edits through replaceAllText only — the case where a
         # resolved thread's anchor was measured to survive full coverage
         snap, retry_reason = _fresh_anchor_snapshot(
             docs_service, drive_service, file_id, doc, doc_tab,
-            anchored_now, named_intervals, body_end, skip_resolved=True)
+            anchored_now, named_intervals, body_end, fp1=fp1,
+            skip_resolved=True)
         if snap is None:
             last_reason = retry_reason
             continue
@@ -2179,6 +2332,20 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
                         f"(данные не потеряны).")
             return msg
 
+        for bs, be, label in snap["blocked"]:
+            # An anchor the accounting could not vouch for, but WHOSE
+            # POSITION is known: only replaces reaching it are refused, and
+            # ANY overlap counts — unlike a healthy anchor, this one's
+            # survival under a partial rewrite is not something we can reason
+            # about. (Inserts never reach this loop; they cannot remove text.)
+            if r["start"] < be and bs < r["end"]:
+                cleaned = _cleanup_canary(docs_service, file_id, canary)
+                _error(_canary_msg(
+                    f"this replace overlaps {label} (range [{bs}, {be})) — "
+                    f"refusing THIS operation; the rest of the document is "
+                    f"still editable. Разрулите этот тред в UI (удалить/"
+                    f"переоткрыть) или правьте этот фрагмент в UI. "
+                    f"({r['source']})", cleaned))
         for as_, ae, atext, aid in snap["anchors"]:
             # full coverage ghosts the comment (C1); PARTIAL overlap is
             # verified safe for replaceAllText — the anchor shrinks
@@ -2312,13 +2479,13 @@ def patch_doc(file_id, ops_path, tab_id=None):
     resolved = [_resolve_op(op, doc_tab, tid) for op in ops]
     _check_ops_overlap(resolved)
 
-    all_comments, anchored = _census_comments(drive_service, file_id)
+    all_comments, anchored, _ = _census_comments(drive_service, file_id)
 
     if not anchored:
         # ---- clean-doc path: single atomic index-based batch ----
         # Second census immediately before the destructive batch narrows the
         # race window (a comment added in between would change the strategy).
-        _, anchored2 = _census_comments(drive_service, file_id)
+        _, anchored2, _ = _census_comments(drive_service, file_id)
         if anchored2:
             _error(
                 "an anchored comment appeared while preparing the patch; "
@@ -3929,7 +4096,7 @@ def sync_doc(file_id, md_path, tab_id=None):
         return
 
     # --- protected ranges: named ranges + comment anchors (plan v4) ---
-    all_comments, anchored = _census_comments(drive_service, file_id)
+    all_comments, anchored, fp1 = _census_comments(drive_service, file_id)
     body_content = (doc_tab.get("body", {}) or {}).get("content", [])
     body_end = body_content[-1]["endIndex"] if body_content else 2
     # named ranges only guard REMOVALS (plan scope) — an insert/style-only
@@ -3942,7 +4109,7 @@ def sync_doc(file_id, md_path, tab_id=None):
         # replaces/deletes are allowed as long as they touch no anchor
         snap, retry_reason = _fresh_anchor_snapshot(
             docs_service, drive_service, file_id, doc, doc_tab,
-            anchored, named_intervals, body_end)
+            anchored, named_intervals, body_end, fp1=fp1)
         if snap is None:
             # retryable race, but re-planning is this whole function —
             # a CLI re-run is the retry (nothing has been applied)
@@ -4126,6 +4293,9 @@ def sync_doc(file_id, md_path, tab_id=None):
             (as_, ae,
              f"the anchor of a live comment (docx id {aid}, «{atext[:40]}»)")
             for as_, ae, atext, aid in snap["anchors"]]
+        # anchors the accounting could not vouch for but could still place —
+        # they narrow the refusal to the paragraphs they sit in (issue #10)
+        protected += snap["blocked"]
     if flat and protected:
         overlap = _find_protected_overlap(flat, protected)
         if overlap:
@@ -4427,7 +4597,7 @@ def update_doc(file_id, file_path, title=None, no_highlights=False,
     folder_id = (meta.get("parents") or [None])[0]
 
     # ---- destructiveness guard (fail closed) ----
-    all_comments, anchored = _census_comments(drive_service, file_id)
+    all_comments, anchored, _ = _census_comments(drive_service, file_id)
     named_ranges = []
     try:
         cur_doc = _safe_get_doc(docs_service, file_id)
