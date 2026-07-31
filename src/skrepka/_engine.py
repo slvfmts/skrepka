@@ -351,10 +351,31 @@ def _fingerprint_from_census(raw_comments):
     return out
 
 
+def _key_owners_universe(raw_comments):
+    """Map each accounting key to the set of comment ids that can produce it.
+
+    Built over EVERY entry the API can see — deleted replies and resolved
+    threads included — because that is the set of things whose leftover record
+    could turn up in an export. A key owned by exactly one id is a witness for
+    that thread: no other thread can put a record with that key into
+    comments.xml (issue #14).
+    """
+    out = {}
+    for c in raw_comments:
+        cid = c.get("id")
+        for entry in [c] + list(c.get("replies") or []):
+            author = (entry.get("author") or {}).get("displayName")
+            created = entry.get("createdTime")
+            if author and created:
+                out.setdefault((author, _trunc_seconds(created)),
+                               set()).add(cid)
+    return out
+
+
 def _census_comments(drive_service, file_id):
     """List ALL comments (incl. resolved) with pagination; fail closed.
 
-    Returns (all_comments, anchored_comments, fingerprint). A comment counts
+    Returns (all_comments, anchored_comments, fingerprint, key_universe). A comment counts
     as anchored when it carries quotedFileContent or an anchor field.
     quotedFileContent is a stale snapshot — it is NEVER used to locate
     anchors, only to decide whether the doc contains anchored comments at all.
@@ -379,7 +400,8 @@ def _census_comments(drive_service, file_id):
         c for c in out
         if c.get("quotedFileContent") or c.get("anchor")
     ]
-    return out, anchored, _fingerprint_from_census(raw)
+    return (out, anchored, _fingerprint_from_census(raw),
+            _key_owners_universe(raw))
 
 
 def _extract_runs_full(content):
@@ -1106,7 +1128,14 @@ def list_comments(file_id, output=None):
         while True:
             results = drive_service.comments().list(
                 fileId=file_id,
-                fields="nextPageToken,comments(id,content,author/displayName,quotedFileContent,resolved,replies(content,author/displayName))",
+                # createdTime and reply ids are not decoration: when the anchor
+                # accounting refuses on colliding keys it names threads by the
+                # second they were created in, and without these fields there
+                # is nowhere for a person to look that up (#16). Reply ids are
+                # what makes the surplus reply deletable (#18).
+                fields="nextPageToken,comments(id,content,author/displayName,"
+                       "createdTime,quotedFileContent,resolved,"
+                       "replies(id,content,author/displayName,createdTime))",
                 includeDeleted=False,
                 pageSize=100,
                 pageToken=page_token,
@@ -1607,36 +1636,29 @@ def _comment_label(c):
     return f"{cid} «{quote}»" if quote else f"{cid} (без цитаты)"
 
 
-def _describe_keys(keys, key_owners):
-    """Name the threads behind accounting keys, deduplicated, id-first."""
-    seen, out = set(), []
-    for key in keys:
-        for c in key_owners.get(key, ()):
-            label = _comment_label(c)
-            if label not in seen:
-                seen.add(label)
-                out.append(label)
-    return "; ".join(out[:5]) if out else "; ".join(
-        f"{a!r} @ {d}" for a, d in list(keys)[:5])
-
-
-def _account_anchored_comments(anchored, records, spans,
+def _account_anchored_comments(anchored, records, spans, *, universe,
                                skip_resolved=False):
-    """Prove every anchored API comment is present in the docx export.
+    """Prove every live anchored THREAD keeps at least one anchor in the export.
 
-    Ghosted threads vanish from the export ENTIRELY (C11a), and a stale
-    export missing a fresh comment looks exactly the same — so every live
-    anchored entry must be shown to be present. Keys are
-    (author.displayName, createdTime→seconds) over non-deleted entries of
-    anchored threads (parents AND replies), and:
+    Ghosted threads vanish from the export ENTIRELY (C11a), and a stale export
+    missing a fresh comment looks exactly the same — so every live anchored
+    thread must be shown to be present. Keys are
+    (author.displayName, createdTime→seconds); `universe` maps each key to the
+    set of comment ids that produced it across EVERYTHING the API can see,
+    deleted and resolved included.
 
-      * a SHORTFALL against comments.xml is a ghost or a stale export;
-      * EXCESS is allowed only where the key maps to exactly ONE API entry —
-        that is a thread anchored to several fragments (C11e). With two
-        entries sharing a key we cannot attribute records to threads, so a
-        multi-anchor neighbour could cover for a ghost: that stays refused;
-      * a key the API does not know at all means the export is stale;
+      * a thread with no witness key — one that belongs to it alone — cannot
+        be identified in the export at all, so it is refused;
+      * a thread whose witness never appears in comments.xml is a ghost or a
+        stale export;
+      * a record key no live thread claims means the export is stale;
       * every record must join to exactly one anchor span via w:id.
+
+    What this does NOT promise: that every anchor of a thread survives. A
+    witness proves one anchor is mapped and therefore protected; an anchor
+    that vanished from the export whole (record and span both) is invisible
+    and can be overwritten, leaving the thread alive on its remaining anchor.
+    skrepka protects threads, not individual anchors (see LIMITATIONS).
 
     `skip_resolved` excludes resolved threads, which Google omits from the
     export entirely (C11c). Only the caller that edits via `replaceAllText`
@@ -1646,11 +1668,10 @@ def _account_anchored_comments(anchored, records, spans,
 
     Returns (problems, metrics).
     """
-    from collections import Counter, defaultdict
+    from collections import Counter
 
     problems = []
-    api_keys = Counter()
-    key_owners = defaultdict(list)  # accounting key → threads that produced it
+    signatures = []  # (thread, Counter of its live entry keys)
     resolved_n = 0
     for c in anchored:
         if c.get("resolved"):
@@ -1670,6 +1691,7 @@ def _account_anchored_comments(anchored, records, spans,
                 # deleteContentRange treats anchors differently (C2) and its
                 # effect on a hidden resolved anchor has NOT been measured.
                 continue
+        sig = Counter()
         entries = [c] + [r for r in (c.get("replies") or [])
                          if not r.get("deleted")]
         for entry in entries:
@@ -1680,56 +1702,55 @@ def _account_anchored_comments(anchored, records, spans,
                     f"comment {_comment_label(c)} has an entry without "
                     f"author/createdTime — cannot account for it")
                 continue
-            key = (author, _trunc_seconds(created))
-            api_keys[key] += 1
-            key_owners[key].append(c)
+            sig[(author, _trunc_seconds(created))] += 1
+        signatures.append((c, sig))
     docx_keys = Counter((r["author"], r["date_sec"]) for r in records)
 
-    # One thread may be anchored to several non-adjacent fragments, and the
-    # export emits a record per (entry × anchor). So a live single-entry thread
-    # on three anchors legitimately yields three records with the same key, and
-    # exact multiset equality reported that as a stale export, blocking the
-    # document (C11e).
+    # --- witness rule (issue #14) -----------------------------------------
+    # Counting entries was the whole trouble: a reply has no anchor of its
+    # own — its record duplicates the parent's span — so it carried no
+    # information about "will this thread keep an anchor", while every reply
+    # added a key and a chance of collision. An agent answering threads in a
+    # loop collided with itself and froze the document.
     #
-    # Excess is therefore allowed — but ONLY where the key belongs to exactly
-    # one API entry. With two entries sharing a key, a multi-anchor neighbour's
-    # surplus can make up for a ghosted thread's absence (api=2, docx=2 from a
-    # single two-anchor thread), and nothing in the export attributes records
-    # to threads. That case stays fail-closed, as it is today.
-    for key, n in api_keys.items():
-        if n > 1:
+    # Presence is proved by NAME instead. A witness key belongs to exactly one
+    # thread across everything the API can see, so an export record carrying
+    # it is that thread's record and its span is that thread's anchor. Nothing
+    # else can forge it.
+    live_keys = set()
+    for _c, sig in signatures:
+        live_keys |= set(sig)
+    for c, sig in signatures:
+        # Uniqueness is measured against the WHOLE API-visible universe, not
+        # just live threads (codex r3): a leftover export record left by a
+        # deleted reply or a resolved thread would otherwise pass for the
+        # witness of a ghost.
+        witnesses = [k for k in sig if universe.get(k) == {c.get("id")}]
+        if not witnesses:
             problems.append(
-                f"ambiguous accounting key (same author, same second) ×{n} — "
-                f"cannot attribute export records to threads, refusing: "
-                f"{_describe_keys([key], key_owners)}")
-    for key, n in docx_keys.items():
-        if n > 1 and key not in api_keys:  # api-side dupes already reported
+                f"comment {_comment_label(c)} shares every (author, second) "
+                f"key with another thread — nothing identifies its records in "
+                f"the export, refusing. Reply to this thread (one at a time, "
+                f"then re-run): the reply's own second becomes its witness")
+            continue
+        # At least ONE witness present is enough — a thread may have several,
+        # and requiring a particular one would flap on partial staleness.
+        if not any(docx_keys.get(k) for k in witnesses):
+            # Deliberately NOT scoped to an operation range (issue #10): a
+            # thread missing from the export has no span in document.xml, so
+            # there are no coordinates to confine the refusal to.
             problems.append(
-                f"ambiguous docx key (same author, same second) ×{n}: "
-                f"{key[0]!r} @ {key[1]}")
-    # shortfall: a live entry with no record at all, or fewer records than
-    # entries sharing that key — still a ghost or a stale export
-    missing = api_keys - docx_keys
-    # excess of a KNOWN key is a multi-anchor thread, not a mismatch; only a
-    # key the API does not know at all means the export is stale
-    unknown = Counter({k: n for k, n in docx_keys.items()
-                       if k not in api_keys})
-    if missing:
-        # Deliberately NOT scoped to an operation range (issue #10): a thread
-        # missing from the export has no span in document.xml, so there are no
-        # coordinates to confine the refusal to. Anything could be sitting
-        # anywhere, so every replace stays blocked.
-        problems.append(
-            "anchored comment entries missing from the export (ghost thread "
-            "or stale export — indistinguishable): "
-            + _describe_keys(missing, key_owners))
+                f"comment {_comment_label(c)} is missing from the export "
+                f"(ghost thread or stale export — indistinguishable)")
+    unknown = {k for k in docx_keys if k not in live_keys}
     if unknown:
-        # Also global. An export record the API does not know means the export
-        # and the API disagree about what exists; the span it maps to is not
-        # the extent of the doubt.
+        # Global. An export record the API does not know means the export and
+        # the API disagree about what exists; the span it maps to is not the
+        # extent of the doubt.
         problems.append(
             "export contains comment entries unknown to the API (stale "
-            "export): " + "; ".join(f"{a!r} @ {d}" for a, d in list(unknown)[:5]))
+            "export): "
+            + "; ".join(f"{a!r} @ {d}" for a, d in sorted(unknown)[:5]))
     # bijection: one span per comments.xml record, joined by w:id
     span_ids = Counter()
     for s in spans:
@@ -1743,6 +1764,11 @@ def _account_anchored_comments(anchored, records, spans,
         n = span_ids.get(rid, 0)
         if n == 1:
             continue
+        # LOAD-BEARING for the witness rule: it proves a thread has an anchor
+        # by "witness record ⇒ exactly one span ⇒ that span is protected".
+        # Localizing this branch the way issue #10 localized the one below
+        # would silently break that chain — a record could then exist with no
+        # span while the accounting still called the thread present.
         # Stays global either way. n == 0: the record has no span at all (an
         # anchor outside document.xml — a footnote, a header — or a ghost),
         # nothing to point at. n > 1: tempting to confine to those spans, but
@@ -1762,7 +1788,7 @@ def _account_anchored_comments(anchored, records, spans,
     metrics = {
         "api_anchored_live": len(anchored) - resolved_n,
         "api_anchored_resolved": resolved_n,
-        "api_thread_entries": sum(api_keys.values()),
+        "api_threads_accounted": len(signatures),
         "docx_comment_entries": len(records),
         "anchor_spans": len(spans),
     }
@@ -1945,7 +1971,7 @@ def _canary_present(docs_service, file_id, canary):
 
 def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
                            doc_tab, anchored, named_intervals, body_end,
-                           *, fp1, skip_resolved=False):
+                           *, fp1, universe, skip_resolved=False):
     """Provably-fresh anchor map for structural edits on a commented doc.
 
     Export freshness is not provable read-only (files.export takes no
@@ -2065,7 +2091,8 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
         # uuid), so it never enters the mapping
         records, rec_problems = _docx_comment_records(docx_bytes)
         acc_problems, metrics = _account_anchored_comments(
-            anchored, records, spans, skip_resolved=skip_resolved)
+            anchored, records, spans, universe=universe,
+            skip_resolved=skip_resolved)
         anchors, map_problems = _map_anchors_to_doc(doc_tab, spans)
         all_problems = problems + rec_problems + acc_problems + map_problems
         global_problems, blocked = _scope_anchor_problems(all_problems, anchors)
@@ -2312,14 +2339,15 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
         body_content = (doc_tab.get("body", {}) or {}).get("content", [])
         body_end = body_content[-1]["endIndex"] if body_content else 2
         named_intervals = _named_range_intervals(doc_tab)
-        _, anchored_now, fp1 = _census_comments(drive_service, file_id)
+        _, anchored_now, fp1, universe = _census_comments(
+            drive_service, file_id)
 
         # this path edits through replaceAllText only — the case where a
         # resolved thread's anchor was measured to survive full coverage
         snap, retry_reason = _fresh_anchor_snapshot(
             docs_service, drive_service, file_id, doc, doc_tab,
             anchored_now, named_intervals, body_end, fp1=fp1,
-            skip_resolved=True)
+            universe=universe, skip_resolved=True)
         if snap is None:
             last_reason = retry_reason
             continue
@@ -2479,13 +2507,13 @@ def patch_doc(file_id, ops_path, tab_id=None):
     resolved = [_resolve_op(op, doc_tab, tid) for op in ops]
     _check_ops_overlap(resolved)
 
-    all_comments, anchored, _ = _census_comments(drive_service, file_id)
+    all_comments, anchored, _, _ = _census_comments(drive_service, file_id)
 
     if not anchored:
         # ---- clean-doc path: single atomic index-based batch ----
         # Second census immediately before the destructive batch narrows the
         # race window (a comment added in between would change the strategy).
-        _, anchored2, _ = _census_comments(drive_service, file_id)
+        _, anchored2, _, _ = _census_comments(drive_service, file_id)
         if anchored2:
             _error(
                 "an anchored comment appeared while preparing the patch; "
@@ -4096,7 +4124,8 @@ def sync_doc(file_id, md_path, tab_id=None):
         return
 
     # --- protected ranges: named ranges + comment anchors (plan v4) ---
-    all_comments, anchored, fp1 = _census_comments(drive_service, file_id)
+    all_comments, anchored, fp1, universe = _census_comments(
+        drive_service, file_id)
     body_content = (doc_tab.get("body", {}) or {}).get("content", [])
     body_end = body_content[-1]["endIndex"] if body_content else 2
     # named ranges only guard REMOVALS (plan scope) — an insert/style-only
@@ -4109,7 +4138,8 @@ def sync_doc(file_id, md_path, tab_id=None):
         # replaces/deletes are allowed as long as they touch no anchor
         snap, retry_reason = _fresh_anchor_snapshot(
             docs_service, drive_service, file_id, doc, doc_tab,
-            anchored, named_intervals, body_end, fp1=fp1)
+            anchored, named_intervals, body_end, fp1=fp1,
+            universe=universe)
         if snap is None:
             # retryable race, but re-planning is this whole function —
             # a CLI re-run is the retry (nothing has been applied)
@@ -4597,7 +4627,7 @@ def update_doc(file_id, file_path, title=None, no_highlights=False,
     folder_id = (meta.get("parents") or [None])[0]
 
     # ---- destructiveness guard (fail closed) ----
-    all_comments, anchored, _ = _census_comments(drive_service, file_id)
+    all_comments, anchored, _, _ = _census_comments(drive_service, file_id)
     named_ranges = []
     try:
         cur_doc = _safe_get_doc(docs_service, file_id)

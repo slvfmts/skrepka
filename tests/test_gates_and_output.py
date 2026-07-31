@@ -89,6 +89,38 @@ def test_emit_json_writes_file_and_prints_receipt(engine, tmp_path, capsys):
     assert "content" not in receipt
 
 
+# --- list_comments field selection (#16) ---
+
+def test_list_comments_asks_for_created_time_and_reply_ids(engine, monkeypatch,
+                                                           capsys):
+    """Without these the refusal on colliding accounting keys names threads by
+    a second the person cannot look up anywhere, and the surplus reply has no
+    id to delete by (#18)."""
+    seen = {}
+
+    class _Req:
+        def execute(self):
+            return {"comments": [{"id": "c1", "content": "x"}]}
+
+    class Drive:
+        def comments(self):
+            return self
+
+        def list(self, **kw):
+            seen.update(kw)
+            return _Req()
+
+    monkeypatch.setattr(engine, "get_creds", lambda: object())
+    monkeypatch.setattr(engine, "get_drive_service", lambda c: Drive())
+    engine.list_comments("doc1")
+    capsys.readouterr()
+
+    fields = seen["fields"]
+    assert "replies(id,content,author/displayName,createdTime)" in fields
+    # the parent's own createdTime, not just the replies' one
+    assert "comments(id,content,author/displayName,createdTime," in fields
+
+
 # --- _write_control fail-closed hardening (codex delta review) ---
 
 def test_write_control_refuses_missing_revision(engine, capsys):

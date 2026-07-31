@@ -300,9 +300,10 @@ def test_accounting_happy_with_reply(engine):
                {"docx_id": "1", "author": "A",
                 "date_sec": "2026-07-13T17:54:32Z"}]
     problems, metrics = engine._account_anchored_comments(
-        anchored, records, _spans("0", "1"))
+        anchored, records, _spans("0", "1"),
+        universe=engine._key_owners_universe(anchored))
     assert problems == []
-    assert metrics["api_thread_entries"] == 2
+    assert metrics["api_threads_accounted"] == 1
     assert metrics["docx_comment_entries"] == 2
     assert metrics["anchor_spans"] == 2
 
@@ -313,7 +314,8 @@ def test_accounting_missing_entry_blocks(engine):
     records = [{"docx_id": "0", "author": "A",
                 "date_sec": "2026-01-01T00:00:01Z"}]
     problems, _ = engine._account_anchored_comments(
-        anchored, records, _spans("0"))
+        anchored, records, _spans("0"),
+        universe=engine._key_owners_universe(anchored))
     assert any("missing from the export" in p for p in problems)
 
 
@@ -324,7 +326,8 @@ def test_accounting_extra_docx_entry_blocks(engine):
                {"docx_id": "1", "author": "Z",
                 "date_sec": "2026-01-01T00:00:09Z"}]
     problems, _ = engine._account_anchored_comments(
-        anchored, records, _spans("0", "1"))
+        anchored, records, _spans("0", "1"),
+        universe=engine._key_owners_universe(anchored))
     assert any("unknown to the API" in p for p in problems)
 
 
@@ -338,9 +341,12 @@ def test_accounting_reply_cannot_saturate_missing_parent(engine):
                {"docx_id": "1", "author": "A",
                 "date_sec": "2026-01-01T00:00:01Z"}]
     problems, _ = engine._account_anchored_comments(
-        anchored, records, _spans("0", "1"))
-    # counts match, but the duplicate key is ambiguous — fail closed
-    assert any("ambiguous" in p for p in problems)
+        anchored, records, _spans("0", "1"),
+        universe=engine._key_owners_universe(anchored))
+    # Counts match. Under the witness rule the refusal comes from the other
+    # side: neither thread owns a key of its own, so nothing in the export
+    # identifies either of them. Same threat, different mechanism (#14).
+    assert any("shares every" in p for p in problems)
 
 
 def test_accounting_deleted_reply_not_expected(engine):
@@ -351,7 +357,8 @@ def test_accounting_deleted_reply_not_expected(engine):
     records = [{"docx_id": "0", "author": "A",
                 "date_sec": "2026-01-01T00:00:01Z"}]
     problems, _ = engine._account_anchored_comments(
-        anchored, records, _spans("0"))
+        anchored, records, _spans("0"),
+        universe=engine._key_owners_universe(anchored))
     assert problems == []
 
 
@@ -363,7 +370,8 @@ def test_accounting_resolved_absent_from_export_is_clean(engine):
     anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z",
                             resolved=True)]
     problems, metrics = engine._account_anchored_comments(
-        anchored, [], [], skip_resolved=True)
+        anchored, [], [], universe=engine._key_owners_universe(anchored),
+        skip_resolved=True)
     assert problems == []
     assert metrics["api_anchored_resolved"] == 1
     assert metrics["api_anchored_live"] == 0
@@ -376,7 +384,8 @@ def test_accounting_resolved_alongside_live_thread(engine):
     records = [{"docx_id": "0", "author": "A",
                 "date_sec": "2026-01-01T00:00:01Z"}]
     problems, metrics = engine._account_anchored_comments(
-        anchored, records, _spans("0"), skip_resolved=True)
+        anchored, records, _spans("0"),
+        universe=engine._key_owners_universe(anchored), skip_resolved=True)
     assert problems == []
     assert metrics["api_anchored_live"] == 1
     assert metrics["api_anchored_resolved"] == 1
@@ -388,14 +397,16 @@ def test_accounting_resolved_still_counted_without_the_flag(engine):
     deleteContentRange treats anchors differently and its effect on a hidden
     resolved anchor was never measured — so they keep failing closed."""
     anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z", resolved=True)]
-    problems, _ = engine._account_anchored_comments(anchored, [], [])
+    problems, _ = engine._account_anchored_comments(
+        anchored, [], [], universe=engine._key_owners_universe(anchored))
     assert any("missing from the export" in p for p in problems)
 
 
 def test_accounting_live_thread_still_blocks_when_missing(engine):
     """Regression guard: excluding resolved must not weaken ghost detection."""
     anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z")]
-    problems, _ = engine._account_anchored_comments(anchored, [], [])
+    problems, _ = engine._account_anchored_comments(
+        anchored, [], [], universe=engine._key_owners_universe(anchored))
     assert any("missing from the export" in p for p in problems)
 
 
@@ -414,7 +425,7 @@ def test_census_fingerprint_comes_from_the_same_read(engine):
     Two reads left a gap no check covered: comments could move between the
     census the accounting trusted and the fp1/fp2 sandwich."""
     drive = DriveStub([api_comment("c1", "A", CREATED)], lambda: b"")
-    live, anchored, fp = engine._census_comments(drive, "doc1")
+    live, anchored, fp, _uni = engine._census_comments(drive, "doc1")
     assert drive._list_calls == 1
     assert [c["id"] for c in live] == ["c1"]
     assert [c["id"] for c in anchored] == ["c1"]
@@ -476,7 +487,7 @@ def test_census_keeps_deleted_comments_out_of_the_live_view(engine):
     raw = [api_comment("c1", "A", CREATED),
            dict(api_comment("c2", "A", "2026-07-14T00:00:09Z"), deleted=True)]
     drive = DriveStub(raw, lambda: b"")
-    live, anchored, fp = engine._census_comments(drive, "doc1")
+    live, anchored, fp, _uni = engine._census_comments(drive, "doc1")
     assert [c["id"] for c in live] == ["c1"]
     assert [c["id"] for c in anchored] == ["c1"]
     assert any(t[1] == "c2" for t in fp)  # deleted entry still fingerprinted
@@ -510,16 +521,20 @@ def test_accounting_multi_anchor_excess_is_allowed(engine):
     records = [{"docx_id": str(i), "author": "A",
                 "date_sec": "2026-01-01T00:00:01Z"} for i in range(3)]
     problems, _ = engine._account_anchored_comments(
-        anchored, records, _spans("0", "1", "2"))
+        anchored, records, _spans("0", "1", "2"),
+        universe=engine._key_owners_universe(anchored))
     assert problems == []
 
 
 def test_accounting_multi_anchor_excess_cannot_mask_a_ghost(engine):
     """The counterexample both reviewers found independently against the first
-    draft of this fix: a live two-anchor thread and a ghosted thread sharing
-    one (author, second) key give api=2, docx=2. A plain `docx >= api` rule
-    passes and the ghost's anchor is left unprotected. The duplicate key must
-    keep failing closed."""
+    draft of the 0.9.1 fix: a live two-anchor thread and a ghosted thread
+    sharing one (author, second) key give api=2, docx=2. A plain `docx >= api`
+    rule passes and the ghost's anchor is left unprotected.
+
+    Kept through the switch to the witness rule (#14) on both reviewers'
+    insistence: the threat is unchanged, only the refusal is. Neither thread
+    has a key of its own, so neither can be identified in the export."""
     anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z"),
                 api_comment("c2", "A", "2026-01-01T00:00:01Z")]  # ghosted
     records = [{"docx_id": "0", "author": "A",
@@ -527,27 +542,136 @@ def test_accounting_multi_anchor_excess_cannot_mask_a_ghost(engine):
                {"docx_id": "1", "author": "A",
                 "date_sec": "2026-01-01T00:00:01Z"}]  # both from c1
     problems, _ = engine._account_anchored_comments(
-        anchored, records, _spans("0", "1"))
-    assert any("ambiguous" in p for p in problems)
+        anchored, records, _spans("0", "1"),
+        universe=engine._key_owners_universe(anchored))
+    assert any("shares every" in p for p in problems)
+
+
+# ---------------------------------------------------------------------------
+# issue #14: presence proved by a witness key, not by counting entries
+# ---------------------------------------------------------------------------
+
+def test_witness_incident_colliding_replies_across_threads_passes(engine):
+    """The field incident: an agent answered every thread in a loop and two
+    replies landed in the same second. Parents are placed by a human seconds
+    apart, so each thread still owns its parent key and stays identifiable.
+    The old rule refused this and froze the whole document."""
+    anchored, records, ids = [], [], []
+    for i in range(6):
+        rep = "2026-01-01T00:05:0{}Z".format(i // 2)  # pairs collide
+        anchored.append(api_comment(
+            f"c{i}", "A", f"2026-01-01T00:00:0{i}Z",
+            replies=[{"createdTime": rep, "author": {"displayName": "A"}}]))
+        records.append({"docx_id": f"p{i}", "author": "A",
+                        "date_sec": f"2026-01-01T00:00:0{i}Z"})
+        records.append({"docx_id": f"r{i}", "author": "A",
+                        "date_sec": rep})
+        ids += [f"p{i}", f"r{i}"]
+    problems, _ = engine._account_anchored_comments(
+        anchored, records, _spans(*ids),
+        universe=engine._key_owners_universe(anchored))
+    assert problems == []
+
+
+def test_witness_two_replies_same_second_into_one_thread_passes(engine):
+    """The other half of the incident. Both replies belong to the SAME thread,
+    so the key is still owned by one thread and remains a witness. The old
+    rule counted entries and refused."""
+    same = "2026-01-01T00:05:00Z"
+    anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z", replies=[
+        {"createdTime": same, "author": {"displayName": "A"}},
+        {"createdTime": same, "author": {"displayName": "A"}}])]
+    records = [{"docx_id": "0", "author": "A",
+                "date_sec": "2026-01-01T00:00:01Z"}]
+    problems, _ = engine._account_anchored_comments(
+        anchored, records, _spans("0"),
+        universe=engine._key_owners_universe(anchored))
+    assert problems == []
+
+
+def test_witness_subset_signature_refused(engine):
+    """Codex r2 counterexample: signatures {p} and {p, q}. A damaged group of
+    the second thread reads exactly as the first, so the first must not be
+    certifiable — it owns no key of its own."""
+    anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z"),
+                api_comment("c2", "A", "2026-01-01T00:00:09Z", replies=[
+                    {"createdTime": "2026-01-01T00:00:01Z",
+                     "author": {"displayName": "A"}}])]
+    records = [{"docx_id": "0", "author": "A",
+                "date_sec": "2026-01-01T00:00:01Z"},
+               {"docx_id": "1", "author": "A",
+                "date_sec": "2026-01-01T00:00:09Z"}]
+    problems, _ = engine._account_anchored_comments(
+        anchored, records, _spans("0", "1"),
+        universe=engine._key_owners_universe(anchored))
+    assert any("c1" in p and "shares every" in p for p in problems)
+
+
+def test_witness_pairwise_disjoint_but_no_unique_key_refused(engine):
+    """Why the witness rule and not the weaker "no signature is a subset of
+    another": {a,b}, {a,c}, {b,d} are pairwise non-nested, yet the first owns
+    no key alone and damaged groups of the other two could forge it."""
+    a, b, c, d = (f"2026-01-01T00:00:0{i}Z" for i in range(1, 5))
+
+    def rep(t):
+        return {"createdTime": t, "author": {"displayName": "A"}}
+
+    anchored = [api_comment("t1", "A", a, replies=[rep(b)]),
+                api_comment("t2", "A", a, replies=[rep(c)]),
+                api_comment("t3", "A", b, replies=[rep(d)])]
+    problems, _ = engine._account_anchored_comments(
+        anchored, [], [], universe=engine._key_owners_universe(anchored))
+    assert any("t1" in p and "shares every" in p for p in problems)
+
+
+def test_witness_may_not_come_from_a_resolved_thread(engine):
+    """codex r3: uniqueness is measured against everything the API can see.
+    A leftover export record from a resolved thread must not pass for the
+    witness of a live one."""
+    key = "2026-01-01T00:00:01Z"
+    live = api_comment("c1", "A", key)
+    resolved = api_comment("c2", "A", key, resolved=True)
+    records = [{"docx_id": "0", "author": "A", "date_sec": key}]
+    problems, _ = engine._account_anchored_comments(
+        [live], records, _spans("0"),
+        universe=engine._key_owners_universe([live, resolved]))
+    assert any("shares every" in p for p in problems)
+
+
+def test_witness_one_of_several_present_is_enough(engine):
+    """A thread may own more than one key; requiring a particular one would
+    flap on partial staleness."""
+    anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z", replies=[
+        {"createdTime": "2026-01-01T00:00:09Z",
+         "author": {"displayName": "A"}}])]
+    records = [{"docx_id": "0", "author": "A",
+                "date_sec": "2026-01-01T00:00:09Z"}]  # parent's record gone
+    problems, _ = engine._account_anchored_comments(
+        anchored, records, _spans("0"),
+        universe=engine._key_owners_universe(anchored))
+    assert problems == []
 
 
 def test_accounting_record_without_span_breaks_bijection(engine):
     anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z")]
     records = [{"docx_id": "0", "author": "A",
                 "date_sec": "2026-01-01T00:00:01Z"}]
-    problems, _ = engine._account_anchored_comments(anchored, records, [])
+    problems, _ = engine._account_anchored_comments(
+        anchored, records, [], universe=engine._key_owners_universe(anchored))
     assert any("anchor spans in document.xml" in p for p in problems)
 
 
 def test_accounting_span_without_record_is_problem(engine):
-    problems, _ = engine._account_anchored_comments([], [], _spans("7"))
+    problems, _ = engine._account_anchored_comments(
+        [], [], _spans("7"), universe={})
     assert any("no comments.xml entry" in p for p in problems)
 
 
 def test_accounting_entry_without_created_time(engine):
     anchored = [{"id": "c1", "author": {"displayName": "A"},
                  "quotedFileContent": {"value": "x"}, "replies": []}]
-    problems, _ = engine._account_anchored_comments(anchored, [], [])
+    problems, _ = engine._account_anchored_comments(
+        anchored, [], [], universe=engine._key_owners_universe(anchored))
     assert any("without author/createdTime" in p for p in problems)
     # the refusal names the thread, not a bare author@second pair (#10)
     assert any("c1 «x»" in p for p in problems)
@@ -574,7 +698,8 @@ def test_missing_thread_refusal_names_the_thread(engine):
     doc where one person wrote everything inside one minute (#10)."""
     anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z")]
     anchored[0]["quotedFileContent"] = {"value": "хранит своё"}
-    problems, _ = engine._account_anchored_comments(anchored, [], [])
+    problems, _ = engine._account_anchored_comments(
+        anchored, [], [], universe=engine._key_owners_universe(anchored))
     msg = next(p for p in problems if "missing from the export" in p)
     assert "c1 «хранит своё»" in msg
     assert "'A' @" not in msg
@@ -597,7 +722,8 @@ def test_record_with_several_spans_stays_global(engine):
     records = [{"docx_id": "0", "author": "A",
                 "date_sec": "2026-01-01T00:00:01Z"}]
     problems, _ = engine._account_anchored_comments(
-        anchored, records, _spans("0", "0"))
+        anchored, records, _spans("0", "0"),
+        universe=engine._key_owners_universe(anchored))
     p = next(p for p in problems if "anchor spans in document.xml" in p)
     assert getattr(p, "docx_ids", ()) == ()
 
@@ -1254,7 +1380,7 @@ def test_accounting_span_without_id_no_crash(engine):
     # regression: sorted({None, "7"}) used to TypeError (codex code-r1 #3)
     records = [{"docx_id": "7", "author": "A", "date_sec": "d"}]
     problems, _ = engine._account_anchored_comments(
-        [], records, [{"docx_id": None}])
+        [], records, [{"docx_id": None}], universe={})
     assert any("without a w:id" in p for p in problems)
 
 
