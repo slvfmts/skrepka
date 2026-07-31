@@ -154,16 +154,30 @@ def _cleanup_after_revoke(revoked_hash):
                 "token_present": _exists(config.TOKEN_NAME)}
 
 
+def _isatty(stream):
+    """True only for a stream that is definitely a terminal. A missing or
+    broken stdin/stderr (pythonw, a closed fd, a detached service) reads as
+    'no terminal' instead of raising inside a confirmation."""
+    try:
+        return bool(stream is not None and stream.isatty())
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
 def _confirm(prompt, assume_yes):
     """Return True (confirmed), False (declined), or None (cannot confirm — no
     interactive terminal and --yes not given)."""
     if assume_yes:
         return True
-    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+    if not (_isatty(sys.stdin) and _isatty(sys.stderr)):
         return None
-    sys.stderr.write(prompt + " [y/N]: ")
-    sys.stderr.flush()
-    return sys.stdin.readline().strip().lower() in ("y", "yes")
+    try:
+        sys.stderr.write(prompt + " [y/N]: ")
+        sys.stderr.flush()
+        answer = sys.stdin.readline()
+    except (OSError, ValueError):
+        return False  # an unreadable terminal is not a yes
+    return answer.strip().lower() in ("y", "yes")
 
 
 # --- logout ---------------------------------------------------------------

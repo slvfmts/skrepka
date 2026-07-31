@@ -3,6 +3,7 @@
 leaves the POST form body), destructive-command confirmation gating, and
 forget's honest dry-run/kept accounting (R3 item 2)."""
 
+import io
 import json
 import os
 import sys
@@ -41,6 +42,28 @@ def _seed_token(store, refresh="RT"):
 def _no_tty(monkeypatch):
     monkeypatch.setattr(sys, "stdin",
                         type("F", (), {"isatty": lambda self: False})())
+
+
+def test_confirm_treats_a_missing_stdin_as_no_terminal(priv, monkeypatch):
+    """revoke/forget must answer 'needs_confirmation', not raise, when stdin is
+    gone (pythonw, closed fd, detached service)."""
+    monkeypatch.setattr(sys, "stdin", None)
+    assert priv._confirm("Continue?", False) is None
+
+
+def test_confirm_declines_when_the_terminal_cannot_be_read(priv, monkeypatch):
+    class BrokenStdin:
+        def isatty(self):
+            return True
+
+        def readline(self):
+            raise OSError("terminal went away")
+
+    fake_err = io.StringIO()
+    fake_err.isatty = lambda: True
+    monkeypatch.setattr(sys, "stdin", BrokenStdin())
+    monkeypatch.setattr(sys, "stderr", fake_err)
+    assert priv._confirm("Continue?", False) is False
 
 
 # --- logout ---------------------------------------------------------------
