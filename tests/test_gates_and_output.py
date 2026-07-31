@@ -1,70 +1,311 @@
-"""Human-gate for human-only operations + --output receipt emission."""
+"""Consent gate for the person's own decisions + --output receipt emission.
 
+Until 0.9.2 the gate demanded a live TTY. A process launched by an agent has
+none (measured: no TTY on stdin/stderr, no /dev/tty), so the legitimate human
+path was unreachable and the only way through was a person pasting a command
+an agent composed. The flag is now the confirmation (#17); these tests pin
+both halves of that: the default path still refuses, and the terminal is no
+longer required.
+"""
+
+import io
 import json
+import sys
 
 import pytest
 
-
-# --- _require_human ---
-
-def test_gate_blocks_non_interactive(engine, monkeypatch, capsys):
-    monkeypatch.delenv("SKREPKA_ASSUME_HUMAN", raising=False)
-    # pytest runs with stdin/stderr not attached to a TTY — exactly the
-    # agent situation the gate exists for
-    with pytest.raises(SystemExit) as exc:
-        engine._require_human("resolve comment thread")
-    assert exc.value.code == 1
-    err = json.loads(capsys.readouterr().out)
-    assert "human-only" in err["error"]
-    assert "SKREPKA_ASSUME_HUMAN" in err["error"]
+REMEDY = "Ask the person to close the thread in the Google Docs UI."
 
 
-def test_gate_env_override_passes(engine, monkeypatch):
-    monkeypatch.setenv("SKREPKA_ASSUME_HUMAN", "1")
-    engine._require_human("resolve comment thread")  # must not raise
+class _Exploded(Exception):
+    """Raised by a stub that must never be reached."""
 
 
-def test_gate_env_other_values_do_not_pass(engine, monkeypatch):
-    monkeypatch.setenv("SKREPKA_ASSUME_HUMAN", "true")
-    with pytest.raises(SystemExit):
-        engine._require_human("resolve comment thread")
-
-
-def test_gate_tty_confirmation_yes(engine, monkeypatch):
-    monkeypatch.delenv("SKREPKA_ASSUME_HUMAN", raising=False)
-
-    class FakeTTY:
+def _fake_tty(monkeypatch, engine, answer):
+    """Attach a fake interactive terminal answering `answer`."""
+    class FakeStdin:
         def isatty(self):
             return True
 
         def readline(self):
-            return "y\n"
+            return answer
 
-    monkeypatch.setattr(engine.sys, "stdin", FakeTTY())
-    monkeypatch.setattr(engine.sys, "stderr", __import__("io").StringIO())
-    monkeypatch.setattr(engine.sys.stderr, "isatty", lambda: True,
-                        raising=False)
-    engine._require_human("update --acknowledge-loss")  # confirmed
-
-
-def test_gate_tty_confirmation_default_is_no(engine, monkeypatch, capsys):
-    monkeypatch.delenv("SKREPKA_ASSUME_HUMAN", raising=False)
-
-    class FakeTTY:
-        def isatty(self):
-            return True
-
-        def readline(self):
-            return "\n"  # bare Enter must NOT confirm
-
-    import io
     fake_err = io.StringIO()
     fake_err.isatty = lambda: True
-    monkeypatch.setattr(engine.sys, "stdin", FakeTTY())
+    monkeypatch.setattr(engine.sys, "stdin", FakeStdin())
+    monkeypatch.setattr(engine.sys, "stderr", fake_err)
+
+
+def _explode_on_auth(monkeypatch, engine):
+    """Make any API path blow up, so a test that claims 'refused before the
+    API' cannot pass on an unrelated 'not signed in' error."""
+    def _boom():
+        raise _Exploded("get_creds must not be reached")
+    monkeypatch.setattr(engine, "get_creds", _boom)
+
+
+# --- _require_consent ---
+
+def test_consent_refuses_without_flag_non_interactive(engine, capsys):
+    # pytest runs with stdin/stderr not attached to a TTY — exactly the agent
+    # situation the gate exists for
+    with pytest.raises(SystemExit) as exc:
+        engine._require_consent("resolve comment thread", False, REMEDY)
+    assert exc.value.code == 1
+    err = json.loads(capsys.readouterr().out)["error"]
+    assert "--yes" in err
+    assert REMEDY in err
+    # the removed bypass must not come back, and the refusal must not hand a
+    # command to the person to paste (both are the whole point of #17)
+    assert "SKREPKA_ASSUME_HUMAN" not in err
+    assert "themselves" not in err
+
+
+def test_consent_flag_alone_passes_without_terminal(engine):
+    engine._require_consent("resolve comment thread", True, REMEDY)
+
+
+def test_consent_env_var_is_no_longer_honoured(engine, monkeypatch):
+    """The old bypass is gone, not renamed: setting it changes nothing."""
+    monkeypatch.setenv("SKREPKA_ASSUME_HUMAN", "1")
+    with pytest.raises(SystemExit):
+        engine._require_consent("resolve comment thread", False, REMEDY)
+
+
+def test_consent_tty_confirmation_yes(engine, monkeypatch):
+    _fake_tty(monkeypatch, engine, "y\n")
+    engine._require_consent("resolve comment thread", False, REMEDY)
+
+
+def test_consent_tty_confirmation_default_is_no(engine, monkeypatch, capsys):
+    _fake_tty(monkeypatch, engine, "\n")  # bare Enter must NOT confirm
+    with pytest.raises(SystemExit):
+        engine._require_consent("resolve comment thread", False, REMEDY)
+    assert "not confirmed" in capsys.readouterr().out
+
+
+def test_consent_treats_a_missing_stdin_as_no_terminal(engine, monkeypatch,
+                                                       capsys):
+    """pythonw, a closed fd, a detached service: sys.stdin can be None. That
+    must refuse with the usual JSON, not raise AttributeError inside a gate."""
+    monkeypatch.setattr(engine.sys, "stdin", None)
+    with pytest.raises(SystemExit):
+        engine._require_consent("resolve comment thread", False, REMEDY)
+    assert "--yes" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_consent_refuses_when_the_terminal_cannot_be_read(engine, monkeypatch,
+                                                          capsys):
+    class BrokenStdin:
+        def isatty(self):
+            return True
+
+        def readline(self):
+            raise OSError("terminal went away")
+
+    fake_err = io.StringIO()
+    fake_err.isatty = lambda: True
+    monkeypatch.setattr(engine.sys, "stdin", BrokenStdin())
     monkeypatch.setattr(engine.sys, "stderr", fake_err)
     with pytest.raises(SystemExit):
-        engine._require_human("resolve comment thread")
+        engine._require_consent("resolve comment thread", False, REMEDY)
     assert "not confirmed" in capsys.readouterr().out
+
+
+# --- resolve / reply --resolve wiring ---
+
+def _fake_reply_drive(seen):
+    class _Req:
+        def execute(self):
+            return {"id": "r1", "content": "ok", "action": "resolve",
+                    "createdTime": "2026-07-31T10:00:00.000Z",
+                    "author": {"displayName": "Slava"}}
+
+    class Drive:
+        def replies(self):
+            return self
+
+        def create(self, **kw):
+            seen.update(kw)
+            return _Req()
+    return Drive()
+
+
+def test_resolve_without_flag_refuses_before_any_api_call(engine, monkeypatch,
+                                                          capsys):
+    _explode_on_auth(monkeypatch, engine)
+    with pytest.raises(SystemExit):
+        engine.resolve_comment("doc1", "c1")
+    assert "--yes" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_reply_resolve_without_flag_refuses_before_any_api_call(
+        engine, monkeypatch, capsys):
+    _explode_on_auth(monkeypatch, engine)
+    with pytest.raises(SystemExit) as exc:
+        engine.reply_comment("doc1", "c1", "text", resolve=True)
+    assert exc.value.code == 1
+    err = json.loads(capsys.readouterr().out)["error"]
+    # the refusal has to carry the remedy the manual checklist looks for
+    assert "Google Docs UI" in err
+    assert "--yes" in err
+
+
+def test_resolve_with_flag_reaches_the_api(engine, monkeypatch, capsys):
+    seen = {}
+    monkeypatch.setattr(engine, "get_creds", lambda: object())
+    monkeypatch.setattr(engine, "get_drive_service",
+                        lambda c: _fake_reply_drive(seen))
+    engine.resolve_comment("doc1", "c1", yes=True)
+    assert seen["body"]["action"] == "resolve"
+    assert json.loads(capsys.readouterr().out)["resolved"] is True
+
+
+def test_cli_passes_the_flag_through_to_resolve(engine, monkeypatch, capsys):
+    """A unit test of the helper cannot prove main() threads args.yes; without
+    this, a forgotten `yes=args.yes` ships a resolve that always refuses."""
+    seen = {}
+    monkeypatch.setattr(engine, "get_creds", lambda: object())
+    monkeypatch.setattr(engine, "get_drive_service",
+                        lambda c: _fake_reply_drive(seen))
+    monkeypatch.setattr(sys, "argv", ["skrepka", "resolve", "doc1", "c1",
+                                      "--yes"])
+    engine.main()
+    assert seen["body"]["action"] == "resolve"
+    capsys.readouterr()
+
+
+def test_cli_passes_the_flag_through_to_reply_resolve(engine, monkeypatch,
+                                                      capsys):
+    """The `reply --resolve` branch of the dispatcher threads its own copy of
+    args.yes; without this the resolve-only test would let a dropped
+    `yes=args.yes` here ship a path that always refuses."""
+    seen = {}
+    monkeypatch.setattr(engine, "get_creds", lambda: object())
+    monkeypatch.setattr(engine, "get_drive_service",
+                        lambda c: _fake_reply_drive(seen))
+    monkeypatch.setattr(sys, "argv", ["skrepka", "reply", "doc1", "c1", "hi",
+                                      "--resolve", "--yes"])
+    engine.main()
+    assert seen["body"]["action"] == "resolve"
+    capsys.readouterr()
+
+
+def test_cli_resolve_without_flag_still_refuses(engine, monkeypatch, capsys):
+    _explode_on_auth(monkeypatch, engine)
+    monkeypatch.setattr(sys, "argv", ["skrepka", "resolve", "doc1", "c1"])
+    with pytest.raises(SystemExit):
+        engine.main()
+    assert "--yes" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_reply_yes_without_resolve_is_a_usage_error(engine, monkeypatch,
+                                                     capsys):
+    """A silently ignored --yes teaches an agent to hang it on everything."""
+    _explode_on_auth(monkeypatch, engine)
+    monkeypatch.setattr(sys, "argv", ["skrepka", "reply", "doc1", "c1", "hi",
+                                      "--yes"])
+    with pytest.raises(SystemExit):
+        engine.main()
+    assert "--resolve" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_reply_prints_the_second_its_reply_landed_in(engine, monkeypatch,
+                                                      capsys):
+    """Anchor accounting keys on (author, second); without this field an agent
+    cannot see the second its own reply took (#15/#16)."""
+    seen = {}
+    monkeypatch.setattr(engine, "get_creds", lambda: object())
+    monkeypatch.setattr(engine, "get_drive_service",
+                        lambda c: _fake_reply_drive(seen))
+    engine.reply_comment("doc1", "c1", "text")
+    out = json.loads(capsys.readouterr().out)
+    assert out["createdTime"] == "2026-07-31T10:00:00.000Z"
+
+
+# --- update: the flag is the confirmation, no terminal involved ---
+
+def _fake_update_drive(calls):
+    class _Get:
+        def execute(self):
+            return {"name": "doc", "parents": ["folder1"]}
+
+    class Files:
+        def get(self, **kw):
+            return _Get()
+
+        def copy(self, **kw):
+            calls.append("copy")
+            raise _Exploded("backup reached")
+
+        def update(self, **kw):
+            calls.append("update")
+            raise _Exploded("destructive write reached")
+
+    class Drive:
+        def files(self):
+            return Files()
+    return Drive()
+
+
+def _stub_update_preflight(monkeypatch, engine, comments, named_ranges=()):
+    monkeypatch.setattr(engine, "get_creds", lambda: object())
+    monkeypatch.setattr(engine, "get_docs_service", lambda c: object())
+    monkeypatch.setattr(engine, "_census_comments",
+                        lambda d, f: (comments, comments, "fp", {}))
+    monkeypatch.setattr(engine, "_safe_get_doc",
+                        lambda d, f: {"namedRanges": {n: {} for n
+                                                      in named_ranges}})
+
+
+def test_update_without_acknowledge_loss_blocks_before_any_write(
+        engine, monkeypatch, tmp_path, capsys):
+    calls = []
+    _stub_update_preflight(monkeypatch, engine, [{"id": "c1"}])
+    monkeypatch.setattr(engine, "get_drive_service",
+                        lambda c: _fake_update_drive(calls))
+    md = tmp_path / "doc.md"
+    md.write_text("# hi\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc:
+        engine.update_doc("doc1", str(md))
+    assert exc.value.code == 2
+    assert calls == []  # neither the backup nor the replace happened
+    assert json.loads(capsys.readouterr().out)["comments"] == 1
+
+
+def test_update_blocks_on_named_ranges_alone(engine, monkeypatch, tmp_path,
+                                             capsys):
+    """A doc with no comments but with named ranges is the other half of the
+    guard — `mark` puts them there and a full replace destroys them."""
+    calls = []
+    _stub_update_preflight(monkeypatch, engine, [], named_ranges=("intro",))
+    monkeypatch.setattr(engine, "get_drive_service",
+                        lambda c: _fake_update_drive(calls))
+    md = tmp_path / "doc.md"
+    md.write_text("# hi\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc:
+        engine.update_doc("doc1", str(md))
+    assert exc.value.code == 2
+    assert calls == []
+    assert json.loads(capsys.readouterr().out)["named_ranges"] == ["intro"]
+
+
+def test_update_with_acknowledge_loss_needs_no_terminal(
+        engine, monkeypatch, tmp_path):
+    """The regression #17 fixes: with the flag, a non-interactive run must get
+    all the way to the backup instead of being stopped by a missing TTY."""
+    calls = []
+    _stub_update_preflight(monkeypatch, engine, [{"id": "c1"}])
+    monkeypatch.setattr(engine, "get_drive_service",
+                        lambda c: _fake_update_drive(calls))
+    md = tmp_path / "doc.md"
+    md.write_text("# hi\n", encoding="utf-8")
+
+    with pytest.raises(_Exploded):
+        engine.update_doc("doc1", str(md), acknowledge_loss=True)
+    assert calls == ["copy"]  # backup attempted, no write yet
 
 
 # --- _emit_json ---

@@ -27,7 +27,7 @@ Setup:
 Comments & edits:
   comments     List comments on a doc
   reply        Post a reply to a comment
-  resolve      Resolve a comment thread (asks for confirmation)
+  resolve      Resolve a comment thread (the person's decision, not an agent's)
   comment      Create a document-level comment
   patch        Apply anchor-safe text edits (keeps comment anchors alive)
   mark         Create a named range around a text fragment
@@ -45,6 +45,9 @@ Data & privacy:
   revoke       Revoke the token with Google, then remove it locally
   forget       Remove the local token/credentials/journals (and, with
                --sidecars PATH, a document's sidecar)
+
+Other:
+  --version    Print the installed version
 
 Run `skrepka <command> --help` for details on a command.
 """
@@ -64,6 +67,15 @@ def main():
     # through so an unknown top-level token still fails loudly.
     if not argv or argv in (["-h"], ["--help"], ["help"]):
         sys.stdout.write(_TOP_HELP)
+        sys.exit(0)
+
+    # Bug reports need a version to quote (#5). Compared as the whole argv, so
+    # `skrepka --version extra` still fails loudly instead of exiting 0; the
+    # version lives in skrepka/__init__.py, which imports nothing heavy, so a
+    # broken dependency install can still answer this.
+    if argv == ["--version"]:
+        from skrepka import __version__
+        sys.stdout.write(f"skrepka {__version__}\n")
         sys.exit(0)
 
     if cmd == "init":

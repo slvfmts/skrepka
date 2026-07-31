@@ -42,3 +42,23 @@ def test_help_with_extra_token_does_not_silently_succeed(monkeypatch):
     # through to the engine parser, which rejects the unknown token.
     code = _run(["help", "patch"], monkeypatch)
     assert code != 0
+
+
+def test_version_prints_the_installed_version(monkeypatch, capsys):
+    """Bug reports have to quote a version, and CONTRIBUTING points here (#5).
+    It must answer before the engine (and its google deps) is imported, so a
+    half-broken install can still be identified."""
+    import skrepka
+
+    monkeypatch.setitem(sys.modules, "skrepka._engine", None)
+    code = _run(["--version"], monkeypatch)
+    out = capsys.readouterr().out
+    assert code == 0
+    assert out.strip() == f"skrepka {skrepka.__version__}"
+    assert "--version" in cli._TOP_HELP
+
+
+def test_version_with_extra_token_does_not_silently_succeed(monkeypatch):
+    # same rule as `help patch`: an unknown trailing token must fail loudly
+    code = _run(["--version", "extra"], monkeypatch)
+    assert code != 0

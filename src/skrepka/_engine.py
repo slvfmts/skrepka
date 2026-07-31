@@ -94,32 +94,49 @@ def _warn(msg):
     print(json.dumps({"warning": msg}), file=sys.stderr)
 
 
-def _require_human(operation):
-    """Cooperative gate for human-only operations (resolving comment
-    threads, updates that acknowledge comment loss). Agent runs are
-    normally non-interactive, so requiring a TTY confirmation stops the
-    accidental/default agent path before any API call. It is NOT a
-    security boundary: an agent could set the env var or allocate a PTY —
-    forbidding that is the agent contract's job (agents/CONTRACT.md), and
-    an agent holding the OAuth token could bypass this CLI entirely.
-    A human running non-interactively (their own scripts/CI) can
-    pre-authorize with SKREPKA_ASSUME_HUMAN=1.
+def _isatty(stream):
+    """True only for a stream that is definitely a terminal. A missing or
+    broken stdin/stderr (pythonw, a closed fd, a detached service) must read
+    as 'no terminal' rather than blow up inside a gate."""
+    try:
+        return bool(stream is not None and stream.isatty())
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def _require_consent(operation, confirmed, remedy):
+    """Cooperative gate for operations that are the person's decision, not the
+    agent's. The explicit flag IS the confirmation, the same way --yes works
+    for revoke/forget in privacy.py.
+
+    It used to demand a TTY. Measured (#17): a subprocess launched by an agent
+    has no TTY on stdin/stderr and no /dev/tty at all, so the demand made the
+    legitimate human path unreachable and left one workaround — a person
+    pasting a command an agent composed. A terminal existing was never
+    evidence that a human consented.
+
+    This is NOT a security boundary: an agent can pass the flag. What forbids
+    it is the agent contract (agents/CONTRACT.md), and an agent holding the
+    OAuth token could bypass this CLI entirely anyway. `remedy` says what to
+    do instead, and is addressed to the agent.
     """
-    if os.environ.get("SKREPKA_ASSUME_HUMAN") == "1":
+    if confirmed:
         return
-    if not (sys.stdin.isatty() and sys.stderr.isatty()):
-        _error(
-            f"'{operation}' is a human-only operation and needs an "
-            f"interactive terminal confirmation. If you are a human running "
-            f"this non-interactively, set SKREPKA_ASSUME_HUMAN=1 and rerun. "
-            f"If you are an AI agent: do not set that variable and do not "
-            f"bypass this gate — ask the person you work for to run "
-            f"'{operation}' themselves.")
-    print(f"Confirm human-only operation '{operation}'? [y/N]: ",
-          end="", file=sys.stderr, flush=True)
-    answer = sys.stdin.readline().strip().lower()
-    if answer not in ("y", "yes"):
+    if _isatty(sys.stdin) and _isatty(sys.stderr):
+        try:
+            print(f"Confirm '{operation}'? [y/N]: ",
+                  end="", file=sys.stderr, flush=True)
+            answer = sys.stdin.readline()
+        except (OSError, ValueError):
+            answer = ""  # unreadable terminal is not a yes
+        if answer.strip().lower() in ("y", "yes"):
+            return
         _error(f"'{operation}' was not confirmed — nothing done")
+    else:
+        _error(
+            f"'{operation}' is the person's decision, not the agent's. "
+            f"{remedy} If you are a human running this non-interactively, "
+            f"rerun with --yes.")
 
 
 def _emit_json(payload, output=None, summary=None):
@@ -2713,12 +2730,16 @@ def mark_range(file_id, name, quote, tab_id=None, occurrence=1):
 # Reply / resolve / create comment
 # ---------------------------------------------------------------------------
 
-def reply_comment(file_id, comment_id, text, resolve=False):
+def reply_comment(file_id, comment_id, text, resolve=False, yes=False):
     """Post a reply to an existing comment. If resolve=True, also resolves the thread."""
     if resolve:
-        # resolving a thread is the reviewer's call, never the agent's —
-        # gate it mechanically, not just by instruction
-        _require_human("resolve comment thread")
+        # Resolving a thread is the reviewer's call, never the agent's. --yes
+        # is the person's own non-interactive path (their scripts), not a door
+        # for the agent: by contract the agent does not resolve at all, with or
+        # without the flag (agents/CONTRACT.md §2.1).
+        _require_consent(
+            "resolve comment thread", yes,
+            "Ask the person to close the thread in the Google Docs UI.")
     file_id = _extract_doc_id(file_id)
     try:
         creds = get_creds()
@@ -2745,18 +2766,24 @@ def reply_comment(file_id, comment_id, text, resolve=False):
         "comment_id": comment_id,
         "content": reply.get("content"),
         "author": reply.get("author", {}).get("displayName"),
+        # Pass-through API fields keep their API names (createdTime, id,
+        # content, author, action); comment_id/resolved are skrepka's own.
+        # The second a reply landed in is what anchor accounting keys on, so
+        # it has to be greppable against `comments` output (#15, #16).
+        "createdTime": reply.get("createdTime"),
         "action": reply.get("action"),
         "resolved": resolve,
     }, ensure_ascii=False))
 
 
-def resolve_comment(file_id, comment_id, text=None):
+def resolve_comment(file_id, comment_id, text=None, yes=False):
     """Resolve a comment by posting a reply with action=resolve.
 
     Per Drive API, 'resolved' is read-only; the only way to resolve is via
     replies.create with action: 'resolve'. Works for unanchored comments too.
     """
-    reply_comment(file_id, comment_id, text or "Resolved.", resolve=True)
+    reply_comment(file_id, comment_id, text or "Resolved.", resolve=True,
+                  yes=yes)
 
 
 def create_comment(file_id, text):
@@ -4656,11 +4683,12 @@ def update_doc(file_id, file_path, title=None, no_highlights=False,
                 "named_ranges": sorted(named_ranges),
             }, ensure_ascii=False, indent=2))
             sys.exit(2)
-        # the flag alone is not enough: destroying comments is the document
-        # owner's call, never the agent's — gate mechanically
-        _require_human(
-            f"update --acknowledge-loss (destroys {len(all_comments)} "
-            f"comment(s) / {len(named_ranges)} named range(s))")
+        # --acknowledge-loss IS the acknowledgement (#17): the CLI used to also
+        # demand a terminal, which an agent-run process never has, so the
+        # legitimate destructive path was unreachable for the actual audience.
+        # What stands between an agent and this branch is the contract: ask the
+        # person in plain words and wait for an explicit yes before passing the
+        # flag (agents/CONTRACT.md §2.2).
         # Acknowledged: back up first, verify placement, report id BEFORE
         # destruction (codex code review #8: pin and verify parents).
         backup_body = {"name": f"{meta.get('name', 'doc')}.pre-update-backup-"
@@ -4829,6 +4857,9 @@ def main():
     rp.add_argument("text", help="Reply text")
     rp.add_argument("--resolve", action="store_true",
                     help="Also mark the thread as resolved")
+    rp.add_argument("--yes", action="store_true",
+                    help="Confirm the resolve without a prompt (only with "
+                         "--resolve; closing a thread is the person's call)")
 
     # resolve command
     rs = sub.add_parser("resolve", help="Resolve a comment thread")
@@ -4836,6 +4867,9 @@ def main():
     rs.add_argument("comment_id", help="Comment ID to resolve")
     rs.add_argument("--text", default=None,
                     help="Optional note (default: 'Resolved.')")
+    rs.add_argument("--yes", action="store_true",
+                    help="Confirm without a prompt (closing a thread is the "
+                         "person's call, not the agent's)")
 
     # comment command (document-level, unanchored)
     cc = sub.add_parser("comment", help="Create a document-level comment (no anchor)")
@@ -4906,9 +4940,15 @@ def main():
     elif args.command == "comments":
         list_comments(_extract_doc_id(args.file_id), output=args.output)
     elif args.command == "reply":
-        reply_comment(args.file_id, args.comment_id, args.text, resolve=args.resolve)
+        # a bare --yes would silently mean nothing here; refusing keeps the
+        # flag tied to the one thing it confirms
+        if args.yes and not args.resolve:
+            _error("--yes applies only together with --resolve — nothing done")
+        reply_comment(args.file_id, args.comment_id, args.text,
+                      resolve=args.resolve, yes=args.yes)
     elif args.command == "resolve":
-        resolve_comment(args.file_id, args.comment_id, text=args.text)
+        resolve_comment(args.file_id, args.comment_id, text=args.text,
+                        yes=args.yes)
     elif args.command == "comment":
         create_comment(args.file_id, args.text)
     elif args.command == "mark":
