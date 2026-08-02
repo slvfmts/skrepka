@@ -61,6 +61,18 @@ def test_consent_refuses_without_flag_non_interactive(engine, capsys):
     assert "themselves" not in err
 
 
+def test_consent_refusal_does_not_end_on_the_flag(engine, capsys):
+    """Measured in the acceptance run: with "rerun with --yes" as the closing
+    sentence, an agent with no contract in context read it as its own next
+    step and passed the flag. The prohibition has to come first and the flag
+    must never be the last thing said."""
+    with pytest.raises(SystemExit):
+        engine._require_consent("resolve comment thread", False, REMEDY)
+    err = json.loads(capsys.readouterr().out)["error"]
+    assert err.index("not the agent's") < err.index("--yes")
+    assert not err.rstrip().endswith("rerun with --yes.")
+
+
 def test_consent_flag_alone_passes_without_terminal(engine):
     engine._require_consent("resolve comment thread", True, REMEDY)
 
@@ -225,22 +237,33 @@ def test_reply_prints_the_second_its_reply_landed_in(engine, monkeypatch,
 
 # --- update: the flag is the confirmation, no terminal involved ---
 
-def _fake_update_drive(calls):
-    class _Get:
+def _fake_update_drive(calls, *, let_it_run=False):
+    """let_it_run=False stops at the first write, so a test can prove the gate
+    let the operation through without actually walking the whole path."""
+    class _Resp:
+        def __init__(self, payload):
+            self.payload = payload
+
         def execute(self):
-            return {"name": "doc", "parents": ["folder1"]}
+            return self.payload
 
     class Files:
         def get(self, **kw):
-            return _Get()
+            return _Resp({"id": "doc1", "name": "doc", "parents": ["folder1"],
+                          "webViewLink": "https://example/doc1"})
 
         def copy(self, **kw):
             calls.append("copy")
-            raise _Exploded("backup reached")
+            if not let_it_run:
+                raise _Exploded("backup reached")
+            return _Resp({"id": "backup1", "name": "doc.pre-update-backup-x",
+                          "parents": ["folder1"]})
 
         def update(self, **kw):
             calls.append("update")
-            raise _Exploded("destructive write reached")
+            if not let_it_run:
+                raise _Exploded("destructive write reached")
+            return _Resp({})
 
     class Drive:
         def files(self):
@@ -271,7 +294,14 @@ def test_update_without_acknowledge_loss_blocks_before_any_write(
         engine.update_doc("doc1", str(md))
     assert exc.value.code == 2
     assert calls == []  # neither the backup nor the replace happened
-    assert json.loads(capsys.readouterr().out)["comments"] == 1
+    blocked = json.loads(capsys.readouterr().out)
+    assert blocked["comments"] == 1
+    # the agent has to be able to name the document it is asking about
+    assert blocked["document"] == "doc"
+    # asking comes before the flag, and consent does not travel between docs
+    reason = blocked["reason"]
+    assert reason.index("ask the person") < reason.index("--acknowledge-loss")
+    assert "does not carry over" in reason
 
 
 def test_update_blocks_on_named_ranges_alone(engine, monkeypatch, tmp_path,
@@ -306,6 +336,42 @@ def test_update_with_acknowledge_loss_needs_no_terminal(
     with pytest.raises(_Exploded):
         engine.update_doc("doc1", str(md), acknowledge_loss=True)
     assert calls == ["copy"]  # backup attempted, no write yet
+
+
+def test_destructive_receipt_says_the_consent_was_one_time(
+        engine, monkeypatch, tmp_path, capsys):
+    """The refusal is the only place the rule is stated, and an agent that
+    already knows the flag never sees it again — that is how a second document
+    got destroyed on no consent at all. The receipt has to repeat it."""
+    calls = []
+    _stub_update_preflight(monkeypatch, engine, [{"id": "c1"}])
+    monkeypatch.setattr(engine, "get_drive_service",
+                        lambda c: _fake_update_drive(calls, let_it_run=True))
+    md = tmp_path / "doc.md"
+    md.write_text("# hi\n", encoding="utf-8")
+
+    engine.update_doc("doc1", str(md), acknowledge_loss=True)
+    out = json.loads(capsys.readouterr().out)
+    assert calls == ["copy", "update"]
+    assert "one-time consent" in out["consent_note"]
+    assert "any other document" in out["consent_note"]
+
+
+def test_clean_document_receipt_has_no_consent_note(
+        engine, monkeypatch, tmp_path, capsys):
+    """No comments, no named ranges: nothing was destroyed and no consent was
+    spent, so the note would be noise."""
+    calls = []
+    _stub_update_preflight(monkeypatch, engine, [])
+    monkeypatch.setattr(engine, "get_drive_service",
+                        lambda c: _fake_update_drive(calls, let_it_run=True))
+    md = tmp_path / "doc.md"
+    md.write_text("# hi\n", encoding="utf-8")
+
+    engine.update_doc("doc1", str(md))
+    out = json.loads(capsys.readouterr().out)
+    assert calls == ["update"]  # no backup: nothing to lose
+    assert "consent_note" not in out
 
 
 # --- _emit_json ---

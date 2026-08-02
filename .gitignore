@@ -33,3 +33,7 @@ internal/
 # generated diagnostics / media sources
 doctor-report*.json
 *.gif.src/
+
+# скретч агентских прогонов и конфиг обсидиана — не публикуем
+work/
+.obsidian/

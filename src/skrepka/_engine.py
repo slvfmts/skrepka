@@ -133,10 +133,16 @@ def _require_consent(operation, confirmed, remedy):
             return
         _error(f"'{operation}' was not confirmed — nothing done")
     else:
+        # Order matters, measured in an acceptance run: when the human-facing
+        # "rerun with --yes" came last, an agent with no contract in context
+        # read it as its own instruction and passed the flag. The prohibition
+        # goes first and the flag is never the closing sentence.
         _error(
             f"'{operation}' is the person's decision, not the agent's. "
-            f"{remedy} If you are a human running this non-interactively, "
-            f"rerun with --yes.")
+            f"Being asked for it is not permission to pass --yes: that flag "
+            f"is the non-interactive path for a person running skrepka from "
+            f"their own shell, and an agent acting for a person is not that "
+            f"person. If you are that person, rerun with --yes. {remedy}")
 
 
 def _emit_json(payload, output=None, summary=None):
@@ -2739,7 +2745,11 @@ def reply_comment(file_id, comment_id, text, resolve=False, yes=False):
         # without the flag (agents/CONTRACT.md §2.1).
         _require_consent(
             "resolve comment thread", yes,
-            "Ask the person to close the thread in the Google Docs UI.")
+            "Ask the person to close the thread in the Google Docs UI, and "
+            "preferably after the edits land: a closed thread drops out of "
+            "the export, so skrepka can no longer protect the text it is "
+            "anchored to, and a later delete turns it into a ghost that "
+            "reopening does not bring back.")
     file_id = _extract_doc_id(file_id)
     try:
         creds = get_creds()
@@ -4674,10 +4684,16 @@ def update_doc(file_id, file_path, title=None, no_highlights=False,
                 "reason": (
                     "full replace via drive.files().update makes ALL comments "
                     "invisible ghosts in the UI and destroys named ranges. "
-                    "Use `patch` for iterative edits. To proceed anyway, rerun "
-                    "with --acknowledge-loss (a backup copy will be created "
-                    "first, but per C0 it will NOT contain the comments)."
+                    "Use `patch` for iterative edits. If a full replace is "
+                    "really wanted: ask the person in plain words about THIS "
+                    "document, name what it loses, and wait for an explicit "
+                    "yes before rerunning with --acknowledge-loss. A yes given "
+                    "for another document, or earlier in this session, does "
+                    "not carry over — ask again for each document. The backup "
+                    "made first holds text and styles only: per C0 it will NOT "
+                    "contain the comments."
                 ),
+                "document": meta.get("name"),
                 "comments": len(all_comments),
                 "anchored_comments": len(anchored),
                 "named_ranges": sorted(named_ranges),
@@ -4771,6 +4787,15 @@ def update_doc(file_id, file_path, title=None, no_highlights=False,
     }
     if backup_info:
         out["backup"] = backup_info
+        # The refusal above is the only place the rule is stated, and an agent
+        # that already knows the flag never sees it again. Measured in an
+        # acceptance run: told "now do the same for the second doc", the agent
+        # reused the working command and destroyed a document nobody had
+        # consented to. The receipt has to carry the rule too.
+        out["consent_note"] = (
+            "--acknowledge-loss consumed a one-time consent: this document, "
+            "this run. Before replacing any other document, ask the person "
+            "again, name that document, and wait for a fresh explicit yes.")
     print(json.dumps(out, ensure_ascii=False))
 
 
