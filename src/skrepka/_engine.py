@@ -1250,7 +1250,8 @@ def _resolve_named_range(doc_tab, name):
         if prev_end < next_start:
             _error(
                 f"named range '{name}' is fragmented ({len(sorted_ranges)} "
-                f"non-contiguous sub-ranges). Re-create it with /gdocs-mark."
+                f"non-contiguous sub-ranges). Re-create it with `skrepka "
+                f"mark`."
             )
     return sorted_ranges[0][0], sorted_ranges[-1][1]
 
@@ -1908,14 +1909,23 @@ def _account_anchored_comments(anchored, records, spans, *, universe,
             # document.
             outside_body += 1
             continue
+        if n == 0 and rid in set((marker_census or {}).get("in_tables") or ()):
+            # The marker IS in document.xml, inside a table the span parser
+            # does not walk. Same conclusion as the parser's own hidden-marker
+            # problem, and it has to be carried the same way, or this plain
+            # string would freeze the document the fence was built to keep
+            # editable (found in review).
+            problems.append(_HiddenMarkerProblem(
+                f"comments.xml entry {rid} anchors inside a table — its exact "
+                f"position is not readable from the export",
+                in_tables=(rid,)))
+            continue
         # LOAD-BEARING for the witness rule: it proves a thread has an anchor
         # by "witness record ⇒ exactly one span ⇒ that span is protected".
         # The rule now reads: a witness record either maps to exactly one span
-        # in the body, or provably has no anchor in the body at all (branch
-        # above). Everything else stays global. n == 0 with the id seen
-        # somewhere in document.xml means the marker is in a container we do
-        # not parse — the hidden-marker problem above carries that case and
-        # decides whether it can be fenced off. n > 1: tempting to confine to
+        # in the body, or provably has no anchor in the body at all (footnote
+        # branch above), or anchors inside a table whose extent bounds it
+        # (branch above). Everything else stays global. n > 1: tempting to confine to
         # those spans, but _parse_docx_anchor_spans already reports the same
         # document as globally broken ("comment range {id}: N starts / M
         # ends"), and a w:id whose markers do not pair up 1:1 has unreliable
@@ -2484,7 +2494,7 @@ def _informational_replies(drive_service, file_id, doc_tab, resolved, comments):
                     quoted = (c.get("quotedFileContent") or {}).get("value", "")
                     note = (
                         f"↻ Текст рядом с этим комментарием обновлён через "
-                        f"/gdocs-patch (было: «{quoted[:200]}»). Тред сохранён."
+                        f"skrepka (было: «{quoted[:200]}»). Тред сохранён."
                     )
                     try:
                         drive_service.replies().create(
@@ -2565,6 +2575,40 @@ def _pure_insertion(search_text, new_text):
     return None
 
 
+def _op_current_text(op, doc_tab, r):
+    """The text a replace op currently occupies, or None if it is not one."""
+    if r["kind"] != "replace":
+        return None
+    if "quote" in op:
+        return op["quote"]
+    return _extract_exact_text_range(doc_tab, r["start"], r["end"])
+
+
+def _op_pure_insertion(op, doc_tab, r):
+    """`_pure_insertion` for a resolved op, or None if it removes text.
+
+    An op is judged by what it DOES, not by the word in its name: a replace
+    whose new text merely extends the old removes nothing, so every rule that
+    exists to protect text from removal has no business with it.
+    """
+    current = _op_current_text(op, doc_tab, r)
+    if not current:
+        return None
+    return _pure_insertion(current, r["text"])
+
+
+def _op_is_noop(op, doc_tab, r):
+    """True for a replace whose new text is the text already there.
+
+    It used to take the full destructive path: delete the text and insert the
+    identical text back, with everything that hangs off a rewrite — styles,
+    the canary, the anchor gates. Nothing about the document changes, so
+    nothing about the document should be written (found in review).
+    """
+    current = _op_current_text(op, doc_tab, r)
+    return current is not None and current == r["text"]
+
+
 def _doomed_threads(start, end, anchors, attribution=None):
     """Threads a replace over [start, end) would ghost.
 
@@ -2630,6 +2674,16 @@ def _narrow_replace(doc_tab, search_text, new_text, start, end,
     for bs, be, _label in _blocked_hits(start, end, blocked):
         l_cand.add(be - start)
         r_cand.add(end - bs)
+    # Style boundaries are candidates too. A paragraph that opens with a bold
+    # lead-in spans mixed styles, and replaceAllText flattens those (C2) — so
+    # the whole operation was refused even when the bold part was not what
+    # changed. Cutting to the boundary leaves it alone (found in review).
+    body = doc_tab.get("body", {}) or {}
+    for rs, re_, _tr in _extract_runs_full(body.get("content", [])):
+        if start < re_ < end:
+            l_cand.add(re_ - start)
+        if start < rs < end:
+            r_cand.add(end - rs)
     l_cand = sorted(c for c in l_cand if 0 <= c <= l_max)
     r_cand = sorted(c for c in r_cand if 0 <= c <= r_max)
 
@@ -2664,9 +2718,27 @@ def _narrow_replace(doc_tab, search_text, new_text, start, end,
     return None
 
 
-def _resolve_replace_target(op, doc_tab, r):
+def _style_refusal(doc_tab, start, end, source):
+    """Refusal message when a replace range spans mixed styles, or None."""
+    uniform, differing = _match_style_signature(doc_tab, start, end)
+    if uniform:
+        return None
+    return (
+        f"replace target spans mixed text styles ({', '.join(differing)}) "
+        f"— replaceAllText would flatten them (confirmed, C2). Split the "
+        f"replacement into uniformly-styled pieces or edit in the UI. "
+        f"({source})")
+
+
+def _resolve_replace_target(op, doc_tab, r, check_style=True):
     """Shared replace-target checks on a given snapshot: exact text,
-    uniqueness, round-trip, style uniformity. Returns search_text."""
+    uniqueness, round-trip, style uniformity. Returns search_text.
+
+    `check_style=False` defers the style check to the caller. The anchor-safe
+    path needs that: it may narrow the range, and a mixed style sitting in the
+    part the narrowing would leave alone must not decide the whole operation
+    before narrowing has been tried (found in review).
+    """
     if "quote" in op:
         search_text = op["quote"]
         if "occurrence" in op and int(op["occurrence"]) != 1:
@@ -2703,14 +2775,10 @@ def _resolve_replace_target(op, doc_tab, r):
             f"resolved text for {r['source']} matches a different "
             f"location ({found} vs ({r['start']}, {r['end']})) — refused"
         )
-    uniform, differing = _match_style_signature(doc_tab, r["start"], r["end"])
-    if not uniform:
-        _error(
-            f"replace target spans mixed text styles ({', '.join(differing)}) "
-            f"— replaceAllText would flatten them (confirmed, C2). Split the "
-            f"replacement into uniformly-styled pieces or edit in the UI. "
-            f"({r['source']})"
-        )
+    if check_style:
+        problem = _style_refusal(doc_tab, r["start"], r["end"], r["source"])
+        if problem:
+            _error(problem)
     return search_text
 
 
@@ -2792,19 +2860,22 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
             _error("multi-tab document: anchor-mapped replaces are not "
                    "supported — edit in the UI")
         tid, doc_tab = _select_tab(doc, tab_id=tab_id)
-        _refuse_on_suggestions(doc_tab)
         r = _resolve_op(op, doc_tab, tid)
+
+        if _op_is_noop(op, doc_tab, r):
+            return {"source": r["source"], "applied_as": "no-op",
+                    "note": "текст уже такой — ничего не записано"}
 
         # A replacement that only EXTENDS its target removes no original
         # character, so no anchor can be ghosted by it and none of the export
         # machinery below is needed (r8). This is the common «допиши фразу к
         # прокомментированному предложению», which used to be refused.
-        current = (op["quote"] if "quote" in op
-                   else _extract_exact_text_range(doc_tab, r["start"], r["end"]))
-        insertion = _pure_insertion(current, r["text"]) if current else None
+        insertion = _op_pure_insertion(op, doc_tab, r)
         if insertion:
             where, text = insertion
-            loc = {"index": r["end"] if where == "after" else r["start"]}
+            point = r["end"] if where == "after" else r["start"]
+            _refuse_on_suggestion_at(doc_tab, point, r["source"])
+            loc = {"index": point}
             if tid:
                 loc["tabId"] = tid
             docs_service.documents().batchUpdate(
@@ -2816,7 +2887,9 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
             return {"source": r["source"], "applied_as": "insert",
                     "note": "замена ничего не удаляла — применена как вставка"}
 
-        search_text = _resolve_replace_target(op, doc_tab, r)
+        _refuse_on_suggestions(doc_tab)
+        search_text = _resolve_replace_target(op, doc_tab, r,
+                                              check_style=False)
         body_content = (doc_tab.get("body", {}) or {}).get("content", [])
         body_end = body_content[-1]["endIndex"] if body_content else 2
         named_intervals = _named_range_intervals(doc_tab)
@@ -2849,14 +2922,22 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
         start_at, end_at, applied_text = r["start"], r["end"], r["text"]
         hits = _blocked_hits(start_at, end_at, snap["blocked"])
         doomed = _doomed_threads(start_at, end_at, snap["anchors"], attribution)
+        # mixed styles are a reason to narrow too, not only a reason to refuse:
+        # replaceAllText flattens them, a range that avoids them does not
+        style_problem = _style_refusal(doc_tab, start_at, end_at, r["source"])
         narrowed = None
-        if hits or doomed:
+        if hits or doomed or style_problem:
             narrowed = _narrow_replace(
                 doc_tab, search_text, r["text"], start_at, end_at,
                 snap["anchors"], snap["blocked"], attribution)
         if narrowed:
+            # everything was re-checked inside the narrowing, on the range
+            # that will actually be written
             search_text, applied_text, start_at, end_at = narrowed
-            hits, doomed = [], []
+            hits, doomed, style_problem = [], [], None
+        if style_problem:
+            cleaned = _cleanup_canary(docs_service, file_id, canary)
+            _error(_canary_msg(style_problem, cleaned))
         if hits:
             bs, be, label = hits[0]
             cleaned = _cleanup_canary(docs_service, file_id, canary)
@@ -3010,12 +3091,22 @@ def patch_doc(file_id, ops_path, tab_id=None):
 
     # Suggestions block replaces document-wide (the anchor map comes from an
     # export whose behaviour with tracked changes is unmeasured), but they
-    # only block an insert that lands inside one (r8).
-    if any(r["kind"] == "replace" for r in resolved):
+    # only block an insert that lands inside one (r8). A replace that removes
+    # nothing counts as an insert here — it is one.
+    insertions = [_op_pure_insertion(op, doc_tab, r)
+                  for op, r in zip(ops, resolved)]
+    noops = [_op_is_noop(op, doc_tab, r) for op, r in zip(ops, resolved)]
+    if any(r["kind"] == "replace" and ins is None and not noop
+           for r, ins, noop in zip(resolved, insertions, noops)):
         _refuse_on_suggestions(doc_tab)
-    for r in resolved:
-        if r["kind"] == "insert":
-            _refuse_on_suggestion_at(doc_tab, r["start"], r["source"])
+    for r, ins, noop in zip(resolved, insertions, noops):
+        if noop:
+            continue  # writes nothing at all
+        if r["kind"] == "insert" or ins:
+            point = r["start"]
+            if ins and ins[0] == "after":
+                point = r["end"]
+            _refuse_on_suggestion_at(doc_tab, point, r["source"])
 
     all_comments, anchored, _, _ = _census_comments(drive_service, file_id)
 
@@ -3029,10 +3120,26 @@ def patch_doc(file_id, ops_path, tab_id=None):
                 "an anchored comment appeared while preparing the patch; "
                 "re-run — the doc now requires the anchor-safe strategy"
             )
+        by_source = {id(r): ins for r, ins in zip(resolved, insertions)}
+        noop_ids = {id(r) for r, noop in zip(resolved, noops) if noop}
         ordered = sorted(resolved, key=lambda r: r["affect_start"], reverse=True)
         requests = []
         for r in ordered:
-            if r["kind"] == "replace":
+            if id(r) in noop_ids:
+                continue
+            ins = by_source.get(id(r))
+            if ins:
+                # A replace that only extends its target: emit the insert
+                # alone. Rewriting it as delete+insert would remove text that
+                # the caller never asked to remove — and this path was already
+                # told, by the suggestion gate above, that this op removes
+                # nothing (found in review).
+                loc = {"index": r["end"] if ins[0] == "after" else r["start"]}
+                if r["tab_id"]:
+                    loc["tabId"] = r["tab_id"]
+                requests.append({"insertText": {"location": loc,
+                                                "text": ins[1]}})
+            elif r["kind"] == "replace":
                 if r["end"] > r["start"]:
                     del_range = {"startIndex": r["start"], "endIndex": r["end"]}
                     if r["tab_id"]:
@@ -3909,18 +4016,42 @@ def _archive_closed_threads(md_path, file_id, closed, doc_tab=None,
                  "content": r.get("content")}
                 for r in (c.get("replies") or []) if not r.get("deleted")],
         })
+    path = md_path + ".skrepka-closed-threads.json"
+
+    # The archive ACCUMULATES. A thread archived by an earlier sync may be
+    # gone from today's census — deleted, or no longer anchored — and a plain
+    # overwrite would then destroy the only copy of it that exists anywhere
+    # (found in review). An archive that can be silently truncated is not an
+    # archive.
+    kept = []
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                previous = json.load(f)
+            old = previous["threads"]
+            if not isinstance(old, list):
+                raise ValueError("threads is not a list")
+        except Exception as e:
+            raise RuntimeError(
+                f"не удалось прочитать прежний архив закрытых тредов {path}: "
+                f"{e}. Перезаписать его нельзя — это единственная копия тех "
+                f"разговоров. Уберите файл в сторону и повторите.")
+        fresh_ids = {e["id"] for e in entries}
+        kept = [t for t in old
+                if isinstance(t, dict) and t.get("id") not in fresh_ids]
+
     payload = {
         "doc_id": file_id,
         "note": ("Закрытые треды. Google не отдаёт их в экспорте, поэтому "
                  "skrepka не знает, где стояли их якоря, и правка через "
                  "удаление могла превратить их в призраков: в интерфейсе "
                  "такой тред не появится даже после переоткрытия. Текст "
-                 "разговора сохранён здесь."),
-        "threads": entries,
+                 "разговора сохранён здесь. Файл накапливается: треды из "
+                 "прошлых прогонов остаются."),
+        "threads": entries + kept,
     }
     return safeio.atomic_write(
-        md_path + ".skrepka-closed-threads.json",
-        json.dumps(payload, ensure_ascii=False, indent=1) + "\n")
+        path, json.dumps(payload, ensure_ascii=False, indent=1) + "\n")
 
 
 def _write_journal(md_path, journal):
@@ -4945,9 +5076,18 @@ def sync_doc(file_id, md_path, tab_id=None):
             archive = _archive_closed_threads(
                 md_path, file_id, closed, doc_tab=doc_tab,
                 edited=edited_ranges)
-        except Exception as e:  # never let bookkeeping block the edit
-            archive = None
-            _warn(f"could not archive closed threads: {e}")
+        except Exception as e:
+            # Fail closed, and only here. The archive is what makes this
+            # edit's known cost acceptable: without it the sync can unhook a
+            # closed thread and leave no copy of what was said (found in
+            # review). The remedy is local and cheap — a writable path next
+            # to the markdown.
+            _error(_canary_note(
+                f"не удалось сохранить разговор закрытых тредов рядом с "
+                f"{md_path}: {e}. Правка остановлена, ничего не применено: в "
+                f"документе {len(closed)} закрытых тредов, их якорей экспорт "
+                f"не показывает, и после правки разговор было бы не "
+                f"восстановить."))
         closed_note = {
             "count": len(closed),
             "archive": archive,

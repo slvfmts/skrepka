@@ -434,15 +434,58 @@ def test_record_with_no_marker_anywhere_is_an_anchor_outside_the_body(engine):
     assert metrics["anchors_outside_body"] == 1
 
 
-def test_record_whose_marker_is_in_the_document_still_needs_its_span(engine):
-    """Same shape, but the marker WAS seen in document.xml — then a missing
-    span means the parser could not place it, and that stays a refusal."""
+def test_record_anchored_in_a_table_is_bounded_not_global(engine):
+    """The marker IS in document.xml, inside a table. The accounting must
+    carry that the same way the parser does — otherwise this plain problem
+    freezes the document the table fence was built to keep editable."""
     anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z")]
     records = [{"docx_id": "0", "author": "A",
                 "date_sec": "2026-01-01T00:00:01Z"}]
     problems, _ = engine._account_anchored_comments(
         anchored, records, [], universe=engine._key_owners_universe(anchored),
         marker_census=_census(in_tables=("0",)))
+    assert len(problems) == 1
+    assert problems[0].in_tables == frozenset({"0"})
+    tab = {"body": {"content": [
+        {"startIndex": 1, "endIndex": 40, "table": {"rows": 1}}]}}
+    remaining, blocked = engine._fence_off_tables(problems, tab)
+    assert remaining == []
+    assert [(s, e) for s, e, _ in blocked] == [(1, 40)]
+
+
+def test_table_anchor_survives_the_whole_problem_pipeline(engine, make_docx):
+    """The real path, both problem sources together: the parser reports the
+    hidden marker AND the accounting reports the record with no span. If
+    either one stays global, the document is frozen and the table fence buys
+    nothing — which is exactly what the first version of it did."""
+    body = ('<w:tbl><w:tr><w:tc><w:p>'
+            '<w:commentRangeStart w:id="3"/><w:r><w:t>cell</w:t></w:r>'
+            '<w:commentRangeEnd w:id="3"/></w:p></w:tc></w:tr></w:tbl>'
+            '<w:p><w:r><w:t>обычный абзац</w:t></w:r></w:p>')
+    spans, problems, census = engine._parse_docx_anchor_spans(make_docx(body))
+    anchored = [api_comment("c1", "A", CREATED)]
+    records = [{"docx_id": "3", "author": "A", "date_sec": CREATED_SEC}]
+    acc, _metrics = engine._account_anchored_comments(
+        anchored, records, spans,
+        universe=engine._key_owners_universe(anchored), marker_census=census)
+    tab = {"body": {"content": [
+        {"startIndex": 1, "endIndex": 40, "table": {"rows": 1}},
+        {"startIndex": 40, "endIndex": 55, "paragraph": {"elements": []}},
+    ]}}
+    remaining, blocked = engine._fence_off_tables(problems + acc, tab)
+    assert remaining == []
+    assert [(s, e) for s, e, _ in blocked] == [(1, 40), (1, 40)]
+
+
+def test_record_whose_marker_hides_elsewhere_stays_global(engine):
+    """A container that is not a table bounds nothing, so the refusal stays
+    document-wide."""
+    anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z")]
+    records = [{"docx_id": "0", "author": "A",
+                "date_sec": "2026-01-01T00:00:01Z"}]
+    problems, _ = engine._account_anchored_comments(
+        anchored, records, [], universe=engine._key_owners_universe(anchored),
+        marker_census=_census(elsewhere=("0",)))
     assert any("has 0 anchor spans" in p for p in problems)
 
 
@@ -1215,9 +1258,20 @@ def _narrow_tab(text):
     return make_doc([text])
 
 
-def _one_para(text):
-    """Tab holding one paragraph, and the (start, end) of its text."""
-    return make_doc([text]), 1, 1 + len(text)
+def _one_para(engine, text):
+    """Tab with one paragraph, and the (start, end) of its text.
+
+    Indices are UTF-16 code units, like the real API — `make_doc` counts code
+    points, which is the same thing only while the text stays in the BMP.
+    """
+    end = 1 + engine._utf16_len(text)
+    tab = {"documentId": "doc1", "revisionId": "R0", "body": {"content": [
+        {"startIndex": 1, "endIndex": end + 1, "paragraph": {
+            "elements": [{"startIndex": 1, "endIndex": end + 1,
+                          "textRun": {"content": text + "\n",
+                                      "textStyle": {}}}],
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"}}}]}}
+    return tab, 1, end
 
 
 def test_narrowing_keeps_the_anchor_when_one_word_changes(engine):
@@ -1228,7 +1282,7 @@ def test_narrowing_keeps_the_anchor_when_one_word_changes(engine):
     The cut is the MINIMAL one that frees the anchor — not the whole common
     affix — so the core stays long enough to still be unique."""
     text = "Здесь слишком мало примеров"
-    tab, start, end = _one_para(text)
+    tab, start, end = _one_para(engine, text)
     a_start = start + len("Здесь ")
     anchors = [(a_start, a_start + len("слишком мало"), "слишком мало", "0")]
     new_text = "Здесь слишком мало образцов"
@@ -1247,7 +1301,7 @@ def test_narrowing_gives_up_when_the_anchor_is_inside_the_change(engine):
     can move past it without eating into the change itself. Nothing can save
     the thread, so narrowing returns nothing and the caller refuses."""
     text = "Начало мало конец"
-    tab, start, end = _one_para(text)
+    tab, start, end = _one_para(engine, text)
     a_start = start + len("Начало м")
     anchors = [(a_start, a_start + len("ал"), "ал", "0")]
     out = engine._narrow_replace(tab, text, "Начало много конец", start, end,
@@ -1272,7 +1326,7 @@ def test_narrowing_counts_headers_when_checking_uniqueness(engine):
     the body but repeated in a running header must not be used — otherwise
     the mismatch only surfaces after the write, as occurrencesChanged."""
     text = "Здесь слишком мало примеров"
-    tab, start, end = _one_para(text)
+    tab, start, end = _one_para(engine, text)
     tab["headers"] = {"h1": {"content": [
         {"startIndex": 1, "endIndex": 30, "paragraph": {"elements": [
             {"startIndex": 1, "endIndex": 30,
@@ -1282,6 +1336,83 @@ def test_narrowing_counts_headers_when_checking_uniqueness(engine):
     out = engine._narrow_replace(tab, text, "Здесь слишком мало образцов",
                                  start, end, anchors, [], {"0": "c1"})
     assert out is None
+
+
+def test_narrowing_survives_a_non_bmp_char_in_the_affix(engine):
+    """The cuts are counted in UTF-16 units and applied to a string of code
+    points. A 💡 in the common prefix is one code point and two units, so a
+    naive implementation puts start2 one unit short and the round-trip check
+    is the only thing between that and a wrong write."""
+    text = "💡 Здесь слишком мало примеров 💡"
+    tab, start, end = _one_para(engine, text)
+    a_start = start + 2 + len(" Здесь ")  # 💡 is 2 UTF-16 units
+    anchors = [(a_start, a_start + len("слишком мало"), "слишком мало", "0")]
+    out = engine._narrow_replace(
+        tab, text, "💡 Здесь слишком мало образцов 💡", start, end,
+        anchors, [], {"0": "c1"})
+    assert out is not None
+    core, repl, start2, end2 = out
+    # the range the engine will write must be exactly where the core sits
+    assert engine._find_quote_in_doctab(tab, core) == (start2, end2)
+    assert text.replace(core, repl) == "💡 Здесь слишком мало образцов 💡"
+
+
+def _two_run_para(bold_prefix, rest):
+    """One paragraph built from two runs with DIFFERENT styles."""
+    n1 = len(bold_prefix)
+    doc = {"documentId": "doc1", "revisionId": "R0", "body": {"content": [
+        {"startIndex": 1, "endIndex": 1 + n1 + len(rest) + 1, "paragraph": {
+            "elements": [
+                {"startIndex": 1, "endIndex": 1 + n1,
+                 "textRun": {"content": bold_prefix,
+                             "textStyle": {"bold": True}}},
+                {"startIndex": 1 + n1, "endIndex": 1 + n1 + len(rest) + 1,
+                 "textRun": {"content": rest + "\n", "textStyle": {}}},
+            ],
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"}}}]}}
+    return doc
+
+
+def test_mixed_style_in_the_untouched_part_no_longer_decides(engine,
+                                                             monkeypatch):
+    """The bold prefix carries the anchor and is NOT what changes. Checking
+    style over the whole original range refused the operation before
+    narrowing was ever tried; the check belongs on the range that will
+    actually be written."""
+    doc = _two_run_para("Жирный якорь", " и обычный хвост примеров")
+    docs = DocsStub(doc)
+    para = "Жирный якорь и обычный хвост примеров"
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        _docx_builder(docs, [(para, [("0", 0, 12)])],
+                      [("0", "A", CREATED_SEC)]))
+    monkeypatch.setattr(engine.time, "sleep", lambda s: None)
+    op = {"op": "replace_quote", "quote": para,
+          "with": "Жирный якорь и обычный хвост образцов"}
+    note = engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
+    assert note["applied_as"] == "narrowed"
+    req = next(r["replaceAllText"] for b in docs.batches for r in b
+               if "replaceAllText" in r)
+    assert req["containsText"]["text"].endswith("примеров")
+    assert "Жирный" not in req["containsText"]["text"]
+
+
+def test_noop_replace_writes_nothing(engine, monkeypatch):
+    """«Bravo» → «Bravo» changed nothing, so nothing may be written: the old
+    path deleted the text and inserted it back, with every gate that hangs
+    off a rewrite."""
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        _docx_builder(docs, [("Alpha", []), ("Bravo", [("0", 0, 5)]),
+                             ("Charlie", [])],
+                      [("0", "A", CREATED_SEC)]))
+    monkeypatch.setattr(engine.time, "sleep", lambda s: None)
+    op = {"op": "replace_quote", "quote": "Bravo", "with": "Bravo"}
+    note = engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
+    assert note["applied_as"] == "no-op"
+    assert docs.batches == []
 
 
 def test_replace_that_only_extends_is_applied_as_an_insert(engine, monkeypatch):
@@ -1372,6 +1503,30 @@ def test_insert_inside_a_suggestion_is_refused(engine, capsys):
     assert "внутрь предложенной правки" in err
 
 
+def test_a_replace_that_removes_nothing_is_judged_as_an_insert(engine):
+    """An op is judged by what it does, not by the word in its name: «Alpha»
+    → «Alpha дальше» removes nothing, so a suggestion in that same paragraph
+    is the only thing that can stop it — and here it is in the other one."""
+    tab = make_doc(["Alpha", "Bravo"])
+    tab["body"]["content"][0]["paragraph"]["elements"][0]["textRun"][
+        "suggestedInsertionIds"] = ["sug1"]
+    r = engine._resolve_op(
+        {"op": "replace_quote", "quote": "Bravo", "with": "Bravo дальше"},
+        tab, None)
+    assert engine._op_pure_insertion(
+        {"op": "replace_quote", "quote": "Bravo", "with": "Bravo дальше"},
+        tab, r) == ("after", " дальше")
+
+
+def test_a_replace_that_removes_text_is_not_an_insert(engine):
+    tab = make_doc(["Alpha", "Bravo"])
+    r = engine._resolve_op(
+        {"op": "replace_quote", "quote": "Bravo", "with": "Zulu"}, tab, None)
+    assert engine._op_pure_insertion(
+        {"op": "replace_quote", "quote": "Bravo", "with": "Zulu"},
+        tab, r) is None
+
+
 def test_replace_is_still_blocked_by_any_suggestion(engine, capsys):
     """Unchanged, and on purpose: the anchor map is built from a docx export
     whose behaviour with tracked changes is not measured."""
@@ -1384,6 +1539,43 @@ def test_replace_is_still_blocked_by_any_suggestion(engine, capsys):
 # ---------------------------------------------------------------------------
 # r8: one refused operation must not cost the person the other nine
 # ---------------------------------------------------------------------------
+
+def test_clean_doc_patch_does_not_rewrite_a_pure_insertion(engine, monkeypatch,
+                                                           tmp_path, capsys):
+    """No comments in the document, so the atomic index path runs. A replace
+    that only extends its target must still be emitted as an insert: turning
+    it into delete+insert removes text the caller never asked to remove, and
+    the suggestion gate was already told this op removes nothing."""
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    drive = DriveStub([], lambda: b"")
+    wire(engine, monkeypatch, docs, drive)
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "replace_quote", "quote": "Bravo", "with": "Bravo2"},
+    ]), encoding="utf-8")
+
+    engine.patch_doc("doc1", str(ops))
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "patched"
+    batch = docs.batches[0]
+    assert not any("deleteContentRange" in rq for rq in batch)
+    assert batch[0]["insertText"] == {"location": {"index": 12}, "text": "2"}
+
+
+def test_clean_doc_patch_skips_a_noop(engine, monkeypatch, tmp_path, capsys):
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    drive = DriveStub([], lambda: b"")
+    wire(engine, monkeypatch, docs, drive)
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "replace_quote", "quote": "Bravo", "with": "Bravo"},
+    ]), encoding="utf-8")
+
+    engine.patch_doc("doc1", str(ops))
+    assert docs.batches == []
+
 
 def test_patch_refuses_one_op_and_applies_the_rest(engine, monkeypatch,
                                                    tmp_path, capsys):
@@ -1534,6 +1726,58 @@ def test_sync_with_a_closed_thread_applies_and_archives_the_conversation(
     assert thread["id"] == "c2"
     assert thread["link"].endswith("?disco=c2")
     assert thread["replies"][0]["content"] == "и вот почему"
+
+
+def test_closed_thread_archive_accumulates(engine, tmp_path):
+    """A thread archived earlier may be gone from today's census — deleted,
+    or no longer anchored. A plain overwrite would destroy the only copy of
+    it that exists anywhere, which is not what an archive is."""
+    md = tmp_path / "doc.md"
+    md.write_text("x", encoding="utf-8")
+    first = api_comment("old", "A", CREATED, resolved=True)
+    engine._archive_closed_threads(str(md), "doc1", [first])
+    second = api_comment("new", "B", CREATED, resolved=True)
+    path = engine._archive_closed_threads(str(md), "doc1", [second])
+    with open(path, encoding="utf-8") as f:
+        archive = json.load(f)
+    assert {t["id"] for t in archive["threads"]} == {"old", "new"}
+
+
+def test_closed_thread_archive_refuses_to_clobber_an_unreadable_one(engine,
+                                                                    tmp_path):
+    md = tmp_path / "doc.md"
+    md.write_text("x", encoding="utf-8")
+    broken = tmp_path / "doc.md.skrepka-closed-threads.json"
+    broken.write_text("{ not json", encoding="utf-8")
+    with pytest.raises(RuntimeError) as exc:
+        engine._archive_closed_threads(
+            str(md), "doc1",
+            [api_comment("c2", "B", CREATED, resolved=True)])
+    assert "единственная копия" in str(exc.value)
+    assert broken.read_text(encoding="utf-8") == "{ not json"
+
+
+def test_sync_stops_when_the_conversation_cannot_be_saved(engine, monkeypatch,
+                                                          tmp_path, capsys):
+    """The archive is what makes the known cost of this edit acceptable.
+    Without it the sync could unhook a closed thread and leave no copy of
+    what was said — so it does not run."""
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED),
+         api_comment("c2", "B", "2026-07-13T17:55:00.000Z", resolved=True)],
+        _docx_builder(docs, ANCHORED_PARAS, ANCHORED_COMMENTS))
+    _, docs, _drive, md = _anchored_setup(engine, monkeypatch, tmp_path,
+                                          docs=docs, drive=drive)
+    monkeypatch.setattr(engine, "_archive_closed_threads",
+                        lambda *a, **kw: (_ for _ in ()).throw(
+                            OSError("read-only file system")))
+    with pytest.raises(SystemExit):
+        engine.sync_doc("doc1", md)
+    err = json.loads(capsys.readouterr().out)["error"]
+    assert "не удалось сохранить разговор закрытых тредов" in err
+    assert not docs.main_applied
 
 
 def test_insert_lost_response_but_applied_is_cleaned(engine, monkeypatch,
