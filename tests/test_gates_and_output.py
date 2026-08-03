@@ -428,6 +428,33 @@ def test_list_comments_asks_for_created_time_and_reply_ids(engine, monkeypatch,
     assert "comments(id,content,author/displayName,createdTime," in fields
 
 
+def test_list_comments_carries_a_link_to_each_thread(engine, monkeypatch,
+                                                     capsys):
+    """#20: naming a thread by id left the person to hunt for it by eye."""
+    class _Req:
+        def execute(self):
+            return {"comments": [{"id": "AAABc", "content": "x"}]}
+
+    class Drive:
+        def comments(self):
+            return self
+
+        def list(self, **kw):
+            return _Req()
+
+    monkeypatch.setattr(engine, "get_creds", lambda: object())
+    monkeypatch.setattr(engine, "get_drive_service", lambda c: Drive())
+    engine.list_comments("doc1")
+    out = json.loads(capsys.readouterr().out)
+    assert out[0]["link"] == (
+        "https://docs.google.com/document/d/doc1/edit?disco=AAABc")
+
+
+def test_thread_link_needs_both_ids(engine):
+    assert engine._thread_link("doc1", None) is None
+    assert engine._thread_link(None, "c1") is None
+
+
 # --- _write_control fail-closed hardening (codex delta review) ---
 
 def test_write_control_refuses_missing_revision(engine, capsys):

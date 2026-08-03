@@ -370,8 +370,7 @@ def test_accounting_resolved_absent_from_export_is_clean(engine):
     anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z",
                             resolved=True)]
     problems, metrics = engine._account_anchored_comments(
-        anchored, [], [], universe=engine._key_owners_universe(anchored),
-        skip_resolved=True)
+        anchored, [], [], universe=engine._key_owners_universe(anchored))
     assert problems == []
     assert metrics["api_anchored_resolved"] == 1
     assert metrics["api_anchored_live"] == 0
@@ -385,21 +384,22 @@ def test_accounting_resolved_alongside_live_thread(engine):
                 "date_sec": "2026-01-01T00:00:01Z"}]
     problems, metrics = engine._account_anchored_comments(
         anchored, records, _spans("0"),
-        universe=engine._key_owners_universe(anchored), skip_resolved=True)
+        universe=engine._key_owners_universe(anchored))
     assert problems == []
     assert metrics["api_anchored_live"] == 1
     assert metrics["api_anchored_resolved"] == 1
 
 
-def test_accounting_resolved_still_counted_without_the_flag(engine):
-    """The exclusion is opt-in, and only the replaceAllText path opts in.
-    Deletion-based callers (sync) keep counting resolved threads, because
-    deleteContentRange treats anchors differently and its effect on a hidden
-    resolved anchor was never measured — so they keep failing closed."""
+def test_accounting_excludes_resolved_on_every_path(engine):
+    """r8: the exclusion is unconditional, deletion paths included. A closed
+    thread is no longer a reason to refuse anything — the conversation is
+    over, and freezing the document costs the person more than the anchor.
+    Deletion paths warn and archive instead."""
     anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z", resolved=True)]
-    problems, _ = engine._account_anchored_comments(
+    problems, metrics = engine._account_anchored_comments(
         anchored, [], [], universe=engine._key_owners_universe(anchored))
-    assert any("missing from the export" in p for p in problems)
+    assert problems == []
+    assert metrics["api_anchored_resolved"] == 1
 
 
 def test_accounting_live_thread_still_blocks_when_missing(engine):
@@ -408,6 +408,91 @@ def test_accounting_live_thread_still_blocks_when_missing(engine):
     problems, _ = engine._account_anchored_comments(
         anchored, [], [], universe=engine._key_owners_universe(anchored))
     assert any("missing from the export" in p for p in problems)
+
+
+# ---------------------------------------------------------------------------
+# r8: an anchor that lives outside document.xml (a footnote, a header)
+# ---------------------------------------------------------------------------
+
+def _census(in_body=(), in_tables=(), elsewhere=()):
+    return {"in_body": frozenset(in_body), "in_tables": frozenset(in_tables),
+            "elsewhere": frozenset(elsewhere)}
+
+
+def test_record_with_no_marker_anywhere_is_an_anchor_outside_the_body(engine):
+    """The record proves the thread is in the export (a ghost is absent from
+    it entirely), and document.xml carries no marker for it — that is a
+    footnote or a header anchor. Nothing written into the body can reach it,
+    so it is not a problem. Before r8 one such comment froze every replace."""
+    anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z")]
+    records = [{"docx_id": "0", "author": "A",
+                "date_sec": "2026-01-01T00:00:01Z"}]
+    problems, metrics = engine._account_anchored_comments(
+        anchored, records, [], universe=engine._key_owners_universe(anchored),
+        marker_census=_census())
+    assert problems == []
+    assert metrics["anchors_outside_body"] == 1
+
+
+def test_record_whose_marker_is_in_the_document_still_needs_its_span(engine):
+    """Same shape, but the marker WAS seen in document.xml — then a missing
+    span means the parser could not place it, and that stays a refusal."""
+    anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z")]
+    records = [{"docx_id": "0", "author": "A",
+                "date_sec": "2026-01-01T00:00:01Z"}]
+    problems, _ = engine._account_anchored_comments(
+        anchored, records, [], universe=engine._key_owners_universe(anchored),
+        marker_census=_census(in_tables=("0",)))
+    assert any("has 0 anchor spans" in p for p in problems)
+
+
+def test_without_a_census_a_missing_span_is_still_a_refusal(engine):
+    """No census (older callers, tests): nothing is assumed, fail closed."""
+    anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z")]
+    records = [{"docx_id": "0", "author": "A",
+                "date_sec": "2026-01-01T00:00:01Z"}]
+    problems, _ = engine._account_anchored_comments(
+        anchored, records, [], universe=engine._key_owners_universe(anchored))
+    assert any("has 0 anchor spans" in p for p in problems)
+
+
+# ---------------------------------------------------------------------------
+# r8 / #20: which thread does an export record belong to
+# ---------------------------------------------------------------------------
+
+def test_attribution_names_the_thread_behind_each_record(engine):
+    anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z"),
+                api_comment("c2", "B", "2026-01-01T00:00:05Z")]
+    records = [{"docx_id": "0", "author": "A",
+                "date_sec": "2026-01-01T00:00:01Z"},
+               {"docx_id": "1", "author": "B",
+                "date_sec": "2026-01-01T00:00:05Z"}]
+    attribution = engine._attribute_records_to_threads(
+        anchored, records, engine._key_owners_universe(anchored))
+    assert attribution == {"0": "c1", "1": "c2"}
+
+
+def test_attribution_covers_every_anchor_of_a_multi_anchor_thread(engine):
+    """One thread on three fragments exports three records with the same
+    second — all three are its anchors."""
+    anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z")]
+    records = [{"docx_id": str(i), "author": "A",
+                "date_sec": "2026-01-01T00:00:01Z"} for i in range(3)]
+    attribution = engine._attribute_records_to_threads(
+        anchored, records, engine._key_owners_universe(anchored))
+    assert attribution == {"0": "c1", "1": "c1", "2": "c1"}
+
+
+def test_attribution_stays_silent_on_a_shared_key(engine):
+    """Two threads created in the same second by the same author: no witness,
+    nothing may be attributed — and the accounting refuses on them anyway."""
+    anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z"),
+                api_comment("c2", "A", "2026-01-01T00:00:01Z")]
+    records = [{"docx_id": "0", "author": "A",
+                "date_sec": "2026-01-01T00:00:01Z"}]
+    attribution = engine._attribute_records_to_threads(
+        anchored, records, engine._key_owners_universe(anchored))
+    assert attribution == {}
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +534,7 @@ def test_census_asks_for_the_fields_the_fingerprint_needs(engine):
     assert seen["includeDeleted"] is True
     # the reply sub-selection is asserted whole: checking for bare "deleted"
     # or "createdTime" would be satisfied by the parent comment's own fields
-    assert "replies(id,createdTime,author/displayName,deleted,action)" \
+    assert "replies(id,content,createdTime,author/displayName,deleted,action)" \
         in seen["fields"]
     for f in ("resolved", "quotedFileContent", "anchor"):
         assert f in seen["fields"]
@@ -507,7 +592,7 @@ def test_patch_blocks_when_only_a_reply_changes(engine, monkeypatch):
             _reply("r1", "B", "2026-07-14T00:00:05Z")])],
         switch_after_lists=1)  # list 1 = census+fp1, list 2 = fp2
     monkeypatch.setattr(engine.time, "sleep", lambda s: None)
-    op = {"op": "replace_quote", "quote": "Bravo", "with": "Bravo2"}
+    op = {"op": "replace_quote", "quote": "Bravo", "with": "Zulu"}
     with pytest.raises(engine.PatchOpError) as exc:
         engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
     assert exc.value.state == "not_applied"
@@ -760,7 +845,7 @@ def test_patch_refuses_only_the_paragraph_holding_the_odd_anchor(
                              ("Charlie", [("0", 0, 7)])],
                       [("0", "A", CREATED_SEC)]))
     monkeypatch.setattr(engine.time, "sleep", lambda s: None)
-    op = {"op": "replace_quote", "quote": "Bravo", "with": "Bravo2"}
+    op = {"op": "replace_quote", "quote": "Bravo", "with": "Zulu"}
     with pytest.raises(SystemExit):
         engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
     err = json.loads(capsys.readouterr().out)["error"]
@@ -781,7 +866,7 @@ def test_patch_still_applies_away_from_the_odd_anchor(engine, monkeypatch):
                              ("Charlie", [("0", 0, 7)])],
                       [("0", "A", CREATED_SEC)]))
     monkeypatch.setattr(engine.time, "sleep", lambda s: None)
-    op = {"op": "replace_quote", "quote": "Alpha", "with": "Alpha2"}
+    op = {"op": "replace_quote", "quote": "Alpha", "with": "Yankee"}
     engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
     main = next(b for b in docs.batches if any("replaceAllText" in r
                                                for r in b))
@@ -1032,7 +1117,7 @@ def test_patch_mixed_live_and_missing_refused(engine, monkeypatch, capsys):
         _docx_builder(docs, [("Charlie", [("0", 0, 7)])],
                       [("0", "A", CREATED_SEC)]))
     monkeypatch.setattr(engine.time, "sleep", lambda s: None)
-    op = {"op": "replace_quote", "quote": "Bravo", "with": "Bravo2"}
+    op = {"op": "replace_quote", "quote": "Bravo", "with": "Zulu"}
     with pytest.raises(SystemExit):
         engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
     err = json.loads(capsys.readouterr().out)["error"]
@@ -1050,7 +1135,7 @@ def test_patch_replace_applies_with_canary_first(engine, monkeypatch):
                              ("Charlie", [("0", 0, 7)])],
                       [("0", "A", CREATED_SEC)]))
     monkeypatch.setattr(engine.time, "sleep", lambda s: None)
-    op = {"op": "replace_quote", "quote": "Bravo", "with": "Bravo2"}
+    op = {"op": "replace_quote", "quote": "Bravo", "with": "Zulu"}
     engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
     main = next(b for b in docs.batches if any("replaceAllText" in r
                                                for r in b))
@@ -1068,12 +1153,268 @@ def test_patch_full_anchor_coverage_still_refused(engine, monkeypatch,
                              ("Charlie", [])],
                       [("0", "A", CREATED_SEC)]))
     monkeypatch.setattr(engine.time, "sleep", lambda s: None)
-    op = {"op": "replace_quote", "quote": "Bravo", "with": "Bravo2"}
+    op = {"op": "replace_quote", "quote": "Bravo", "with": "Zulu"}
     with pytest.raises(SystemExit):
         engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
     err = json.loads(capsys.readouterr().out)["error"]
-    assert "fully covers the anchor" in err
+    assert "накрывает целиком последний якорь" in err
+    # the refusal names the thread and links straight to it (#20)
+    assert "?disco=c1" in err
     assert docs.canary_text is None  # cleaned up
+
+
+# ---------------------------------------------------------------------------
+# r8: narrowing a replace instead of refusing it
+# ---------------------------------------------------------------------------
+
+def test_common_affixes_cannot_overlap(engine):
+    """«да, да, да» → «да, да»: prefix and suffix both want the same
+    characters. Uncapped they sum past the string and the core comes out with
+    negative length."""
+    p, s = engine._common_affixes("да, да, да", "да, да")
+    assert p + s <= len("да, да")
+
+
+def test_points_for_units_never_splits_a_surrogate_pair(engine):
+    """💡 is one code point and two UTF-16 units: a cut of one unit has to
+    take the whole character, not half of it."""
+    assert engine._points_for_units("💡x", 1) == 1
+    assert engine._points_for_units("💡x", 2) == 1
+    assert engine._points_for_units("💡x", 3) == 2
+
+
+def test_pure_insertion_detects_both_sides(engine):
+    assert engine._pure_insertion("фраза", "фраза и хвост") == (
+        "after", " и хвост")
+    assert engine._pure_insertion("фраза", "начало фраза") == (
+        "before", "начало ")
+    assert engine._pure_insertion("фраза", "другое") is None
+    assert engine._pure_insertion("фраза", "фра") is None
+
+
+def test_doomed_thread_needs_all_its_anchors_covered(engine):
+    """A thread on three fragments survives a replace covering two of them
+    (measured) — skrepka used to refuse on the first one."""
+    anchors = [(10, 20, "one", "0"), (30, 40, "two", "1"),
+               (50, 60, "three", "2")]
+    attribution = {"0": "c1", "1": "c1", "2": "c1"}
+    assert engine._doomed_threads(5, 45, anchors, attribution) == []
+    doomed = engine._doomed_threads(5, 65, anchors, attribution)
+    assert [cid for cid, _ in doomed] == ["c1"]
+
+
+def test_unattributed_anchor_keeps_the_strict_rule(engine):
+    """Nobody could say which thread this span belongs to, so «the last
+    anchor» is unknowable and any full coverage counts."""
+    anchors = [(10, 20, "one", "0")]
+    doomed = engine._doomed_threads(5, 25, anchors, {})
+    assert [cid for cid, _ in doomed] == [None]
+
+
+def _narrow_tab(text):
+    return make_doc([text])
+
+
+def _one_para(text):
+    """Tab holding one paragraph, and the (start, end) of its text."""
+    return make_doc([text]), 1, 1 + len(text)
+
+
+def test_narrowing_keeps_the_anchor_when_one_word_changes(engine):
+    """The typical edit: a commented sentence with one word replaced. The
+    naive replace covers the anchor whole; the narrowed one leaves the
+    anchor's first character alive, which is all the thread needs.
+
+    The cut is the MINIMAL one that frees the anchor — not the whole common
+    affix — so the core stays long enough to still be unique."""
+    text = "Здесь слишком мало примеров"
+    tab, start, end = _one_para(text)
+    a_start = start + len("Здесь ")
+    anchors = [(a_start, a_start + len("слишком мало"), "слишком мало", "0")]
+    new_text = "Здесь слишком мало образцов"
+    out = engine._narrow_replace(tab, text, new_text, start, end,
+                                 anchors, [], {"0": "c1"})
+    assert out is not None
+    core, repl, start2, end2 = out
+    # the applied operation still produces exactly the text that was asked for
+    assert text.replace(core, repl) == new_text
+    assert start2 > a_start  # the anchor's first character is out of range
+    assert engine._doomed_threads(start2, end2, anchors, {"0": "c1"}) == []
+
+
+def test_narrowing_gives_up_when_the_anchor_is_inside_the_change(engine):
+    """The anchor sits strictly inside the part that changes: neither border
+    can move past it without eating into the change itself. Nothing can save
+    the thread, so narrowing returns nothing and the caller refuses."""
+    text = "Начало мало конец"
+    tab, start, end = _one_para(text)
+    a_start = start + len("Начало м")
+    anchors = [(a_start, a_start + len("ал"), "ал", "0")]
+    out = engine._narrow_replace(tab, text, "Начало много конец", start, end,
+                                 anchors, [], {"0": "c1"})
+    assert out is None
+
+
+def test_narrowing_refuses_a_core_that_is_not_unique(engine):
+    """The narrowed core repeats elsewhere in the tab: replaceAllText would
+    rewrite both places, so this narrowing is unusable and we fall back to
+    the refusal instead of quietly changing two paragraphs."""
+    tab = make_doc(["Xмало примеров", "мало примеров"])
+    text, start, end = "Xмало примеров", 1, 15
+    anchors = [(start, start + 1, "X", "0")]
+    out = engine._narrow_replace(tab, text, "Xмало образцов", start, end,
+                                 anchors, [], {"0": "c1"})
+    assert out is None
+
+
+def test_narrowing_counts_headers_when_checking_uniqueness(engine):
+    """replaceAllText is not confined to the body. A core that is unique in
+    the body but repeated in a running header must not be used — otherwise
+    the mismatch only surfaces after the write, as occurrencesChanged."""
+    text = "Здесь слишком мало примеров"
+    tab, start, end = _one_para(text)
+    tab["headers"] = {"h1": {"content": [
+        {"startIndex": 1, "endIndex": 30, "paragraph": {"elements": [
+            {"startIndex": 1, "endIndex": 30,
+             "textRun": {"content": "лишком мало примеров\n"}}]}}]}}
+    a_start = start + len("Здесь ")
+    anchors = [(a_start, a_start + len("слишком мало"), "слишком мало", "0")]
+    out = engine._narrow_replace(tab, text, "Здесь слишком мало образцов",
+                                 start, end, anchors, [], {"0": "c1"})
+    assert out is None
+
+
+def test_replace_that_only_extends_is_applied_as_an_insert(engine, monkeypatch):
+    """«Bravo» → «Bravo2» removes no original character, so it cannot ghost
+    anything: no export, no canary, just an insert. It used to be refused as
+    full anchor coverage."""
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        _docx_builder(docs, [("Alpha", []), ("Bravo", [("0", 0, 5)]),
+                             ("Charlie", [])],
+                      [("0", "A", CREATED_SEC)]))
+    monkeypatch.setattr(engine.time, "sleep", lambda s: None)
+    op = {"op": "replace_quote", "quote": "Bravo", "with": "Bravo2"}
+    note = engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
+    assert note["applied_as"] == "insert"
+    assert not any("replaceAllText" in r for b in docs.batches for r in b)
+    inserts = [r["insertText"] for b in docs.batches for r in b
+               if "insertText" in r]
+    assert inserts == [{"location": {"index": 12}, "text": "2"}]
+
+
+def test_narrowed_replace_reaches_the_api_and_is_reported(engine, monkeypatch):
+    """End to end: the op covers the anchor, skrepka narrows it, the write
+    goes through and the receipt says the applied operation is not the one
+    that was asked for."""
+    doc = make_doc(["Alpha", "Здесь слишком мало примеров", "Charlie"])
+    docs = DocsStub(doc)
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        _docx_builder(docs, [("Alpha", []),
+                             ("Здесь слишком мало примеров",
+                              [("0", 6, 18)]),
+                             ("Charlie", [])],
+                      [("0", "A", CREATED_SEC)]))
+    monkeypatch.setattr(engine.time, "sleep", lambda s: None)
+    op = {"op": "replace_quote", "quote": "Здесь слишком мало примеров",
+          "with": "Здесь слишком мало образцов"}
+    note = engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
+    assert note["applied_as"] == "narrowed"
+    main = next(b for b in docs.batches if any("replaceAllText" in r
+                                               for r in b))
+    req = next(r["replaceAllText"] for r in main if "replaceAllText" in r)
+    # minimal cut: only what the anchor needs, so the core stays unique
+    assert req["containsText"]["text"] == "лишком мало примеров"
+    assert req["replaceText"] == "лишком мало образцов"
+
+
+# ---------------------------------------------------------------------------
+# r8: a pending suggestion stops blocking inserts elsewhere
+# ---------------------------------------------------------------------------
+
+def _tab_with_suggestion():
+    """Two paragraphs; the FIRST carries a suggested insertion."""
+    tab = make_doc(["Alpha", "Bravo"])
+    first = tab["body"]["content"][0]
+    first["paragraph"]["elements"][0]["textRun"]["suggestedInsertionIds"] = \
+        ["sug1"]
+    return tab
+
+
+def test_suggestion_intervals_cover_only_the_suggested_run(engine):
+    intervals = engine._suggestion_intervals(_tab_with_suggestion())
+    assert [(s, e) for s, e, _ in intervals] == [(1, 7)]
+
+
+def test_paragraph_level_suggestion_covers_the_paragraph(engine):
+    tab = make_doc(["Alpha", "Bravo"])
+    tab["body"]["content"][1]["paragraph"]["suggestedParagraphStyleChanges"] \
+        = {"sug1": {}}
+    intervals = engine._suggestion_intervals(tab)
+    assert [(s, e) for s, e, _ in intervals] == [(7, 13)]
+
+
+def test_insert_outside_a_suggestion_is_allowed(engine):
+    """The whole point of #19: a suggestion in the first paragraph used to
+    block an insert in the second, though an insert removes nothing."""
+    tab = _tab_with_suggestion()
+    engine._refuse_on_suggestion_at(tab, 10, "quote='Bravo'")  # no raise
+
+
+def test_insert_inside_a_suggestion_is_refused(engine, capsys):
+    tab = _tab_with_suggestion()
+    with pytest.raises(SystemExit):
+        engine._refuse_on_suggestion_at(tab, 3, "quote='Alpha'")
+    err = json.loads(capsys.readouterr().out)["error"]
+    assert "внутрь предложенной правки" in err
+
+
+def test_replace_is_still_blocked_by_any_suggestion(engine, capsys):
+    """Unchanged, and on purpose: the anchor map is built from a docx export
+    whose behaviour with tracked changes is not measured."""
+    with pytest.raises(SystemExit):
+        engine._refuse_on_suggestions(_tab_with_suggestion())
+    err = json.loads(capsys.readouterr().out)["error"]
+    assert "pending suggestions" in err
+
+
+# ---------------------------------------------------------------------------
+# r8: one refused operation must not cost the person the other nine
+# ---------------------------------------------------------------------------
+
+def test_patch_refuses_one_op_and_applies_the_rest(engine, monkeypatch,
+                                                   tmp_path, capsys):
+    """The anchor sits on «Bravo», so replacing Bravo whole is refused — but
+    Alpha and Charlie have nothing to do with it. Before r8 the loop broke on
+    the first refusal and the other operations never ran."""
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        _docx_builder(docs, [("Alpha", []), ("Bravo", [("0", 0, 5)]),
+                             ("Charlie", [])],
+                      [("0", "A", CREATED_SEC)]))
+    wire(engine, monkeypatch, docs, drive)
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "replace_quote", "quote": "Alpha", "with": "Yankee"},
+        {"op": "replace_quote", "quote": "Bravo", "with": "Zulu"},
+        {"op": "replace_quote", "quote": "Charlie", "with": "Xray"},
+    ]), encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc:
+        engine.patch_doc("doc1", str(ops))
+    assert exc.value.code == 3
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "partially-patched"
+    assert out["ops_applied"] == 2
+    assert [r["op"] for r in out["refused"]] == [1]
+    assert "накрывает целиком последний якорь" in out["refused"][0]["error"]
+    # nothing halted: no failed_at, the doc state is known throughout
+    assert "failed_at" not in out
 
 
 def test_replace_all_reply_found_by_type_not_position(engine):
@@ -1161,6 +1502,38 @@ def _anchored_setup(engine, monkeypatch, tmp_path, docs=None, drive=None):
     wire(engine, monkeypatch, docs, drive)
     md = make_workdir(engine, tmp_path, doc, BASE_MD, LOCAL_EDIT)
     return doc, docs, drive, md
+
+
+def test_sync_with_a_closed_thread_applies_and_archives_the_conversation(
+        engine, monkeypatch, tmp_path, capsys):
+    """r8: a closed thread stops blocking sync. Google hides it from the
+    export, so its anchor cannot be protected and the rewrite may unhook it —
+    the words are written out first and the receipt says so, instead of the
+    document being frozen forever."""
+    doc = make_doc(BASE_TEXTS)
+    merged = make_doc(["Alpha", "Bravo edited", "Charlie"], rev="R2")
+    docs = DocsStub(doc, merged_doc=merged)
+    closed = api_comment("c2", "B", "2026-07-13T17:55:00.000Z", resolved=True)
+    closed["replies"] = [{"id": "r1", "content": "и вот почему",
+                          "author": {"displayName": "B"},
+                          "createdTime": "2026-07-13T17:56:00.000Z"}]
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED), closed],
+        _docx_builder(docs, ANCHORED_PARAS, ANCHORED_COMMENTS),
+        html=b"<p>Alpha</p><p>Bravo edited</p><p>Charlie</p>")
+    wire(engine, monkeypatch, docs, drive)
+    md = make_workdir(engine, tmp_path, doc, BASE_MD, LOCAL_EDIT)
+    engine.sync_doc("doc1", md)
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "synced"
+    assert out["closed_threads"]["count"] == 1
+
+    with open(out["closed_threads"]["archive"], encoding="utf-8") as f:
+        archive = json.load(f)
+    thread = archive["threads"][0]
+    assert thread["id"] == "c2"
+    assert thread["link"].endswith("?disco=c2")
+    assert thread["replies"][0]["content"] == "и вот почему"
 
 
 def test_insert_lost_response_but_applied_is_cleaned(engine, monkeypatch,
@@ -1297,7 +1670,7 @@ def test_patch_fp2_change_with_failing_cleanup_raises(engine, monkeypatch,
         # so the second list IS fp2 and it sees a new comment
         switch_after_lists=1)
     monkeypatch.setattr(engine.time, "sleep", lambda s: None)
-    op = {"op": "replace_quote", "quote": "Bravo", "with": "Bravo2"}
+    op = {"op": "replace_quote", "quote": "Bravo", "with": "Zulu"}
     with pytest.raises(engine.PatchOpError) as exc:
         engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
     assert "осталась служебная строка" in str(exc.value)

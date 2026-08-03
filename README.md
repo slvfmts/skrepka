@@ -36,7 +36,7 @@ skrepka убирает это копирование. Вы оставляете 
 |---|---|
 | [docs/QUICKSTART.md](https://github.com/slvfmts/skrepka/blob/main/docs/QUICKSTART.md) | Настройка доступа к Google по шагам |
 | [docs/PLUGIN.md](https://github.com/slvfmts/skrepka/blob/main/docs/PLUGIN.md) | Навыки для Claude Code и Codex |
-| [docs/LIMITATIONS.md](https://github.com/slvfmts/skrepka/blob/main/docs/LIMITATIONS.md) | Что 0.9 не делает |
+| [docs/LIMITATIONS.md](https://github.com/slvfmts/skrepka/blob/main/docs/LIMITATIONS.md) | Что skrepka не делает |
 | [PRIVACY.md](https://github.com/slvfmts/skrepka/blob/main/PRIVACY.md) | Какие данные и куда идут |
 | [SECURITY.md](https://github.com/slvfmts/skrepka/blob/main/SECURITY.md) | Модель угроз и как сообщить об уязвимости |
 
