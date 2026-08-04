@@ -3120,14 +3120,14 @@ def patch_doc(file_id, ops_path, tab_id=None):
                 "an anchored comment appeared while preparing the patch; "
                 "re-run — the doc now requires the anchor-safe strategy"
             )
-        by_source = {id(r): ins for r, ins in zip(resolved, insertions)}
-        noop_ids = {id(r) for r, noop in zip(resolved, noops) if noop}
-        ordered = sorted(resolved, key=lambda r: r["affect_start"], reverse=True)
+        ordered = sorted(range(len(resolved)),
+                         key=lambda i: resolved[i]["affect_start"],
+                         reverse=True)
         requests = []
-        for r in ordered:
-            if id(r) in noop_ids:
+        for i in ordered:
+            r, ins = resolved[i], insertions[i]
+            if noops[i]:
                 continue
-            ins = by_source.get(id(r))
             if ins:
                 # A replace that only extends its target: emit the insert
                 # alone. Rewriting it as delete+insert would remove text that
