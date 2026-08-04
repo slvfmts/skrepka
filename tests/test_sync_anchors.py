@@ -1563,6 +1563,45 @@ def test_clean_doc_patch_does_not_rewrite_a_pure_insertion(engine, monkeypatch,
     assert batch[0]["insertText"] == {"location": {"index": 12}, "text": "2"}
 
 
+def test_op_classification_follows_the_same_target_as_resolution(engine):
+    """An op carrying BOTH `range` and `quote` is accepted, and `_resolve_op`
+    targets the range. Reading the quote instead would classify the op
+    against text it does not touch — and a no-op decided on the wrong text
+    writes nothing where a replace was due."""
+    doc = make_doc(BASE_TEXTS, named_ranges={
+        "mark1": {"namedRanges": [{"ranges": [
+            {"startIndex": 7, "endIndex": 12}]}]}})
+    op = {"op": "replace_range", "range": "mark1", "quote": "Charlie",
+          "text": "Charlie"}
+    r = engine._resolve_op(op, doc, None)
+    assert (r["start"], r["end"]) == (7, 12)  # the range, not the quote
+    # the range holds "Bravo", the new text is "Charlie" — not a no-op
+    assert engine._op_is_noop(op, doc, r) is False
+    assert engine._op_pure_insertion(op, doc, r) is None
+
+
+def test_a_noop_does_not_veto_a_compatible_neighbour(engine, monkeypatch,
+                                                     tmp_path, capsys):
+    """A no-op writes nothing, so it occupies nothing. It used to hold its
+    range through the overlap check and reject the insert next to it."""
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    drive = DriveStub([], lambda: b"")
+    wire(engine, monkeypatch, docs, drive)
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "replace_quote", "quote": "Bravo", "with": "Bravo"},
+        {"op": "insert_after_quote", "quote": "Bravo", "text": " хвост"},
+    ]), encoding="utf-8")
+
+    engine.patch_doc("doc1", str(ops))
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "patched"
+    inserts = [rq["insertText"] for b in docs.batches for rq in b
+               if "insertText" in rq]
+    assert inserts == [{"location": {"index": 12}, "text": " хвост"}]
+
+
 def test_clean_doc_patch_skips_a_noop(engine, monkeypatch, tmp_path, capsys):
     doc = make_doc(BASE_TEXTS)
     docs = DocsStub(doc)

@@ -2576,12 +2576,21 @@ def _pure_insertion(search_text, new_text):
 
 
 def _op_current_text(op, doc_tab, r):
-    """The text a replace op currently occupies, or None if it is not one."""
+    """The text a replace op currently occupies, or None if it is not one.
+
+    Precedence mirrors `_resolve_op` exactly — `range` first, `quote` second.
+    An op carrying BOTH is accepted there and targets the named range; reading
+    the quote instead would classify it against text the op does not touch,
+    and a no-op or a pure insertion decided on the wrong text writes the wrong
+    thing (found in review).
+    """
     if r["kind"] != "replace":
         return None
+    if "range" in op:
+        return _extract_exact_text_range(doc_tab, r["start"], r["end"])
     if "quote" in op:
         return op["quote"]
-    return _extract_exact_text_range(doc_tab, r["start"], r["end"])
+    return None
 
 
 def _op_pure_insertion(op, doc_tab, r):
@@ -3085,17 +3094,21 @@ def patch_doc(file_id, ops_path, tab_id=None):
     tid, doc_tab = _select_tab(doc, tab_id=tab_id)
 
     # Resolve every op against the current snapshot (validates targets early
-    # for both paths) and reject ambiguous batches.
+    # for both paths) and classify what each one actually does.
     resolved = [_resolve_op(op, doc_tab, tid) for op in ops]
-    _check_ops_overlap(resolved)
+    insertions = [_op_pure_insertion(op, doc_tab, r)
+                  for op, r in zip(ops, resolved)]
+    noops = [_op_is_noop(op, doc_tab, r) for op, r in zip(ops, resolved)]
+
+    # Ambiguous batches are rejected — but an op that writes nothing occupies
+    # nothing, and used to veto a perfectly compatible neighbour purely by
+    # holding a range (found in review).
+    _check_ops_overlap([r for r, noop in zip(resolved, noops) if not noop])
 
     # Suggestions block replaces document-wide (the anchor map comes from an
     # export whose behaviour with tracked changes is unmeasured), but they
     # only block an insert that lands inside one (r8). A replace that removes
     # nothing counts as an insert here — it is one.
-    insertions = [_op_pure_insertion(op, doc_tab, r)
-                  for op, r in zip(ops, resolved)]
-    noops = [_op_is_noop(op, doc_tab, r) for op, r in zip(ops, resolved)]
     if any(r["kind"] == "replace" and ins is None and not noop
            for r, ins, noop in zip(resolved, insertions, noops)):
         _refuse_on_suggestions(doc_tab)
