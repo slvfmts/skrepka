@@ -265,6 +265,28 @@ def get_docs_service(creds):
     return build("docs", "v1", credentials=creds)
 
 
+def _plain_text(content):
+    """Concatenate the text of a content list, ignoring indices entirely.
+
+    Headers, footers and footnotes are a SEPARATE index space, and the API
+    omits `startIndex` on their first element — so the indexed walker below
+    raises on them (measured on a live document 2026-08-05). Anything that
+    only needs the words, not the coordinates, uses this.
+    """
+    out = []
+    for element in content:
+        if "paragraph" in element:
+            for elem in element["paragraph"].get("elements", []):
+                tr = elem.get("textRun")
+                if tr:
+                    out.append(tr.get("content", ""))
+        elif "table" in element:
+            for row in element["table"].get("tableRows", []):
+                for cell in row.get("tableCells", []):
+                    out.append(_plain_text(cell.get("content", [])))
+    return "".join(out)
+
+
 def _extract_text_runs(content):
     """Walk document content and yield (start_index, end_index, text) for each text run."""
     for element in content:
@@ -656,9 +678,7 @@ def _count_text_outside_body(doc_tab, text):
         for container in (doc_tab.get(key) or {}).values():
             if not isinstance(container, dict):
                 continue
-            parts = [t for _s, _e, t in
-                     _extract_text_runs(container.get("content", []))]
-            total += "".join(parts).count(text)
+            total += _plain_text(container.get("content", [])).count(text)
     return total
 
 
@@ -1999,7 +2019,9 @@ def _scope_anchor_problems(problems, anchors, attribution=None, file_id=None):
             link = _thread_link(file_id, cid)
             who = f"треда {cid} {link}" if link else f"docx id {i}"
             blocked.append((s, e, (
-                f"an unaccounted comment anchor ({who}, «{t[:40]}») — {p}")))
+                f"an unaccounted comment anchor ({who}, «{t[:40]}») — {p}. "
+                f"Разберитесь с этим тредом в UI (удалить или переоткрыть) "
+                f"или правьте этот фрагмент в интерфейсе")))
     return global_problems, blocked
 
 
@@ -2054,7 +2076,9 @@ def _fence_off_tables(global_problems, doc_tab):
             remaining.append(p)
             continue
         for s, e, label in tables:
-            blocked.append((s, e, f"{label} ({p})"))
+            blocked.append((s, e, (
+                f"{label} ({p}). Правьте этот фрагмент в интерфейсе Google "
+                f"Docs — комментарий там не пострадает")))
     return remaining, blocked
 
 
@@ -2404,23 +2428,21 @@ def _comments_fingerprint(drive_service, file_id):
 
 
 def _refuse_on_suggestions(doc_tab):
-    """Any pending suggestion in the TARGET tab blocks a REPLACE (scoped per
-    codex code review #9 — a suggestion in a sibling tab does not block edits
-    to this one).
+    """Any pending suggestion in the TARGET tab blocks the operation.
 
-    Still document-wide, and honestly so: what the docx export does with a
-    pending suggestion is not measured, and the anchor map is built from that
-    export. Positional accounting for suggestions would rest on nothing. What
-    r8 did remove is the part that never needed the export — see
-    `_suggestion_intervals`.
+    Kept for `sync`, which rewrites whole paragraphs through
+    deleteContentRange and reconciles the document against a local file — a
+    pending suggestion shifts that comparison in ways this round did not
+    measure. `patch` judges suggestions by position instead; see
+    `_refuse_on_suggestion_range`.
     """
     marker = _scan_suggestions(doc_tab)
     if marker:
         _error(
             f"target tab has pending suggestions ({marker}); accept/reject "
-            f"them in the Google Docs UI first — replaces are blocked while "
+            f"them in the Google Docs UI first — sync is blocked while "
             f"suggestions exist (fail-closed policy, see FINDINGS.md). "
-            f"Вставки при этом работают: они ничего не удаляют."
+            f"Точечные правки через patch при этом работают."
         )
 
 
@@ -2471,6 +2493,29 @@ def _refuse_on_suggestion_at(doc_tab, index, source):
                 f"вставка попадает внутрь предложенной правки ({label}, "
                 f"диапазон [{s}, {e})) — примите или отклоните её в интерфейсе "
                 f"Google Docs. Остальной документ правится. ({source})")
+
+
+def _refuse_on_suggestion_range(doc_tab, start, end, source):
+    """A replace is refused only when its range meets a pending suggestion.
+
+    The document-wide refusal was a proxy for "the export might be
+    untrustworthy on a document with tracked changes". Measured on a live
+    document (2026-08-05): the export carries a pending suggestion as a real
+    `w:ins`, paragraph texts match the API snapshot exactly, and the whole
+    anchor pipeline — parse, account, map — comes out clean. So trust is now
+    established directly, per document, by machinery that already fails
+    closed: an anchor sharing a paragraph with tracked changes makes that
+    paragraph unparseable and refuses on its own.
+
+    What is still not measured is what `replaceAllText` does to a match that
+    OVERLAPS suggested text. That is exactly what this refuses.
+    """
+    for s, e, label in _suggestion_intervals(doc_tab):
+        if _ranges_overlap(start, end, s, e):
+            _error(
+                f"замена задевает предложенную правку ({label}, диапазон "
+                f"[{s}, {e})) — примите или отклоните её в интерфейсе Google "
+                f"Docs. Остальной документ правится. ({source})")
 
 
 def _informational_replies(drive_service, file_id, doc_tab, resolved, comments):
@@ -2896,7 +2941,8 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
             return {"source": r["source"], "applied_as": "insert",
                     "note": "замена ничего не удаляла — применена как вставка"}
 
-        _refuse_on_suggestions(doc_tab)
+        _refuse_on_suggestion_range(doc_tab, r["start"], r["end"],
+                                    r["source"])
         search_text = _resolve_replace_target(op, doc_tab, r,
                                               check_style=False)
         body_content = (doc_tab.get("body", {}) or {}).get("content", [])
@@ -2951,11 +2997,9 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
             bs, be, label = hits[0]
             cleaned = _cleanup_canary(docs_service, file_id, canary)
             _error(_canary_msg(
-                f"this replace overlaps {label} (range [{bs}, {be})) — "
-                f"refusing THIS operation; the rest of the document is "
-                f"still editable. Разрулите этот тред в UI (удалить/"
-                f"переоткрыть) или правьте этот фрагмент в UI. "
-                f"({r['source']})", cleaned))
+                f"эта замена задевает {label} (диапазон [{bs}, {be})) — "
+                f"отклонена ИМЕННО ЭТА операция, остальной документ "
+                f"правится. ({r['source']})", cleaned))
         if doomed:
             cid, spans = doomed[0]
             atext = spans[0][2]
@@ -3105,13 +3149,9 @@ def patch_doc(file_id, ops_path, tab_id=None):
     # holding a range (found in review).
     _check_ops_overlap([r for r, noop in zip(resolved, noops) if not noop])
 
-    # Suggestions block replaces document-wide (the anchor map comes from an
-    # export whose behaviour with tracked changes is unmeasured), but they
-    # only block an insert that lands inside one (r8). A replace that removes
-    # nothing counts as an insert here — it is one.
-    if any(r["kind"] == "replace" and ins is None and not noop
-           for r, ins, noop in zip(resolved, insertions, noops)):
-        _refuse_on_suggestions(doc_tab)
+    # Suggestions are judged by position, not by their existence anywhere in
+    # the tab (r8, after the export was measured). An op that removes nothing
+    # is checked as a point; a replace is checked as a range.
     for r, ins, noop in zip(resolved, insertions, noops):
         if noop:
             continue  # writes nothing at all
@@ -3120,6 +3160,9 @@ def patch_doc(file_id, ops_path, tab_id=None):
             if ins and ins[0] == "after":
                 point = r["end"]
             _refuse_on_suggestion_at(doc_tab, point, r["source"])
+        else:
+            _refuse_on_suggestion_range(doc_tab, r["start"], r["end"],
+                                        r["source"])
 
     all_comments, anchored, _, _ = _census_comments(drive_service, file_id)
 

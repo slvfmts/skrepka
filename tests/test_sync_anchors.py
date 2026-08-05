@@ -892,7 +892,7 @@ def test_patch_refuses_only_the_paragraph_holding_the_odd_anchor(
     with pytest.raises(SystemExit):
         engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
     err = json.loads(capsys.readouterr().out)["error"]
-    assert "refusing THIS operation" in err
+    assert "отклонена ИМЕННО ЭТА операция" in err
     assert "docx id 9" in err
     assert _no_content_mutation(docs)
     assert docs.canary_text is None
@@ -1327,10 +1327,13 @@ def test_narrowing_counts_headers_when_checking_uniqueness(engine):
     the mismatch only surfaces after the write, as occurrencesChanged."""
     text = "Здесь слишком мало примеров"
     tab, start, end = _one_para(engine, text)
+    # NO startIndex anywhere: that is how the API really returns a header —
+    # a separate index space, and the first element carries no index at all
+    # (measured on a live document 2026-08-05, where the indexed walker
+    # raised KeyError and took the whole replace down with it)
     tab["headers"] = {"h1": {"content": [
-        {"startIndex": 1, "endIndex": 30, "paragraph": {"elements": [
-            {"startIndex": 1, "endIndex": 30,
-             "textRun": {"content": "лишком мало примеров\n"}}]}}]}}
+        {"paragraph": {"elements": [
+            {"textRun": {"content": "лишком мало примеров\n"}}]}}]}}
     a_start = start + len("Здесь ")
     anchors = [(a_start, a_start + len("слишком мало"), "слишком мало", "0")]
     out = engine._narrow_replace(tab, text, "Здесь слишком мало образцов",
@@ -1527,9 +1530,28 @@ def test_a_replace_that_removes_text_is_not_an_insert(engine):
         tab, r) is None
 
 
-def test_replace_is_still_blocked_by_any_suggestion(engine, capsys):
-    """Unchanged, and on purpose: the anchor map is built from a docx export
-    whose behaviour with tracked changes is not measured."""
+def test_replace_away_from_a_suggestion_is_allowed(engine):
+    """Measured 2026-08-05: the export carries a pending suggestion as a real
+    tracked change, paragraph texts still match the API snapshot, and the
+    anchor pipeline comes out clean. So a suggestion three paragraphs away is
+    no longer a reason to refuse a replace."""
+    tab = _tab_with_suggestion()
+    engine._refuse_on_suggestion_range(tab, 8, 12, "quote='Bravo'")
+
+
+def test_replace_touching_a_suggestion_is_refused(engine, capsys):
+    """What replaceAllText does to a match overlapping suggested text is NOT
+    measured — that is what stays refused."""
+    tab = _tab_with_suggestion()
+    with pytest.raises(SystemExit):
+        engine._refuse_on_suggestion_range(tab, 3, 9, "quote='Alpha'")
+    err = json.loads(capsys.readouterr().out)["error"]
+    assert "задевает предложенную правку" in err
+
+
+def test_sync_is_still_blocked_by_any_suggestion(engine, capsys):
+    """sync reconciles the whole document against a local file, and what a
+    pending suggestion does to that comparison was not measured."""
     with pytest.raises(SystemExit):
         engine._refuse_on_suggestions(_tab_with_suggestion())
     err = json.loads(capsys.readouterr().out)["error"]
