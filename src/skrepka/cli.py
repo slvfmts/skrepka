@@ -29,16 +29,20 @@ Comments & edits:
   reply        Post a reply to a comment
   resolve      Resolve a comment thread (the person's decision, not an agent's)
   comment      Create a document-level comment
-  patch        Apply anchor-safe text edits (keeps comment anchors alive)
+  patch        Apply anchor-safe text edits (keeps comment threads alive —
+               start here when a doc has comments)
   mark         Create a named range around a text fragment
   suggestions  List suggestions on a doc
 
 Documents:
   upload       Create a Google Doc from a .md file
   download     Export a Google Doc as markdown
-  update       Update an existing Google Doc
+  update       Replace a doc's whole content — DESTROYS every comment thread
   upload-file  Upload file(s) as-is (no Google Doc conversion)
-  sync         Three-way merge a local .md into a doc (experimental)
+  sync         Three-way merge a local .md into a doc, keeping OPEN comment
+               threads (experimental; refuses when the edit rewrites
+               commented text; a closed thread can be unhooked — its words
+               are archived next to the .md first)
 
 Data & privacy:
   logout       Remove the local token (keeps your OAuth client)

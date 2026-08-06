@@ -917,6 +917,99 @@ def test_patch_still_applies_away_from_the_odd_anchor(engine, monkeypatch):
     assert "replaceAllText" in main[1]
 
 
+def _dup_paragraph_doc(docs=None):
+    """A document whose commented paragraph appears twice, byte for byte —
+    the live shape of #26. The second copy carries no comment."""
+    return [("Alpha", []), ("Bravo", [("0", 0, 5)]), ("Charlie", []),
+            ("Bravo", [])]
+
+
+def test_patch_survives_two_identical_paragraphs(engine, monkeypatch):
+    """#26: the anchor matches two paragraphs, so it cannot be placed — and
+    that used to disable replaces and deletes in the WHOLE document. An op
+    away from the copies goes through."""
+    doc = make_doc(["Alpha", "Bravo", "Charlie", "Bravo"])
+    docs = DocsStub(doc)
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        _docx_builder(docs, _dup_paragraph_doc(), [("0", "A", CREATED_SEC)]))
+    monkeypatch.setattr(engine.time, "sleep", lambda s: None)
+    op = {"op": "replace_quote", "quote": "Alpha", "with": "Yankee"}
+    engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
+    main = next(b for b in docs.batches if any("replaceAllText" in r
+                                               for r in b))
+    assert "replaceAllText" in main[1]
+
+
+def test_patch_refuses_an_op_reaching_into_a_copy(engine, monkeypatch, capsys):
+    """The other half: an operation whose range touches either copy is
+    refused, and the refusal names the thread instead of the export row.
+
+    The op here also covers a healthy anchor completely, so BOTH refusal
+    sources are live at once. The fence has to win: the rewrite path of #21
+    could otherwise delete text next to an anchor it cannot see, because an
+    ambiguous anchor is absent from `anchors` by construction."""
+    doc = make_doc(["Alpha", "Bravo", "Charlie", "Bravo"])
+    docs = DocsStub(doc)
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED),
+         api_comment("c2", "B", "2026-07-13T18:10:00.000Z")],
+        _docx_builder(docs,
+                      [("Alpha", []), ("Bravo", [("0", 0, 5)]),
+                       ("Charlie", [("1", 0, 7)]), ("Bravo", [])],
+                      [("0", "A", CREATED_SEC),
+                       ("1", "B", "2026-07-13T18:10:00Z")]))
+    monkeypatch.setattr(engine.time, "sleep", lambda s: None)
+    # a quote across the paragraph boundary IS unique, so the uniqueness check
+    # lets it through and the fence is what stops it
+    op = {"op": "replace_quote", "quote": "Bravo\nCharlie", "with": "Zulu"}
+    with pytest.raises(SystemExit):
+        engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
+    err = json.loads(capsys.readouterr().out)["error"]
+    assert "одинаковых копий" in err
+    assert "отклонена ИМЕННО ЭТА операция" in err
+    assert _no_content_mutation(docs)
+
+
+def test_a_quote_op_on_a_copy_is_stopped_by_uniqueness(engine, monkeypatch,
+                                                       capsys):
+    """Recorded on purpose: editing a duplicated paragraph by quote never
+    reaches the fence — the quote must resolve to ONE place, and any substring
+    of a duplicated paragraph resolves to two. The tail of #26 consists of
+    weakening exactly this rule, so whoever weakens it removes a guard that is
+    doing real work here."""
+    doc = make_doc(["Alpha", "Bravo", "Charlie", "Bravo"])
+    docs = DocsStub(doc)
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        _docx_builder(docs, _dup_paragraph_doc(), [("0", "A", CREATED_SEC)]))
+    monkeypatch.setattr(engine.time, "sleep", lambda s: None)
+    op = {"op": "replace_quote", "quote": "Bravo", "with": "Zulu"}
+    with pytest.raises(SystemExit):
+        engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
+    err = json.loads(capsys.readouterr().out)["error"]
+    assert "non-unique (2 matches)" in err
+    # and the way out it offers must be one that works on a commented doc:
+    # `occurrence` targeting is refused there, so pointing at it would be a
+    # dead end (#24 — a refusal has to name a path that exists)
+    assert "occurrence" not in err or "comment" in err
+    assert _no_content_mutation(docs)
+
+
+def test_a_fenced_range_stops_a_sync_delete(engine):
+    """The sync path protects through the same list (`protected` absorbs
+    `snap["blocked"]`), so a fence built for an ambiguous anchor stops the
+    positional rewrite that would ghost it."""
+    fence = engine._fence_off_ambiguous([{
+        "docx_id": "0", "para_text": "Bravo", "start_off": 0, "end_off": 5,
+        "candidates": [(7, 13), (21, 27)],
+    }])[0]
+    flat = [{"deleteContentRange": {"range": {"startIndex": 7,
+                                              "endIndex": 13}}}]
+    overlap = engine._find_protected_overlap(flat, fence)
+    assert overlap and "одинаковых копий" in overlap
+
+
 # ---------------------------------------------------------------------------
 # units: named ranges + overlap
 # ---------------------------------------------------------------------------
@@ -2461,3 +2554,81 @@ def test_odd_final_batch_response_recovers_positionally(engine, monkeypatch,
     assert out["action"] == "synced"
     assert out["recovered_after_lost_response"] is True
     assert out["styled_blocks"] == 0
+
+
+def _make_doc_styled(specs, rev="R0"):
+    """Like make_doc, but each paragraph carries its own named style — so a
+    heading and a body paragraph can hold the SAME text."""
+    content, idx = [], 1
+    for text, style in specs:
+        s, e = idx, idx + len(text) + 1
+        content.append({"startIndex": s, "endIndex": e, "paragraph": {
+            "elements": [{"startIndex": s, "endIndex": e,
+                          "textRun": {"content": text + "\n",
+                                      "textStyle": {}}}],
+            "paragraphStyle": {"namedStyleType": style},
+        }})
+        idx = e
+    return {"documentId": "doc1", "revisionId": rev,
+            "body": {"content": content}}
+
+
+def test_sync_refuses_to_rewrite_a_twin_of_an_anchored_paragraph(
+        engine, monkeypatch, tmp_path, capsys):
+    """The end-to-end half of #26 on the sync path. A heading and a paragraph
+    can carry the same text: for sync's own alignment they are different
+    (the type is part of the key), but the anchor map sees one text twice and
+    cannot tell which copy the comment is on. The fence covers both, so the
+    positional rewrite — `deleteContentRange`, the operation that ghosts an
+    anchor — is refused before any write."""
+    doc = _make_doc_styled([("Bravo", "HEADING_1"), ("Bravo", "NORMAL_TEXT"),
+                            ("Charlie", "NORMAL_TEXT")])
+    docs = DocsStub(doc)
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        # the anchor is on the BODY copy; the local edit below touches the
+        # heading, and skrepka must still refuse — it cannot know which is which
+        _docx_builder(docs, [("Bravo", []), ("Bravo", [("0", 0, 5)]),
+                             ("Charlie", [])],
+                      [("0", "A", CREATED_SEC)]),
+        html=b"<h1>Bravo</h1><p>Bravo</p><p>Charlie</p>")
+    wire(engine, monkeypatch, docs, drive)
+    md = make_workdir(engine, tmp_path, doc,
+                      "# Bravo\n\nBravo\n\nCharlie",
+                      "# Bravo edited\n\nBravo\n\nCharlie")
+    with pytest.raises(SystemExit):
+        engine.sync_doc("doc1", md)
+    err = json.loads(capsys.readouterr().out)["error"]
+    assert "одинаковых копий" in err
+    assert _no_content_mutation(docs)
+
+
+def test_sync_applies_away_from_the_copies_and_counts_them_honestly(
+        engine, monkeypatch, tmp_path, capsys):
+    """The payoff of #26 on the sync path: a document whose commented
+    paragraph has a twin used to be frozen whole. Now the twins are fenced and
+    everything else merges. The receipt counts ambiguous ANCHORS, not fenced
+    intervals — one anchor with two candidates is one anchor skrepka could not
+    place, and reporting two would send the person hunting for a comment that
+    does not exist."""
+    doc = _make_doc_styled([("Bravo", "HEADING_1"), ("Bravo", "NORMAL_TEXT"),
+                            ("Charlie", "NORMAL_TEXT")])
+    merged = _make_doc_styled([("Bravo", "HEADING_1"), ("Bravo", "NORMAL_TEXT"),
+                               ("Charlie edited", "NORMAL_TEXT")], rev="R2")
+    docs = DocsStub(doc, merged_doc=merged)
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        _docx_builder(docs, [("Bravo", []), ("Bravo", [("0", 0, 5)]),
+                             ("Charlie", [])],
+                      [("0", "A", CREATED_SEC)]),
+        html=b"<h1>Bravo</h1><p>Bravo</p><p>Charlie edited</p>")
+    wire(engine, monkeypatch, docs, drive)
+    md = make_workdir(engine, tmp_path, doc,
+                      "# Bravo\n\nBravo\n\nCharlie",
+                      "# Bravo\n\nBravo\n\nCharlie edited")
+    engine.sync_doc("doc1", md)
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "synced"
+    accounting = out["anchor_accounting"]
+    assert accounting["ambiguous_anchors"] == 1
+    assert accounting["blocked_anchors"] == 2  # both copies fenced

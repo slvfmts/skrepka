@@ -62,3 +62,15 @@ def test_version_with_extra_token_does_not_silently_succeed(monkeypatch):
     # same rule as `help patch`: an unknown trailing token must fail loudly
     code = _run(["--version", "extra"], monkeypatch)
     assert code != 0
+
+
+def test_overview_names_the_cost_of_update_and_the_path_that_keeps_threads():
+    """The curated overview is the first thing an agent reads, and for a while
+    it described `update` as neutrally as `upload`. An agent that learns the
+    destructive path before the safe one will reach for it under pressure
+    (#24) — the live incident cost 18 threads."""
+    lines = {ln.split()[0]: ln for ln in cli._TOP_HELP.splitlines()
+             if ln.startswith("  ") and ln.strip()}
+    assert "DESTROYS" in lines["update"]
+    assert "keeps comment threads alive" in lines["patch"]
+    assert "keeping OPEN comment" in lines["sync"]

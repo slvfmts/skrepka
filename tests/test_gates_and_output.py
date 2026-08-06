@@ -467,3 +467,44 @@ def test_write_control_refuses_missing_revision(engine, capsys):
 
 def test_write_control_pins_revision(engine):
     assert engine._write_control("rev7") == {"requiredRevisionId": "rev7"}
+
+
+def test_update_help_names_the_path_that_keeps_threads(engine, monkeypatch,
+                                                       capsys):
+    """The live incident of #24: an agent read `--help`, saw the flag, asked
+    the person honestly, got a yes — and destroyed 18 threads. The refusal we
+    wrote so carefully never reached it. Help is the only channel that does,
+    so it has to name the alternative, not just the price."""
+    monkeypatch.setattr(sys, "argv", ["skrepka", "update", "--help"])
+    with pytest.raises(SystemExit) as ei:
+        engine.main()
+    assert ei.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "`patch` applies edits and keeps the threads alive" in help_text
+    assert "closed threads" in help_text          # the honest caveat
+    assert "download" in help_text and "sync" in help_text
+    assert "sidecar must stay next to it" in help_text
+    assert "not a reason to use this flag" in help_text
+
+
+def test_destructive_refusal_names_both_shapes_of_the_task(
+        engine, monkeypatch, tmp_path, capsys):
+    """`patch` for edits, download→sync for a freshly written file — and the
+    boundary between them, because sync refuses outright once the new text
+    rewrites commented paragraphs. Without the boundary the advice sends the
+    agent into a refusal and back here."""
+    _stub_update_preflight(monkeypatch, engine, [{"id": "c1"}])
+    monkeypatch.setattr(engine, "get_drive_service",
+                        lambda c: _fake_update_drive([]))
+    md = tmp_path / "doc.md"
+    md.write_text("# hi\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        engine.update_doc("doc1", str(md))
+    reason = json.loads(capsys.readouterr().out)["reason"]
+    assert "rewrites a commented fragment whole" in reason
+    assert "sidecar must stay beside it" in reason
+    assert "those belong to `patch`" in reason
+    assert "not a reason to come back here" in reason
+    # the order the earlier round pinned: ask the person, THEN the flag
+    assert reason.index("ask the person") < reason.index("--acknowledge-loss")
