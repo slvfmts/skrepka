@@ -1,8 +1,8 @@
 # Как участвовать
 
-skrepka 0.9 — предрелиз некоммерческого проекта, который ведёт один человек. Гарантированных сроков ответа нет. Это не значит, что issue не читают: значит, что ответ может занять время.
+skrepka — предрелиз некоммерческого проекта, который ведёт один человек. Гарантированных сроков ответа нет. Это не значит, что issue не читают: значит, что ответ может занять время.
 
-*In English: this project is a solo, non-commercial 0.9 pre-release. Issues and pull requests are welcome in English too; the rules below apply unchanged.*
+*In English: this project is a solo, non-commercial pre-release. Issues and pull requests are welcome in English too; the rules below apply unchanged.*
 
 ## Уязвимости — не в публичные issue
 
