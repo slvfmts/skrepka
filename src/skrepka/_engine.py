@@ -2518,42 +2518,6 @@ def _refuse_on_suggestion_range(doc_tab, start, end, source):
                 f"Docs. Остальной документ правится. ({source})")
 
 
-def _informational_replies(drive_service, file_id, doc_tab, resolved, comments):
-    """Best-effort: post an informational reply on comments whose stale
-    quotedFileContent still matches text intersecting an applied op.
-
-    Purely informational — NEVER used for safety decisions (the snapshot
-    can be stale; see codex r1 #2).
-    """
-    unresolved = [c for c in comments if not c.get("resolved")]
-    notes = []
-    seen = set()
-    for r in resolved:
-        for c in unresolved:
-            cid = c.get("id")
-            if cid in seen:
-                continue
-            for cs, ce in _locate_comment_in_tab(doc_tab, c):
-                if _ranges_overlap(r["affect_start"], r["affect_end"], cs, ce):
-                    seen.add(cid)
-                    quoted = (c.get("quotedFileContent") or {}).get("value", "")
-                    note = (
-                        f"↻ Текст рядом с этим комментарием обновлён через "
-                        f"skrepka (было: «{quoted[:200]}»). Тред сохранён."
-                    )
-                    try:
-                        drive_service.replies().create(
-                            fileId=file_id, commentId=cid,
-                            body={"content": note}, fields="id",
-                        ).execute()
-                        notes.append({"comment_id": cid, "reply_posted": True})
-                    except HttpError as e:
-                        notes.append({"comment_id": cid, "reply_posted": False,
-                                      "error": str(e)})
-                    break
-    return notes
-
-
 def _check_ops_overlap(resolved):
     sorted_for_check = sorted(resolved, key=lambda r: (r["affect_start"], r["affect_end"]))
     for i in range(len(sorted_for_check) - 1):
@@ -3164,7 +3128,7 @@ def patch_doc(file_id, ops_path, tab_id=None):
             _refuse_on_suggestion_range(doc_tab, r["start"], r["end"],
                                         r["source"])
 
-    all_comments, anchored, _, _ = _census_comments(drive_service, file_id)
+    _all, anchored, _, _ = _census_comments(drive_service, file_id)
 
     if not anchored:
         # ---- clean-doc path: single atomic index-based batch ----
@@ -3249,7 +3213,7 @@ def patch_doc(file_id, ops_path, tab_id=None):
         )
 
     global _RAISE_ERRORS
-    applied, applied_idx, op_notes, refused = [], [], [], []
+    applied, op_notes, refused = [], [], []
     failed_at, failure, app_state = None, None, None
     for i, op in enumerate(ops):
         try:
@@ -3260,7 +3224,6 @@ def patch_doc(file_id, ops_path, tab_id=None):
             finally:
                 _RAISE_ERRORS = False
             applied.append(resolved[i]["source"])
-            applied_idx.append(i)
             if note:
                 op_notes.append(note)
             continue
@@ -3286,14 +3249,13 @@ def patch_doc(file_id, ops_path, tab_id=None):
         failed_at, failure, app_state = i, reason, state
         break
 
-    # Best-effort phase: must NEVER suppress the patch report below.
-    try:
-        notes = _informational_replies(
-            drive_service, file_id, doc_tab,
-            [resolved[i] for i in applied_idx], all_comments)
-    except Exception as e:
-        notes = [{"error": f"informational replies failed: {e}"}]
-
+    # skrepka used to post an informational reply into every thread whose
+    # STALE quote intersected an op — approximate by construction, and with
+    # narrowing the applied range is narrower than the declared one, so the
+    # notice could name text the edit never touched. On the acceptance run it
+    # read as «комментарии отработаны не по смыслу». Writing into a person's
+    # document has to earn its place; the receipt carries op_notes and thread
+    # links instead (#22).
     result = {
         "action": ("patched" if failed_at is None and not refused
                    else "partially-patched"),
@@ -3302,7 +3264,6 @@ def patch_doc(file_id, ops_path, tab_id=None):
         "tab_id": tid,
         "ops_applied": len(applied),
         "applied": applied,
-        "comment_notes": notes,
     }
     if op_notes:
         result["op_notes"] = op_notes
