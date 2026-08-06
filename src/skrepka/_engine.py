@@ -2840,13 +2840,18 @@ def _rewrite_anchor_requests(doc_tab, search_text, new_text, start, end,
     ins_at = end - tail_len
     try:
         pos = index_map.index(ins_at)
+        at = index_map.index(start)
     except ValueError:
-        return None  # the insertion point is not a position in the text
+        # A position with no place in the text buffer. Refusing is the whole
+        # answer here: raising would escape a PRECONDITION check as an
+        # exception, and `patch` would read that as an unknown document state
+        # and stop every remaining operation.
+        return None
     projected = buf[:pos] + new_text + buf[pos:]
     needle = head + new_text
     if _count_in_buffer(projected, needle) != 1:
         return None
-    if projected.find(needle) != index_map.index(start):
+    if projected.find(needle) != at:
         return None
     if _count_text_outside_body(doc_tab, needle):
         return None
