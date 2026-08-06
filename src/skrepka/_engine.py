@@ -584,6 +584,36 @@ def _extract_text_from_doctab(doc_tab):
     yield from _extract_text_runs(body.get("content", []))
 
 
+def _text_buffer(doc_tab):
+    """Flat text of a tab's body plus a map position-in-buffer -> doc index.
+
+    Google Docs indices are UTF-16 code units. Non-BMP characters (💡) are one
+    Python code point but two units, so the index advances per character, not
+    per position in the string.
+
+    A '\\x00' sentinel marks every place where consecutive runs are NOT
+    contiguous in the index space — table cell boundaries, structural
+    elements — so a quote can never falsely match across one. Its entry in
+    the map is -1, which is not a position anything may be resolved to.
+
+    One builder for everyone who searches this text: matching, counting and
+    the projected-uniqueness check must agree byte for byte, or the check
+    stops describing what the write will do.
+    """
+    buf_parts, index_map, last_end = [], [], None
+    for start, end, text in _extract_text_from_doctab(doc_tab):
+        if last_end is not None and start != last_end:
+            buf_parts.append("\x00")
+            index_map.append(-1)
+        last_end = end
+        doc_offset = 0
+        for ch in text:
+            buf_parts.append(ch)
+            index_map.append(start + doc_offset)
+            doc_offset += 2 if ord(ch) > 0xFFFF else 1
+    return "".join(buf_parts), index_map
+
+
 def _find_quote_in_doctab(doc_tab, quote, occurrence=1):
     """Find the Nth (1-based) occurrence of `quote` within a tab's text.
 
@@ -593,32 +623,9 @@ def _find_quote_in_doctab(doc_tab, quote, occurrence=1):
     runs but not structural boundaries (paragraph breaks are represented by
     '\\n' in textRun content, which is fine).
     """
-    runs = list(_extract_text_from_doctab(doc_tab))
-    if not runs:
+    buf, index_map = _text_buffer(doc_tab)
+    if not buf:
         return None
-
-    # Build a flat buffer and index map: position-in-buffer -> doc index.
-    # Google Docs indices are UTF-16 code units. Non-BMP chars (e.g. 💡)
-    # are 1 Python code point but 2 UTF-16 units (surrogate pair).
-    # We track the doc index offset per code point to stay aligned.
-    # A '\x00' sentinel is inserted wherever consecutive runs are not
-    # contiguous in the index space (table cell boundaries, structural
-    # elements) so a quote can never falsely match across them.
-    buf_parts = []
-    index_map = []  # parallel array: index_map[i] = doc index for buf char i
-    last_end = None
-    for start, end, text in runs:
-        if last_end is not None and start != last_end:
-            buf_parts.append("\x00")
-            index_map.append(-1)
-        last_end = end
-        doc_offset = 0
-        for ch in text:
-            buf_parts.append(ch)
-            index_map.append(start + doc_offset)
-            # Advance by UTF-16 code unit count for this char
-            doc_offset += 2 if ord(ch) > 0xFFFF else 1
-    buf = "".join(buf_parts)
 
     if not quote or "\x00" in quote:
         return None  # NUL is the internal boundary sentinel — never matchable
@@ -639,25 +646,22 @@ def _find_quote_in_doctab(doc_tab, quote, occurrence=1):
         pos = idx + 1
 
 
-def _count_quote_occurrences(doc_tab, quote):
-    runs = list(_extract_text_from_doctab(doc_tab))
-    parts, last_end = [], None
-    for start, end, text in runs:
-        if last_end is not None and start != last_end:
-            parts.append("\x00")  # same cross-boundary sentinel as _find_quote
-        last_end = end
-        parts.append(text)
-    buf = "".join(parts)
+def _count_in_buffer(buf, quote):
+    """Occurrences of `quote` in a text buffer, overlapping matches included."""
     if not quote or "\x00" in quote:
         return 0  # NUL is the internal boundary sentinel — never matchable
-    count = 0
-    pos = 0
+    count, pos = 0, 0
     while True:
         idx = buf.find(quote, pos)
         if idx == -1:
             return count
         count += 1
         pos = idx + 1
+
+
+def _count_quote_occurrences(doc_tab, quote):
+    buf, _index_map = _text_buffer(doc_tab)
+    return _count_in_buffer(buf, quote)
 
 
 def _count_text_outside_body(doc_tab, text):
@@ -2748,6 +2752,150 @@ def _style_refusal(doc_tab, start, end, source):
         f"({source})")
 
 
+# Control characters — a newline among them, it starts a new paragraph —
+# and the Private Use Area, which Docs is known to strip. Any of these
+# and the text that lands is not what the positions were computed for.
+_REWRITE_FORBIDDEN = re.compile("[\x00-\x1f\x7f-\x9f\ue000-\uf8ff]")
+
+
+def _distinct_anchor_ranges(spans):
+    """Ranges of a set of anchor spans, one entry per distinct range.
+
+    A thread exports one record per ENTRY, and every one of them carries the
+    parent's range — a thread with a single reply comes back with two
+    identical anchors. Counting spans instead of ranges would mean the rewrite
+    never fires on a thread anybody replied to.
+    """
+    return sorted({(s, e) for s, e, _t, _i in spans})
+
+
+def _rewrite_anchor_requests(doc_tab, search_text, new_text, start, end,
+                             anchors, attribution, named_intervals,
+                             has_resolved):
+    """Requests that rewrite a fully-covered anchor without ghosting it.
+
+    A person does this by hand: type the new text INSIDE the comment's
+    selection, then delete the old. Measured (docs/FINDINGS.md): the anchor
+    grows over an insert made strictly inside it, survives a replace whose
+    match leaves one of its characters alone, and survives the deletion of
+    that last character — the thread dies only if the anchor collapses to
+    nothing, not when the original text goes. All three fit in ONE atomic
+    batch, so no half-rewritten state ever exists.
+
+    Returns (requests, tail_len) or None. **None means the caller refuses
+    exactly as it did before** — this is an added capability, not a new
+    default, so every condition below can be as strict as it likes: the cost
+    of getting one wrong is a feature that did not fire, never a damaged
+    document.
+    """
+    if not new_text or _REWRITE_FORBIDDEN.search(new_text):
+        # Docs strips some control characters and turns \n into a paragraph
+        # break, so the text that lands would not be the text we measured
+        # positions for.
+        return None
+    if has_resolved:
+        # Closed threads are invisible to the export, so their anchors could
+        # be anywhere — including under the character this batch deletes, and
+        # deleteContentRange is what turns a closed thread into a ghost.
+        # `patch` never used deletion before; it is not going to start by
+        # gambling with a thread it cannot see.
+        return None
+    if any("tableOfContents" in el for el in
+           (doc_tab.get("body", {}) or {}).get("content", [])):
+        # The text walkers do not read a table of contents, so the local
+        # uniqueness count would not see a match hiding there while
+        # replaceAllText may well rewrite it (#23).
+        return None
+    for ns, ne, _label in named_intervals:
+        if _ranges_overlap(start, end, ns, ne):
+            return None  # the deletion would cut a machine-owned mark
+
+    doomed = _doomed_threads(start, end, anchors, attribution)
+    if len(doomed) != 1:
+        return None
+    ranges = _distinct_anchor_ranges(doomed[0][1])
+    if ranges != [(start, end)]:
+        # the target must be exactly the anchor: an anchor strictly inside a
+        # wider replace would need the original removed on BOTH sides, and a
+        # deletion reaching into an anchor from outside is the one shape that
+        # was measured to damage text
+        return None
+    for as_, ae, _t, aid in anchors:
+        if (as_, ae) != (start, end) and _ranges_overlap(start, end, as_, ae):
+            # a neighbour touching the tail character would meet the deletion
+            # from outside; only strictly-inside deletion is measured safe
+            return None
+
+    if len(search_text) < 2:
+        # Two CODE POINTS, not two UTF-16 units: one emoji is two units but a
+        # single character, and there is no position strictly inside it.
+        return None
+    head, tail = search_text[:-1], search_text[-1]
+    tail_len = _utf16_len(tail)
+
+    # Project the document as it will read between request 1 and request 2 and
+    # verify there that the search string is unique AND lands where we think.
+    # It cannot be checked against the live document: it does not exist yet.
+    buf, index_map = _text_buffer(doc_tab)
+    ins_at = end - tail_len
+    try:
+        pos = index_map.index(ins_at)
+    except ValueError:
+        return None  # the insertion point is not a position in the text
+    projected = buf[:pos] + new_text + buf[pos:]
+    needle = head + new_text
+    if _count_in_buffer(projected, needle) != 1:
+        return None
+    if projected.find(needle) != index_map.index(start):
+        return None
+    if _count_text_outside_body(doc_tab, needle):
+        return None
+
+    requests = [
+        {"insertText": {"location": {"index": ins_at}, "text": new_text}},
+        {"replaceAllText": {"containsText": {"text": needle,
+                                             "matchCase": True},
+                            "replaceText": new_text}},
+        {"deleteContentRange": {"range": {
+            "startIndex": start + _utf16_len(new_text),
+            "endIndex": start + _utf16_len(new_text) + tail_len}}},
+    ]
+    return requests, tail_len
+
+
+def _execute_anchor_rewrite(docs_service, file_id, tid, requests, revision_id,
+                            source, extra_requests_before=None):
+    """Send the rewrite batch and read its verdict.
+
+    Unlike `_execute_replace_all`, `occurrencesChanged` here is diagnosis
+    AFTER the write, never a precondition: the insert and the deletion land
+    whatever the replace matched, so anything other than exactly one match
+    means the document has been changed in a way nobody planned. There is no
+    `not_applied` outcome to report.
+    """
+    for req in requests:
+        if tid and "replaceAllText" in req:
+            req["replaceAllText"]["tabsCriteria"] = {"tabIds": [tid]}
+        elif tid and "insertText" in req:
+            req["insertText"]["location"]["tabId"] = tid
+        elif tid and "deleteContentRange" in req:
+            req["deleteContentRange"]["range"]["tabId"] = tid
+    body = {"requests": list(extra_requests_before or []) + requests,
+            "writeControl": _write_control(revision_id)}
+    result = docs_service.documents().batchUpdate(
+        documentId=file_id, body=body).execute()
+    occ = next((rep.get("replaceAllText", {}) for rep in
+                (result.get("replies") or []) if "replaceAllText" in rep),
+               {}).get("occurrencesChanged")
+    if occ != 1:
+        raise PatchOpError(
+            f"перезапись якоря: replaceAllText сообщил {occ!r} совпадений "
+            f"вместо одного ({source}). Вставка и удаление в этом батче "
+            f"выполняются в любом случае, поэтому документ изменён — "
+            f"проверьте его состояние глазами, повторять вслепую нельзя",
+            state="unknown")
+
+
 def _resolve_replace_target(op, doc_tab, r, check_style=True):
     """Shared replace-target checks on a given snapshot: exact text,
     uniqueness, round-trip, style uniformity. Returns search_text.
@@ -2949,11 +3097,23 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
             narrowed = _narrow_replace(
                 doc_tab, search_text, r["text"], start_at, end_at,
                 snap["anchors"], snap["blocked"], attribution)
+        rewrite = None
         if narrowed:
             # everything was re-checked inside the narrowing, on the range
             # that will actually be written
             search_text, applied_text, start_at, end_at = narrowed
             hits, doomed, style_problem = [], [], None
+        elif doomed and not hits and not style_problem:
+            # Narrowing could not save the thread, so try what a person does
+            # by hand: write the new text inside the comment's selection and
+            # take the old one out. Every precondition is inside; None here
+            # means the refusal below stands exactly as before.
+            rewrite = _rewrite_anchor_requests(
+                doc_tab, search_text, r["text"], start_at, end_at,
+                snap["anchors"], attribution, named_intervals,
+                has_resolved=any(c.get("resolved") for c in anchored_now))
+            if rewrite:
+                doomed = []
         if style_problem:
             cleaned = _cleanup_canary(docs_service, file_id, canary)
             _error(_canary_msg(style_problem, cleaned))
@@ -3002,10 +3162,16 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
         # no other network calls between the final census and the write;
         # the batch deletes the canary FIRST (atomic with the replace)
         try:
-            _execute_replace_all(
-                docs_service, file_id, tid, search_text, applied_text,
-                snap["r1"], r["source"],
-                extra_requests_before=[_canary_delete_request(canary)])
+            if rewrite:
+                _execute_anchor_rewrite(
+                    docs_service, file_id, tid, rewrite[0], snap["r1"],
+                    r["source"],
+                    extra_requests_before=[_canary_delete_request(canary)])
+            else:
+                _execute_replace_all(
+                    docs_service, file_id, tid, search_text, applied_text,
+                    snap["r1"], r["source"],
+                    extra_requests_before=[_canary_delete_request(canary)])
         except PatchOpError:
             raise  # occurrence mismatch: batch APPLIED, canary already gone
         except HttpError as e:
@@ -3034,6 +3200,11 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
                     "narrowed_to": search_text,
                     "note": "замена сужена до изменённого фрагмента, чтобы "
                             "сохранить тред"}
+        if rewrite:
+            return {"source": r["source"], "applied_as": "rewritten",
+                    "note": "фрагмент переписан целиком; тред перевешен на "
+                            "новый текст и теперь относится к тексту, "
+                            "которого не было, когда комментарий писали"}
         return None
     _error(
         f"anchor-mapped replace kept failing preflight after 3 attempts "

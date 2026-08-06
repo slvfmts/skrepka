@@ -1186,16 +1186,47 @@ def test_patch_replace_applies_with_canary_first(engine, monkeypatch):
     assert "replaceAllText" in main[1]
 
 
-def test_patch_full_anchor_coverage_still_refused(engine, monkeypatch,
-                                                  capsys):
+def _covered_anchor_doc(engine, monkeypatch, comments=None):
+    """Doc whose middle paragraph is covered by one anchor, end to end."""
     doc = make_doc(BASE_TEXTS)
     docs = DocsStub(doc)
     drive = DriveStub(
-        [api_comment("c1", "A", CREATED)],
+        comments or [api_comment("c1", "A", CREATED)],
         _docx_builder(docs, [("Alpha", []), ("Bravo", [("0", 0, 5)]),
                              ("Charlie", [])],
                       [("0", "A", CREATED_SEC)]))
     monkeypatch.setattr(engine.time, "sleep", lambda s: None)
+    return docs, drive
+
+
+def test_patch_full_anchor_coverage_is_rewritten(engine, monkeypatch):
+    """#21: the whole commented fragment is replaced, and the thread comes
+    along. Used to be a refusal — the single most common thing an editor is
+    asked to do on a commented paragraph."""
+    docs, drive = _covered_anchor_doc(engine, monkeypatch)
+    op = {"op": "replace_quote", "quote": "Bravo", "with": "Zulu"}
+    note = engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
+    assert note["applied_as"] == "rewritten"
+
+    main = next(b for b in docs.batches if any("replaceAllText" in r
+                                               for r in b))
+    assert "deleteContentRange" in main[0]           # canary first
+    assert main[1]["insertText"] == {"location": {"index": 11},
+                                     "text": "Zulu"}  # inside the anchor
+    assert main[2]["replaceAllText"]["containsText"]["text"] == "BravZulu"
+    assert main[2]["replaceAllText"]["replaceText"] == "Zulu"
+    assert main[3]["deleteContentRange"]["range"] == {"startIndex": 11,
+                                                      "endIndex": 12}
+
+
+def test_rewrite_refuses_when_a_closed_thread_is_in_the_document(
+        engine, monkeypatch, capsys):
+    """The rewrite is the first thing in `patch` that deletes text, and a
+    closed thread's anchor is invisible — it could be exactly under the
+    character being removed. Fall back to the old refusal instead."""
+    docs, drive = _covered_anchor_doc(engine, monkeypatch, comments=[
+        api_comment("c1", "A", CREATED),
+        api_comment("c2", "B", "2026-07-13T18:00:00.000Z", resolved=True)])
     op = {"op": "replace_quote", "quote": "Bravo", "with": "Zulu"}
     with pytest.raises(SystemExit):
         engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
@@ -1466,6 +1497,197 @@ def test_narrowed_replace_reaches_the_api_and_is_reported(engine, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# #21: rewriting a fully covered anchor without ghosting the thread
+# ---------------------------------------------------------------------------
+
+def _rewrite_case(engine, text="Здесь старый текст", new="Совсем иная фраза",
+                  **over):
+    """Everything `_rewrite_anchor_requests` needs for one paragraph whose
+    anchor covers the text exactly."""
+    tab, start, end = _one_para(engine, text)
+    kw = {
+        "doc_tab": tab, "search_text": text, "new_text": new,
+        "start": start, "end": end,
+        "anchors": [(start, end, text, "0")],
+        "attribution": {"0": "c1"},
+        "named_intervals": [],
+        "has_resolved": False,
+    }
+    kw.update(over)
+    return kw
+
+
+def test_rewrite_builds_the_three_requests(engine):
+    kw = _rewrite_case(engine)
+    requests, tail_len = engine._rewrite_anchor_requests(**kw)
+    assert tail_len == 1
+    ins, rep, dele = requests
+    # insert lands strictly inside the anchor, before its last character
+    assert ins["insertText"]["location"]["index"] == kw["end"] - 1
+    # the match leaves that last character alone, so it never covers the whole
+    assert rep["replaceAllText"]["containsText"]["text"] == \
+        kw["search_text"][:-1] + kw["new_text"]
+    assert rep["replaceAllText"]["replaceText"] == kw["new_text"]
+    # and the leftover original character goes last
+    tail_at = kw["start"] + engine._utf16_len(kw["new_text"])
+    assert dele["deleteContentRange"]["range"] == {"startIndex": tail_at,
+                                                   "endIndex": tail_at + 1}
+
+
+def test_rewrite_counts_a_non_bmp_tail_in_utf16(engine):
+    """The anchor ends with an emoji: one code point, two index units."""
+    kw = _rewrite_case(engine, text="Старый текст 💡")
+    requests, tail_len = engine._rewrite_anchor_requests(**kw)
+    assert tail_len == 2
+    assert requests[0]["insertText"]["location"]["index"] == kw["end"] - 2
+    rng = requests[2]["deleteContentRange"]["range"]
+    assert rng["endIndex"] - rng["startIndex"] == 2
+
+
+def test_rewrite_refuses_a_single_emoji_anchor(engine):
+    """«💡» is two UTF-16 units but ONE character: there is no position
+    strictly inside it, and a length check in units would wave it through."""
+    assert engine._rewrite_anchor_requests(**_rewrite_case(engine, text="💡")) \
+        is None
+
+
+def test_rewrite_refuses_a_single_character_anchor(engine):
+    assert engine._rewrite_anchor_requests(**_rewrite_case(engine, text="Я")) \
+        is None
+
+
+def test_rewrite_refuses_an_empty_replacement(engine):
+    """Nothing would be left under the anchor to keep it from collapsing."""
+    assert engine._rewrite_anchor_requests(**_rewrite_case(engine, new="")) \
+        is None
+
+
+def test_rewrite_refuses_a_newline_in_the_replacement(engine):
+    """Docs turns \\n into a paragraph break, so the inserted text would not
+    be the text every position was computed for."""
+    assert engine._rewrite_anchor_requests(
+        **_rewrite_case(engine, new="две\nстроки")) is None
+
+
+def test_rewrite_refuses_when_a_neighbour_anchor_touches_the_range(engine):
+    """A neighbour ending on the tail character would meet the deletion from
+    outside — the one shape measured to damage text."""
+    kw = _rewrite_case(engine)
+    kw["anchors"] = kw["anchors"] + [(kw["end"] - 1, kw["end"] + 3, "хвост",
+                                      "9")]
+    kw["attribution"] = {"0": "c1", "9": "c2"}
+    assert engine._rewrite_anchor_requests(**kw) is None
+
+
+def test_rewrite_refuses_when_a_named_range_covers_the_target(engine):
+    kw = _rewrite_case(engine)
+    kw["named_intervals"] = [(kw["start"], kw["end"], "named range 'mark1'")]
+    assert engine._rewrite_anchor_requests(**kw) is None
+
+
+def test_rewrite_refuses_when_a_table_of_contents_is_present(engine):
+    kw = _rewrite_case(engine)
+    kw["doc_tab"]["body"]["content"].append(
+        {"startIndex": 900, "endIndex": 950, "tableOfContents": {}})
+    assert engine._rewrite_anchor_requests(**kw) is None
+
+
+def test_rewrite_refuses_when_the_anchor_is_inside_a_wider_replace(engine):
+    """The anchor is a phrase in the middle: the original would have to go
+    from both sides, and that means deleting into the anchor from outside."""
+    kw = _rewrite_case(engine)
+    kw["anchors"] = [(kw["start"] + 6, kw["start"] + 11, "старый", "0")]
+    assert engine._rewrite_anchor_requests(**kw) is None
+
+
+def test_rewrite_refuses_two_doomed_threads(engine):
+    kw = _rewrite_case(engine)
+    kw["anchors"] = kw["anchors"] + [(kw["start"] + 1, kw["start"] + 4,
+                                      "дес", "9")]
+    kw["attribution"] = {"0": "c1", "9": "c2"}
+    assert engine._rewrite_anchor_requests(**kw) is None
+
+
+def test_rewrite_survives_a_thread_with_replies(engine):
+    """A thread exports one record per entry, all with the parent's range —
+    a reply means two identical anchors. Counting spans instead of distinct
+    ranges would switch the rewrite off for every thread anybody answered."""
+    kw = _rewrite_case(engine)
+    kw["anchors"] = kw["anchors"] + [(kw["start"], kw["end"],
+                                      kw["search_text"], "1")]
+    kw["attribution"] = {"0": "c1", "1": "c1"}
+    assert engine._rewrite_anchor_requests(**kw) is not None
+
+
+def test_rewrite_refuses_a_projected_string_that_is_not_unique(engine):
+    """The needle exists only after the insert, so uniqueness is checked on
+    the projected text — and here the same pair already sits in the document
+    next door."""
+    text, new = "аб", "вг"
+    tab = make_doc([text, "а" + new])   # «авг» already contains «а» + «вг»
+    kw = _rewrite_case(engine, text=text, new=new)
+    kw["doc_tab"] = tab
+    assert engine._rewrite_anchor_requests(**kw) is None
+
+
+def test_rewrite_refuses_when_the_needle_also_sits_in_a_header(engine):
+    kw = _rewrite_case(engine)
+    kw["doc_tab"]["headers"] = {"h1": {"content": [
+        {"paragraph": {"elements": [
+            {"textRun": {"content": kw["search_text"][:-1] + kw["new_text"]}}
+        ]}}]}}
+    assert engine._rewrite_anchor_requests(**kw) is None
+
+
+def test_rewrite_response_without_one_match_is_unknown(engine):
+    """occurrencesChanged here is diagnosis after the write: the insert and
+    the deletion land whatever the replace matched, so anything but one means
+    the document changed in a way nobody planned."""
+    class Svc:
+        def documents(self):
+            return self
+
+        def batchUpdate(self, **kw):
+            return self
+
+        def execute(self):
+            return {"replies": [{}, {}, {"replaceAllText":
+                                         {"occurrencesChanged": 0}}]}
+
+    with pytest.raises(engine.PatchOpError) as exc:
+        engine._execute_anchor_rewrite(Svc(), "doc1", None, [
+            {"insertText": {"location": {"index": 1}, "text": "x"}},
+            {"replaceAllText": {"containsText": {"text": "a"},
+                                "replaceText": "b"}},
+            {"deleteContentRange": {"range": {"startIndex": 1,
+                                              "endIndex": 2}}},
+        ], "R1", "quote='a'")
+    assert exc.value.state == "unknown"
+    assert "документ изменён" in str(exc.value)
+
+
+def test_narrowing_wins_over_rewriting(engine, monkeypatch):
+    """The cheap path first: when one word changes, the thread is saved by
+    narrowing and the document is written once, not three times."""
+    doc = make_doc(["Alpha", "Здесь слишком мало примеров", "Charlie"])
+    docs = DocsStub(doc)
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        _docx_builder(docs, [("Alpha", []),
+                             ("Здесь слишком мало примеров", [("0", 6, 18)]),
+                             ("Charlie", [])],
+                      [("0", "A", CREATED_SEC)]))
+    monkeypatch.setattr(engine.time, "sleep", lambda s: None)
+    note = engine._apply_op_anchor_safe(docs, drive, "doc1", {
+        "op": "replace_quote", "quote": "Здесь слишком мало примеров",
+        "with": "Здесь слишком мало образцов"}, None)
+    assert note["applied_as"] == "narrowed"
+    main = next(b for b in docs.batches if any("replaceAllText" in r
+                                               for r in b))
+    assert not any("insertText" in r for r in main)
+
+
+# ---------------------------------------------------------------------------
 # r8: a pending suggestion stops blocking inserts elsewhere
 # ---------------------------------------------------------------------------
 
@@ -1645,8 +1867,11 @@ def test_patch_refuses_one_op_and_applies_the_rest(engine, monkeypatch,
     the first refusal and the other operations never ran."""
     doc = make_doc(BASE_TEXTS)
     docs = DocsStub(doc)
+    # a closed thread in the document keeps the rewrite path out of it, so
+    # covering the anchor whole is still a refusal
     drive = DriveStub(
-        [api_comment("c1", "A", CREATED)],
+        [api_comment("c1", "A", CREATED),
+         api_comment("c2", "B", "2026-07-13T18:00:00.000Z", resolved=True)],
         _docx_builder(docs, [("Alpha", []), ("Bravo", [("0", 0, 5)]),
                              ("Charlie", [])],
                       [("0", "A", CREATED_SEC)]))
