@@ -1608,6 +1608,48 @@ def test_rewrite_refuses_two_doomed_threads(engine):
     assert engine._rewrite_anchor_requests(**kw) is None
 
 
+def test_rewrite_refuses_a_second_thread_on_the_same_selection(engine):
+    """Two comments on the same paragraph export byte-identical ranges. If the
+    other thread has a second anchor elsewhere it is not doomed, so the count
+    of doomed threads stays at one — and «same range» must not be read as
+    «same thread», or someone else's anchor gets rewritten silently."""
+    kw = _rewrite_case(engine)
+    kw["anchors"] = kw["anchors"] + [
+        (kw["start"], kw["end"], kw["search_text"], "9"),   # the twin
+        (900, 910, "далеко", "8"),                           # its other anchor
+    ]
+    kw["attribution"] = {"0": "c1", "9": "c2", "8": "c2"}
+    assert engine._rewrite_anchor_requests(**kw) is None
+
+
+def test_rewrite_refuses_a_span_nobody_could_attribute(engine):
+    """A span whose (author, second) collides with another thread stays
+    unattributed. Here it only OVERLAPS the target, so it is not doomed and
+    the count of doomed threads stays at one — it has to be refused by the
+    neighbour check itself. It may be a duplicate of our own anchor or a
+    whole other thread, and the geometry cannot tell."""
+    kw = _rewrite_case(engine)
+    kw["anchors"] = kw["anchors"] + [(kw["end"] - 1, kw["end"] + 5,
+                                      "хвост", "7")]
+    assert engine._doomed_threads(
+        kw["start"], kw["end"], kw["anchors"], kw["attribution"]) != []
+    assert len(engine._doomed_threads(
+        kw["start"], kw["end"], kw["anchors"], kw["attribution"])) == 1
+    assert engine._rewrite_anchor_requests(**kw) is None
+
+
+def test_rewrite_refuses_a_colliding_reply_as_two_doomed_threads(engine):
+    """The other half of the same trouble: an unattributed span that IS
+    covered by the target counts as a second doomed thread. Refusing is the
+    honest outcome — it may be our own reply, and it may not be."""
+    kw = _rewrite_case(engine)
+    kw["anchors"] = kw["anchors"] + [(kw["start"], kw["end"],
+                                      kw["search_text"], "7")]
+    assert len(engine._doomed_threads(
+        kw["start"], kw["end"], kw["anchors"], kw["attribution"])) == 2
+    assert engine._rewrite_anchor_requests(**kw) is None
+
+
 def test_rewrite_survives_a_thread_with_replies(engine):
     """A thread exports one record per entry, all with the parent's range —
     a reply means two identical anchors. Counting spans instead of distinct

@@ -2820,11 +2820,21 @@ def _rewrite_anchor_requests(doc_tab, search_text, new_text, start, end,
         # deletion reaching into an anchor from outside is the one shape that
         # was measured to damage text
         return None
+    doomed_cid = doomed[0][0]
     for as_, ae, _t, aid in anchors:
-        if (as_, ae) != (start, end) and _ranges_overlap(start, end, as_, ae):
-            # a neighbour touching the tail character would meet the deletion
-            # from outside; only strictly-inside deletion is measured safe
-            return None
+        if not _ranges_overlap(start, end, as_, ae):
+            continue
+        if doomed_cid is not None and attribution.get(aid) == doomed_cid:
+            continue  # our own thread — its replies duplicate its range
+        # Anyone else's anchor, or one nobody could attribute. A neighbour
+        # touching the tail character would meet the deletion from outside,
+        # and only strictly-inside deletion is measured safe. Identical
+        # ranges are NOT an exception: two comments on the same selection
+        # export byte-identical ranges, so «same range» does not mean «same
+        # thread» (found in review). An unattributable span is refused for
+        # the same reason — it may be our own reply's duplicate or a whole
+        # other thread, and nothing in the geometry tells them apart.
+        return None
 
     if len(search_text) < 2:
         # Two CODE POINTS, not two UTF-16 units: one emoji is two units but a
