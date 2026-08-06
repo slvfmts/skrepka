@@ -4031,6 +4031,25 @@ def _opaque_hash(el):
     return _sha256_str(json.dumps(_strip_indices(el), sort_keys=True))
 
 
+def _closed_threads_in_edited_ranges(doc_tab, closed, edited):
+    """Best-effort: which closed threads probably sat in an edited paragraph.
+
+    The thread's stale quote is looked up in the tab, the same way
+    `_informational_replies` does. Display only — it never decides anything,
+    the snapshot is stale by construction. Measured useful: on the acceptance
+    run it named the doomed thread correctly.
+    """
+    suspects = set()
+    if doc_tab is None or not edited:
+        return suspects
+    for c in closed:
+        for cs, ce in _locate_comment_in_tab(doc_tab, c):
+            if any(_ranges_overlap(s, e, cs, ce) for s, e in edited):
+                suspects.add(c.get("id"))
+                break
+    return suspects
+
+
 def _archive_closed_threads(md_path, file_id, closed, doc_tab=None,
                             edited=()):
     """Write the conversation of every closed thread next to the markdown.
@@ -4050,14 +4069,10 @@ def _archive_closed_threads(md_path, file_id, closed, doc_tab=None,
     """
     if not closed:
         return None
+    suspects = _closed_threads_in_edited_ranges(doc_tab, closed, edited)
     entries = []
     for c in closed:
-        near = False
-        if doc_tab is not None and edited:
-            for cs, ce in _locate_comment_in_tab(doc_tab, c):
-                if any(_ranges_overlap(s, e, cs, ce) for s, e in edited):
-                    near = True
-                    break
+        near = c.get("id") in suspects
         entries.append({
             "id": c.get("id"),
             "link": _thread_link(file_id, c.get("id")),
@@ -5144,16 +5159,27 @@ def sync_doc(file_id, md_path, tab_id=None):
                 f"документе {len(closed)} закрытых тредов, их якорей экспорт "
                 f"не показывает, и после правки разговор было бы не "
                 f"восстановить."))
+        suspects = _closed_threads_in_edited_ranges(doc_tab, closed,
+                                                    edited_ranges)
         closed_note = {
             "count": len(closed),
+            "probably_hit": sorted(suspects),
             "archive": archive,
             "note": ("Google не отдаёт закрытые треды в экспорте, поэтому "
-                     "их якоря не защищены: правка могла превратить один из "
-                     "них в призрака. Разговор сохранён в файле."),
+                     "их якоря не защищены. Замерено: закрытый тред, чей "
+                     "абзац переписан, исчезает совсем — переоткрытие его не "
+                     "возвращает. Разговор сохранён в файле."),
         }
-        _warn(f"в документе {len(closed)} закрытых тредов; их якоря экспорт "
-              f"не показывает, и правка могла их задеть. Разговор сохранён: "
-              f"{archive}")
+        if suspects:
+            _warn(f"закрытых тредов в документе: {len(closed)}, из них "
+                  f"{len(suspects)} стояли в абзацах, которые правка "
+                  f"переписывает — эти треды исчезнут из документа, и "
+                  f"переоткрытие их не вернёт (замерено). Разговор сохранён: "
+                  f"{archive}")
+        else:
+            _warn(f"в документе {len(closed)} закрытых тредов; их якоря "
+                  f"экспорт не показывает, и правка могла их задеть. "
+                  f"Разговор сохранён: {archive}")
 
     rev_pin = snap["r1"] if snap is not None else revision_id
     rev_after_text = rev_pin
