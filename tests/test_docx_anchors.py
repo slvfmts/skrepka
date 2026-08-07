@@ -417,3 +417,20 @@ def test_the_fence_stops_before_the_paragraph_terminator(engine):
     }])
     assert over == []
     assert any("cannot hold it" in p for p in problems)
+
+
+def test_the_refusal_names_a_remedy_that_fits_the_reason(engine):
+    """#24 in miniature. «Разберитесь с призраками» is right for an
+    unaccounted thread and plain wrong for a duplicated paragraph — and a
+    refusal naming a path that does not exist is what cost 18 threads."""
+    dup = engine._anchor_map_remedy(
+        "anchor 0 matches 2 paragraphs and one of them cannot hold it")
+    assert "Различите копии" in dup and "призрак" not in dup
+
+    chip = engine._anchor_map_remedy(
+        "anchor 0 matches 2 paragraphs, and a paragraph whose text skrepka "
+        "cannot read (a smart chip) could be its home too")
+    assert "чип" in chip and "Различите копии" not in chip
+
+    ghost = engine._anchor_map_remedy("anchor span 7 has no comments.xml entry")
+    assert "призрак" in ghost

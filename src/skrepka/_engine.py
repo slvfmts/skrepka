@@ -2209,6 +2209,28 @@ def _fence_off_tables(global_problems, doc_tab):
     return remaining, blocked
 
 
+def _anchor_map_remedy(shown):
+    """The way out, chosen by the reason — not one advice for all of them.
+
+    This refusal used to end with «разберитесь с комментариями-призраками»
+    whatever went wrong. That is right for an unaccounted thread and plain
+    wrong for a duplicated paragraph or a smart chip, and a refusal naming a
+    path that does not exist is the #24 defect all over again.
+    """
+    if "cannot read" in shown:
+        return ("В документе есть абзац, текст которого skrepka не читает "
+                "(смарт-чип или ссылка-карточка), и он мог бы оказаться домом "
+                "этого комментария. Уберите чип из отдельной строки или "
+                "правьте документ в интерфейсе.")
+    if "matches" in shown and "paragraph" in shown:
+        return ("Абзац с комментарием повторяется в документе дословно, "
+                "поэтому неясно, к какой копии он относится. Различите копии "
+                "в интерфейсе Google Docs — хватит одного слова — и повторите "
+                "команду.")
+    return ("Разрулите комментарии-призраки в UI (удалить/переоткрыть тред) "
+            "или правьте документ в UI.")
+
+
 def _fence_off_ambiguous(ambiguous, attribution=None, file_id=None):
     """Turn "the anchor is in ONE of these identical paragraphs" into a fence.
 
@@ -2582,12 +2604,11 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
             global_problems, doc_tab)
         blocked = blocked + table_blocked + amb_blocked
         if global_problems:
+            shown = "; ".join(str(p) for p in global_problems[:4])
             _abort(
                 "anchor accounting/mapping failed — paragraph "
                 "replaces/deletes are blocked (fail closed): "
-                + "; ".join(global_problems[:4])
-                + ". Разрулите комментарии-призраки в UI (удалить/"
-                  "переоткрыть тред) или правьте документ в UI.")
+                + shown + ". " + _anchor_map_remedy(shown))
         # Fenced ranges are checked too, not only placed anchors: an anchor at
         # the very end of the document is exactly what this guard is for, and
         # an ambiguous one is invisible to `anchors` (found in review).
