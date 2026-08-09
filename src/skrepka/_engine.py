@@ -1212,9 +1212,16 @@ def list_comments(file_id, output=None):
                 # second they were created in, and without these fields there
                 # is nowhere for a person to look that up (#16). Reply ids are
                 # what makes the surplus reply deletable (#18).
-                fields="nextPageToken,comments(id,content,author/displayName,"
+                # author/me says whether the entry is the authorized account's
+                # own. Without it «ответь только на мои комментарии» is not
+                # expressible: the agent has to guess by display name, and a
+                # wrong guess means talking to the customer in their document
+                # instead of to the person who asked (живой случай 2026-08-09).
+                fields="nextPageToken,comments(id,content,"
+                       "author/displayName,author/me,"
                        "createdTime,quotedFileContent,resolved,"
-                       "replies(id,content,author/displayName,createdTime))",
+                       "replies(id,content,author/displayName,author/me,"
+                       "createdTime))",
                 includeDeleted=False,
                 pageSize=100,
                 pageToken=page_token,
@@ -1236,7 +1243,12 @@ def list_comments(file_id, output=None):
     _emit_json(comments, output=output,
                summary={"comments": len(comments),
                         "unresolved": sum(1 for c in comments
-                                          if not c.get("resolved"))})
+                                          if not c.get("resolved")),
+                        # so a scoped request («отработай мои комментарии»)
+                        # can be checked against a number, not against a
+                        # display name the agent had to guess
+                        "mine": sum(1 for c in comments
+                                    if (c.get("author") or {}).get("me"))})
 
 
 # ---------------------------------------------------------------------------

@@ -423,9 +423,16 @@ def test_list_comments_asks_for_created_time_and_reply_ids(engine, monkeypatch,
     capsys.readouterr()
 
     fields = seen["fields"]
-    assert "replies(id,content,author/displayName,createdTime)" in fields
+    # asserted piecewise, not as one literal: the field list grows (author/me
+    # joined it for scoped requests), and a substring match on the whole
+    # concatenation breaks on every addition without meaning anything
+    replies = fields[fields.index("replies("):]
+    for f in ("id", "content", "author/displayName", "createdTime"):
+        assert f in replies, f
     # the parent's own createdTime, not just the replies' one
-    assert "comments(id,content,author/displayName,createdTime," in fields
+    parent = fields[:fields.index("replies(")]
+    for f in ("id", "content", "author/displayName", "createdTime"):
+        assert f in parent, f
 
 
 def test_list_comments_carries_a_link_to_each_thread(engine, monkeypatch,
@@ -508,3 +515,40 @@ def test_destructive_refusal_names_both_shapes_of_the_task(
     assert "not a reason to come back here" in reason
     # the order the earlier round pinned: ask the person, THEN the flag
     assert reason.index("ask the person") < reason.index("--acknowledge-loss")
+
+
+def test_comments_can_tell_whose_thread_it_is(engine, monkeypatch, capsys):
+    """«Ответь только на МОИ комментарии» must be answerable from the data.
+    Without `author/me` the agent guesses by display name — and a wrong guess
+    means writing to the customer, in the customer's document, instead of to
+    the person who asked (живой случай 2026-08-09)."""
+    captured = {}
+
+    class _Comments:
+        def list(self, **kw):
+            captured.update(kw)
+            return _Result({"comments": [
+                {"id": "c1", "content": "мой",
+                 "author": {"displayName": "Слава", "me": True}},
+                {"id": "c2", "content": "клиента",
+                 "author": {"displayName": "Наталья", "me": False}},
+            ]})
+
+    class _Result:
+        def __init__(self, payload):
+            self._p = payload
+
+        def execute(self):
+            return self._p
+
+    class _Drive:
+        def comments(self):
+            return _Comments()
+
+    monkeypatch.setattr(engine, "get_creds", lambda: object())
+    monkeypatch.setattr(engine, "get_drive_service", lambda c: _Drive())
+    engine.list_comments("doc1")
+
+    assert "author/me" in captured["fields"]
+    out = json.loads(capsys.readouterr().out)
+    assert [c["author"]["me"] for c in out] == [True, False]
