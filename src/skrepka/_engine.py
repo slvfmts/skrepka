@@ -1342,7 +1342,10 @@ def _resolve_op(op, doc_tab, tab_id):
             _error(
                 f"quote is non-unique ({total} matches): {quote!r}. "
                 f"Extend the quote until it is unique — include the "
-                f"surrounding sentence; that works everywhere. "
+                f"surrounding sentence. That fails when the paragraph itself "
+                f"repeats word for word: no quote inside it is unique, so the "
+                f"edit cannot be addressed at all. Do not guess a copy — tell "
+                f"the person the text repeats and ask what to do. "
                 f"'occurrence': N also disambiguates, but only on a doc "
                 f"WITHOUT anchored comments — with them it is refused, so "
                 f"sending an agent there alone would be a dead end."
@@ -6223,7 +6226,7 @@ def main():
              "beside the .md. What `patch` "
              "cannot place is a list for the person, not a reason to use this "
              "flag. The backup made first holds text and styles only — not "
-             "the comments")
+             "the comments.")
 
     # upload-file command (raw upload, any file type, no conversion)
     uf = sub.add_parser("upload-file", help="Upload file(s) as-is (no Google Doc conversion)")

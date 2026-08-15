@@ -993,6 +993,13 @@ def test_a_quote_op_on_a_copy_is_stopped_by_uniqueness(engine, monkeypatch,
     # `occurrence` targeting is refused there, so pointing at it would be a
     # dead end (#24 — a refusal has to name a path that exists)
     assert "occurrence" not in err or "comment" in err
+    # "extend the quote" is the remedy everywhere EXCEPT here, and here is
+    # where it gets offered. Measured on a live doc 15 August: the paragraph
+    # was duplicated whole, so every longer quote stayed non-unique too. A
+    # refusal that promises a remedy which provably cannot work is worse than
+    # one that admits the edit is unreachable.
+    assert "repeats word for word" in err
+    assert "works everywhere" not in err
     assert _no_content_mutation(docs)
 
 
