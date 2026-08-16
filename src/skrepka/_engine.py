@@ -2033,8 +2033,83 @@ def _comment_label(c, file_id=None):
     return f"{label} {link}" if link else label
 
 
+def _ghost_verdict(c, records, doc_tab, file_id=None):
+    """Is this witness-less thread provably a ghost? None when it is not.
+
+    A thread the API calls live whose records are absent from the export is
+    «a ghost or a stale export», and until #34 the two were treated as
+    indistinguishable — so ANY vanished comment froze every replace in the
+    document. Losing a comment without closing it is not a malfunction: the
+    text got rewritten, the paragraph deleted, the block moved. A ghost has no
+    anchor left, so blocking the document buys it nothing.
+
+    Two signs, independent of each other, and both must agree:
+
+    1. the export carries a record created LATER than this thread. The export
+       is a snapshot of the comment store at some instant T; a record dated D
+       proves T ≥ D, so a D later than this thread's creation leaves lag with
+       nothing to explain. When the missing thread is the newest thing in the
+       document the sign stays silent and the refusal stands — there lag
+       really is indistinguishable;
+    2. the text the comment was attached to is no longer in the document. This
+       one does not come from the export at all — it is read from the API and
+       the current snapshot, so a converter fault cannot forge it.
+
+    Sign 1 rests on the export being assembled whole rather than in pieces —
+    the same assumption the text canary already rests on, and NOT a measured
+    fact. The review held a P0 on it: in a chain of three coincidences (thread
+    alive, its text changed since, its record dropped by the converter) an
+    edit could kill a live thread. The owner took that trade knowingly on
+    2026-08-16 — see internal/DECISIONS.md — against the cost of the opposite,
+    which happens routinely.
+
+    When the stale quote IS still found in the document, the verdict carries
+    those places: they get fenced, so an edit there is refused while the rest
+    of the document stays editable. The fence proves nothing about where the
+    anchor is; it only makes being wrong cost a local refusal instead of a
+    thread.
+    """
+    if doc_tab is None:
+        return None  # nothing to check sign 2 against — fail closed
+    created = _trunc_seconds(c.get("createdTime") or "")
+    if not created:
+        return None
+    if not any((r.get("date_sec") or "") > created for r in records):
+        return None
+    if not (c.get("quotedFileContent") or {}).get("value"):
+        return None  # sign 2 is unverifiable, so it cannot agree
+    return {"id": c.get("id"),
+            "link": _thread_link(file_id, c.get("id")),
+            "quote": ((c.get("quotedFileContent") or {}).get("value")
+                      or "")[:60],
+            "fenced": _locate_comment_in_tab(doc_tab, c)}
+
+
+def _fence_off_ghosts(ghosts):
+    """Blocked ranges for vanished threads whose old text is still here.
+
+    A ghost with nothing left to find fences nothing and costs the person
+    nothing. One whose quote still matches somewhere gets those places fenced:
+    if the thread is in fact alive and simply missing from the export, this is
+    where it most likely still sits.
+    """
+    blocked = []
+    for g in ghosts:
+        for cs, ce in g.get("fenced") or ():
+            who = (f"треда {g['id']} {g['link']}" if g.get("link")
+                   else f"комментария {g.get('id')}")
+            blocked.append((cs, ce, (
+                f"комментарий {who} пропал из выгрузки документа, а текст, на "
+                f"котором он висел («{g.get('quote', '')[:40]}»), ещё здесь — "
+                f"поэтому правка этого места отклонена, а остальной документ "
+                f"правится. Уберите тред через «Удалить» в панели "
+                f"комментариев или правьте этот фрагмент в интерфейсе")))
+    return blocked
+
+
 def _account_anchored_comments(anchored, records, spans, *, universe,
-                               file_id=None, marker_census=None):
+                               file_id=None, marker_census=None,
+                               doc_tab=None):
     """Prove every live anchored THREAD keeps at least one anchor in the export.
 
     Ghosted threads vanish from the export ENTIRELY (C11a), and a stale export
@@ -2076,7 +2151,7 @@ def _account_anchored_comments(anchored, records, spans, *, universe,
     """
     from collections import Counter
 
-    problems = []
+    problems, ghosts = [], []
     signatures = []  # (thread, Counter of its live entry keys)
     resolved_n = 0
     for c in anchored:
@@ -2133,9 +2208,17 @@ def _account_anchored_comments(anchored, records, spans, *, universe,
         # At least ONE witness present is enough — a thread may have several,
         # and requiring a particular one would flap on partial staleness.
         if not any(docx_keys.get(k) for k in witnesses):
-            # Deliberately NOT scoped to an operation range (issue #10): a
-            # thread missing from the export has no span in document.xml, so
-            # there are no coordinates to confine the refusal to.
+            verdict = _ghost_verdict(c, records, doc_tab, file_id)
+            if verdict is not None:
+                # Provably gone: it has no anchor left to protect, so the
+                # document is not held hostage to it (#34). Named in the
+                # receipt — removing someone's comment is the person's call
+                # (CONTRACT §2.2), never ours.
+                ghosts.append(verdict)
+                continue
+            # Not provable, so nothing is scoped: a thread missing from the
+            # export has no span in document.xml, and there are no coordinates
+            # to confine the refusal to.
             problems.append(
                 f"comment {_comment_label(c, file_id)} is missing from the export "
                 f"(ghost thread or stale export — indistinguishable)")
@@ -2216,6 +2299,11 @@ def _account_anchored_comments(anchored, records, spans, *, universe,
         "anchor_spans": len(spans),
         "anchors_outside_body": outside_body,
     }
+    if ghosts:
+        # carried in the metrics rather than a third return value: every
+        # caller and test unpacks two, and a vanished thread is diagnosis,
+        # not a decision anybody downstream re-makes
+        metrics["ghosts"] = ghosts
     return problems, metrics
 
 
@@ -2706,7 +2794,7 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
         records, rec_problems = _docx_comment_records(docx_bytes)
         acc_problems, metrics = _account_anchored_comments(
             anchored, records, spans, universe=universe, file_id=file_id,
-            marker_census=census)
+            marker_census=census, doc_tab=doc_tab)
         anchors, map_problems, ambiguous = _map_anchors_to_doc(doc_tab, spans)
         attribution = _attribute_records_to_threads(anchored, records,
                                                     universe)
@@ -2724,7 +2812,12 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
         # is confined to the tables instead of the document (r8).
         global_problems, table_blocked = _fence_off_tables(
             global_problems, doc_tab)
-        blocked = blocked + table_blocked + amb_blocked
+        # A thread that vanished from the export has no anchor left to
+        # protect, so it no longer freezes the document — but where its old
+        # text still stands is fenced, in case it is alive and merely missing
+        # (#34).
+        ghost_blocked = _fence_off_ghosts(metrics.get("ghosts") or ())
+        blocked = blocked + table_blocked + amb_blocked + ghost_blocked
         if global_problems:
             shown = "; ".join(str(p) for p in global_problems[:4])
             _abort(
@@ -2758,7 +2851,8 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
     metrics["ambiguous_anchors"] = len(ambiguous)
     return ({"anchors": anchors, "fp1": fp1, "canary": canary,
              "r1": canary["r1"], "metrics": metrics, "blocked": blocked,
-             "attribution": attribution}, None)
+             "attribution": attribution,
+             "ghosts": metrics.get("ghosts") or []}, None)
 
 
 def _canary_insert_ambiguous(docs_service, file_id, canary, reason):
@@ -3392,7 +3486,8 @@ def _execute_replace_all(docs_service, file_id, tid, search_text, new_text,
         )
 
 
-def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
+def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
+                          warnings=None):
     """Apply ONE op on a commented doc.
 
     Inserts: fresh read, re-resolve, pinned batch (C5 verified safe).
@@ -3485,6 +3580,12 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
         if snap is None:
             last_reason = retry_reason
             continue
+        if warnings is not None:
+            # Collected for the caller to print ONCE. A vanished thread is a
+            # property of the document, not of this operation — repeating it
+            # per op would be ten copies of the same line on a ten-edit file.
+            for g in snap.get("ghosts") or ():
+                warnings.setdefault(g.get("id"), g)
         canary = snap["canary"]
 
         def _canary_msg(msg, cleaned):
@@ -3874,6 +3975,7 @@ def patch_doc(file_id, ops_path, tab_id=None):
         )
 
     applied, op_notes, refused = [], [], []
+    ghosts = {}
     failed_at, failure, app_state = None, None, None
     for i, op in enumerate(ops):
         if i in early_refusals:
@@ -3887,7 +3989,8 @@ def patch_doc(file_id, ops_path, tab_id=None):
             _RAISE_ERRORS = True  # nested preflight errors must not exit
             try:
                 note = _apply_op_anchor_safe(docs_service, drive_service,
-                                             file_id, op, tab_id)
+                                             file_id, op, tab_id,
+                                             warnings=ghosts)
             finally:
                 _RAISE_ERRORS = False
             applied.append(_op_source_label(op, resolved[i]))
@@ -3949,6 +4052,20 @@ def patch_doc(file_id, ops_path, tab_id=None):
     }
     if op_notes:
         result["op_notes"] = op_notes
+    if ghosts:
+        # Named, never removed: deleting somebody's comment is the person's
+        # decision (CONTRACT §2.2). Before #34 each of these stopped every
+        # replace in the document instead.
+        result["ghost_threads"] = [
+            {"id": g.get("id"), "link": g.get("link"), "quote": g.get("quote"),
+             "note": ("комментарий пропал из документа — якоря у него больше "
+                      "нет, на правки он не влияет. Убрать его можно вручную: "
+                      "«Удалить» в панели комментариев"
+                      if not g.get("fenced") else
+                      "комментарий пропал из выгрузки, но текст, на котором он "
+                      "висел, ещё в документе — правки этого места отклонены, "
+                      "остальной документ правится")}
+            for g in ghosts.values()]
     if refused:
         result["refused"] = refused
     if failed_at is not None:
@@ -4678,19 +4795,25 @@ def _opaque_hash(el):
 def _closed_threads_in_edited_ranges(doc_tab, closed, edited):
     """Best-effort: which closed threads probably sat in an edited paragraph.
 
-    The thread's stale quote is looked up in the tab, the same way
-    `_informational_replies` does. Display only — it never decides anything,
-    the snapshot is stale by construction. Measured useful: on the acceptance
-    run it named the doomed thread correctly.
+    Returns {thread id: how many places its stale quote matches}. The count is
+    not decoration: `_locate_comment_in_tab` returns EVERY occurrence, so on a
+    document with repeated paragraphs a thread standing in a clean copy is
+    reported as hit when the other copy is edited (#29). One match means «here»;
+    several mean «one of these», and the person deserves the difference — the
+    note sends them to check a thread by eye.
+
+    Display only — it never decides anything, the snapshot is stale by
+    construction. Measured useful: on the acceptance run it named the doomed
+    thread correctly.
     """
-    suspects = set()
+    suspects = {}
     if doc_tab is None or not edited:
         return suspects
     for c in closed:
-        for cs, ce in _locate_comment_in_tab(doc_tab, c):
-            if any(_ranges_overlap(s, e, cs, ce) for s, e in edited):
-                suspects.add(c.get("id"))
-                break
+        where = _locate_comment_in_tab(doc_tab, c)
+        if any(_ranges_overlap(s, e, cs, ce)
+               for cs, ce in where for s, e in edited):
+            suspects[c.get("id")] = len(where)
     return suspects
 
 
@@ -4716,7 +4839,7 @@ def _archive_closed_threads(md_path, file_id, closed, doc_tab=None,
     suspects = _closed_threads_in_edited_ranges(doc_tab, closed, edited)
     entries = []
     for c in closed:
-        near = c.get("id") in suspects
+        matches = suspects.get(c.get("id"))
         entries.append({
             "id": c.get("id"),
             "link": _thread_link(file_id, c.get("id")),
@@ -4724,7 +4847,16 @@ def _archive_closed_threads(md_path, file_id, closed, doc_tab=None,
             "created": c.get("createdTime"),
             "quote": (c.get("quotedFileContent") or {}).get("value"),
             "content": c.get("content"),
-            "probably_in_an_edited_paragraph": near,
+            "probably_in_an_edited_paragraph": matches is not None,
+            # «here» and «one of N places» are different messages: the flag
+            # sends the person to check a thread by eye, and on a document
+            # with repeated paragraphs the old flat `true` sent them to a
+            # thread the edit never touched (#29)
+            "where": ("текст этого треда встречается в документе "
+                      f"{matches} раз — правка задела одно из этих мест"
+                      if matches and matches > 1 else
+                      "правка переписывает место, где стоял этот тред"
+                      if matches else None),
             "replies": [
                 {"author": (r.get("author") or {}).get("displayName"),
                  "created": r.get("createdTime"),
@@ -5822,11 +5954,18 @@ def sync_doc(file_id, md_path, tab_id=None):
                      "возвращает. Разговор сохранён в файле."),
         }
         if suspects:
+            # «стояли» would be a claim, and on a document with repeated
+            # paragraphs it is sometimes a false one — the quote matches in
+            # several places and only one of them is being edited (#29)
+            unsure = sum(1 for n in suspects.values() if n > 1)
+            hedge = (f" (у {unsure} из них текст встречается в документе "
+                     f"не один раз, так что это может быть и другая копия)"
+                     if unsure else "")
             _warn(f"закрытых тредов в документе: {len(closed)}, из них "
-                  f"{len(suspects)} стояли в абзацах, которые правка "
-                  f"переписывает — эти треды исчезнут из документа, и "
-                  f"переоткрытие их не вернёт (замерено). Разговор сохранён: "
-                  f"{archive}")
+                  f"{len(suspects)} по нашей оценке стояли в абзацах, которые "
+                  f"правка переписывает{hedge} — такие треды исчезают из "
+                  f"документа, и переоткрытие их не вернёт (замерено). "
+                  f"Разговор сохранён: {archive}")
         else:
             _warn(f"в документе {len(closed)} закрытых тредов; их якоря "
                   f"экспорт не показывает, и правка могла их задеть. "

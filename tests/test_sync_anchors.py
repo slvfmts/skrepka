@@ -362,6 +362,76 @@ def test_accounting_deleted_reply_not_expected(engine):
     assert problems == []
 
 
+# ---------------------------------------------------------------------------
+# r10 (#34): a thread that vanished stops holding the document hostage
+# ---------------------------------------------------------------------------
+
+def _vanished_case(engine, quote):
+    """One thread missing from the export, one live thread newer than it."""
+    gone = api_comment("c1", "A", "2026-01-01T00:00:01Z")
+    gone["quotedFileContent"] = {"value": quote} if quote else {}
+    live = api_comment("c2", "B", "2026-01-01T00:00:09Z")
+    records = [{"docx_id": "0", "author": "B",
+                "date_sec": "2026-01-01T00:00:09Z"}]
+    anchored = [gone, live]
+    return anchored, records, engine._key_owners_universe(anchored)
+
+
+def test_a_vanished_thread_whose_text_is_gone_stops_blocking(engine):
+    """Living case 2026-08-09: five edits refused as one because a thread had
+    lost its anchor when the customer moved a block. Losing a comment without
+    closing it is normal practice, and a ghost has no anchor left to protect."""
+    anchored, records, universe = _vanished_case(engine, "Вариант 1")
+    problems, metrics = engine._account_anchored_comments(
+        anchored, records, _spans("0"), universe=universe, file_id="DOC",
+        doc_tab=make_doc(["Совсем другой текст"]))
+    assert problems == []
+    assert [g["id"] for g in metrics["ghosts"]] == ["c1"]
+    assert metrics["ghosts"][0]["link"].endswith("disco=c1")
+    assert engine._fence_off_ghosts(metrics["ghosts"]) == []
+
+
+def test_a_vanished_thread_whose_text_is_still_here_is_fenced(engine):
+    """The two signs disagree: the export lost it, the document still holds
+    the text it was attached to. Being wrong here must cost a local refusal,
+    not a thread — so the place is fenced and the rest stays editable."""
+    anchored, records, universe = _vanished_case(engine, "Вариант 1")
+    _p, metrics = engine._account_anchored_comments(
+        anchored, records, _spans("0"), universe=universe, file_id="DOC",
+        doc_tab=make_doc(["до", "Вариант 1", "после"]))
+    blocked = engine._fence_off_ghosts(metrics["ghosts"])
+    assert [(s, e) for s, e, _l in blocked] == [(4, 13)]
+    assert "пропал из выгрузки" in blocked[0][2]
+    assert "disco=c1" in blocked[0][2]
+
+
+def test_the_newest_thread_missing_from_the_export_still_blocks(engine):
+    """Nothing in the export was created after it, so the snapshot may simply
+    have been cut off before it existed — there lag really is
+    indistinguishable from a ghost, and the refusal stands."""
+    gone = api_comment("c1", "A", "2026-01-01T00:00:09Z")
+    live = api_comment("c2", "B", "2026-01-01T00:00:01Z")
+    anchored = [gone, live]
+    problems, metrics = engine._account_anchored_comments(
+        anchored, [{"docx_id": "0", "author": "B",
+                    "date_sec": "2026-01-01T00:00:01Z"}],
+        _spans("0"), universe=engine._key_owners_universe(anchored),
+        doc_tab=make_doc(["ничего похожего"]))
+    assert any("missing from the export" in p for p in problems)
+    assert "ghosts" not in metrics
+
+
+def test_a_vanished_thread_without_a_quote_still_blocks(engine):
+    """The second sign is unverifiable, so it cannot agree — and one sign was
+    never the deal."""
+    anchored, records, universe = _vanished_case(engine, None)
+    problems, metrics = engine._account_anchored_comments(
+        anchored, records, _spans("0"), universe=universe,
+        doc_tab=make_doc(["что угодно"]))
+    assert any("missing from the export" in p for p in problems)
+    assert "ghosts" not in metrics
+
+
 def test_accounting_resolved_absent_from_export_is_clean(engine):
     """Google omits resolved threads from the export entirely — measured on a
     live document 2026-07-30. The previous version of this test put the
@@ -2142,6 +2212,37 @@ def test_a_replace_covering_a_crossing_anchor_is_still_refused(engine,
     assert "накрывает целиком последний якорь" in out["refused"][0]["error"]
 
 
+def test_a_ghost_is_named_in_the_receipt_and_the_patch_goes_on(engine,
+                                                               monkeypatch,
+                                                               tmp_path,
+                                                               capsys):
+    """#34 end to end: one vanished thread used to refuse every replace in the
+    document. It is now named once — not per operation — and removing it stays
+    the person's decision (CONTRACT §2.2)."""
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    gone = api_comment("c2", "B", "2026-07-13T17:00:00.000Z")
+    gone["quotedFileContent"] = {"value": "Вариант 1"}
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED), gone],
+        _docx_builder(docs, [("Alpha", []), ("Bravo", [("0", 0, 5)]),
+                             ("Charlie", [])],
+                      [("0", "A", CREATED_SEC)]))
+    wire(engine, monkeypatch, docs, drive)
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "replace_quote", "quote": "Alpha", "with": "Yankee"},
+        {"op": "replace_quote", "quote": "Charlie", "with": "Xray"},
+    ]), encoding="utf-8")
+
+    engine.patch_doc("doc1", str(ops))
+    out = json.loads(capsys.readouterr().out)
+    assert out["ops_applied"] == 2
+    assert [g["id"] for g in out["ghost_threads"]] == ["c2"]
+    assert "disco=c2" in out["ghost_threads"][0]["link"]
+    assert "Убрать его можно вручную" in out["ghost_threads"][0]["note"]
+
+
 # ---------------------------------------------------------------------------
 # r10 (#36): the validation phase must not throw the file away either
 # ---------------------------------------------------------------------------
@@ -2870,3 +2971,42 @@ def test_sync_applies_away_from_the_copies_and_counts_them_honestly(
     accounting = out["anchor_accounting"]
     assert accounting["ambiguous_anchors"] == 1
     assert accounting["blocked_anchors"] == 2  # both copies fenced
+
+
+# ---------------------------------------------------------------------------
+# r10 (#29): «стоял здесь» is a claim, and on repeated paragraphs a false one
+# ---------------------------------------------------------------------------
+
+def test_a_closed_thread_on_a_repeated_paragraph_is_not_claimed_to_be_here(
+        engine):
+    """`_locate_comment_in_tab` returns EVERY occurrence by contract, so a
+    thread standing in the clean copy used to be reported as hit when the
+    other copy was edited — and the person went to check a thread the edit
+    never touched."""
+    tab = make_doc(["Одинаковый абзац", "прочее", "Одинаковый абзац"])
+    closed = [api_comment("c1", "A", CREATED, resolved=True)]
+    closed[0]["quotedFileContent"] = {"value": "Одинаковый абзац"}
+    # the edit covers the FIRST copy only
+    suspects = engine._closed_threads_in_edited_ranges(tab, closed, [(1, 17)])
+    assert suspects == {"c1": 2}
+
+
+def test_a_closed_thread_matching_once_is_named_plainly(engine):
+    tab = make_doc(["Единственный абзац", "прочее"])
+    closed = [api_comment("c1", "A", CREATED, resolved=True)]
+    closed[0]["quotedFileContent"] = {"value": "Единственный абзац"}
+    assert engine._closed_threads_in_edited_ranges(
+        tab, closed, [(1, 19)]) == {"c1": 1}
+
+
+def test_the_archive_says_one_of_n_places_not_here(engine, tmp_path):
+    tab = make_doc(["Одинаковый абзац", "прочее", "Одинаковый абзац"])
+    closed = [api_comment("c1", "A", CREATED, resolved=True)]
+    closed[0]["quotedFileContent"] = {"value": "Одинаковый абзац"}
+    md = tmp_path / "doc.md"
+    md.write_text("x", encoding="utf-8")
+    path = engine._archive_closed_threads(str(md), "DOC", closed,
+                                          doc_tab=tab, edited=[(1, 17)])
+    entry = json.loads(open(path, encoding="utf-8").read())["threads"][0]
+    assert entry["probably_in_an_edited_paragraph"] is True
+    assert "встречается в документе 2 раз" in entry["where"]
