@@ -2138,7 +2138,26 @@ def _ghost_verdict(c, records, doc_tab, file_id=None):
         return None
     quote = (c.get("quotedFileContent") or {}).get("value")
     if not quote:
-        return None  # sign 2 is unverifiable, so it cannot agree
+        # No quoted text at all, and no record in the export. Measured
+        # 2026-08-16: a comment created through the API never attaches to
+        # document text — but Drive stores the `anchor` field it was given
+        # verbatim, and skrepka counts anything carrying `anchor` as anchored.
+        # Such a thread has no text anchor to lose, yet it used to freeze
+        # every replace in the document, which is what any other tool leaving
+        # comments through the API does to a document today.
+        #
+        # A genuinely text-anchored comment always carries the quote (it is
+        # filled at creation and survives losing the anchor — the living ghost
+        # of 2026-08-09 still had it). One anchored to an image might not, but
+        # that one has a record in the export and never reaches this branch.
+        # So here the thread is either never-anchored or already ghosted, and
+        # either way nothing an edit does can hurt it. Sign 1 still has to
+        # hold: it is what rules out the export simply being older than the
+        # thread.
+        return {"id": c.get("id"),
+                "link": _thread_link(file_id, c.get("id")),
+                "quote": None,
+                "fenced": []}
     if _count_text_outside_body(doc_tab, quote):
         # The old text survives in a header, a footer or a footnote, where the
         # fence cannot reach — `_text_buffer` walks the body only, while

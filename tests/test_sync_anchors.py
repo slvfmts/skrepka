@@ -458,12 +458,36 @@ def test_the_newest_thread_missing_from_the_export_still_blocks(engine):
     assert "ghosts" not in metrics
 
 
-def test_a_vanished_thread_without_a_quote_still_blocks(engine):
-    """The second sign is unverifiable, so it cannot agree — and one sign was
-    never the deal."""
+def test_a_thread_that_never_held_text_does_not_block(engine):
+    """Measured 2026-08-16: a comment created through the API never attaches
+    to document text, yet Drive stores the `anchor` it was handed verbatim and
+    skrepka counts anything with `anchor` as anchored. Such a thread has no
+    text anchor to lose — and it used to freeze every replace in the document,
+    which is what any other tool leaving comments through the API does to a
+    document."""
     anchored, records, universe = _vanished_case(engine, None)
     problems, metrics = engine._account_anchored_comments(
         anchored, records, _spans("0"), universe=universe,
+        doc_tab=make_doc(["что угодно"]))
+    assert problems == []
+    assert [g["id"] for g in metrics["ghosts"]] == ["c1"]
+    # nothing to fence with, and nothing that needs fencing
+    assert engine._fence_off_ghosts(metrics["ghosts"]) == []
+
+
+def test_a_thread_without_a_quote_still_blocks_while_the_export_may_be_old(
+        engine):
+    """Sign 1 is not waived: without a record newer than the thread, the
+    export may simply predate it, and then its absence proves nothing about
+    what the thread is."""
+    gone = api_comment("c1", "A", "2026-01-01T00:00:09Z")
+    gone["quotedFileContent"] = {}
+    live = api_comment("c2", "B", "2026-01-01T00:00:01Z")
+    anchored = [gone, live]
+    problems, metrics = engine._account_anchored_comments(
+        anchored, [{"docx_id": "0", "author": "B",
+                    "date_sec": "2026-01-01T00:00:01Z"}],
+        _spans("0"), universe=engine._key_owners_universe(anchored),
         doc_tab=make_doc(["что угодно"]))
     assert any("missing from the export" in p for p in problems)
     assert "ghosts" not in metrics
