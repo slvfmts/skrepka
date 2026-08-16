@@ -1511,12 +1511,15 @@ def _parse_docx_anchor_spans(docx_bytes):
     """Parse word/document.xml and extract comment anchor spans.
 
     Returns (spans, problems, census):
-      spans: [{"docx_id", "para_index", "para_text", "start_off", "end_off",
-               "anchor_text", "has_objects"}] — offsets are UTF-16 units
-              within the paragraph text
-      problems: reasons the mapping is unusable (unpaired ranges,
-              cross-paragraph spans, inline objects in anchor paragraphs,
-              malformed XML). Any problem ⇒ caller fails closed.
+      spans: [{"docx_id", "para_index", "para_text", "start_off",
+               "end_para_index", "end_para_text", "end_off", "anchor_text",
+               "has_objects"}] — offsets are UTF-16 units within their own
+              paragraph's text. The two paragraph indices are equal for an
+              ordinary anchor and differ when the selection was dragged
+              across a paragraph break (#45).
+      problems: reasons the mapping is unusable (unpaired ranges, inline
+              objects in anchor paragraphs, malformed XML). Any problem ⇒
+              caller fails closed.
       census: {"in_tables", "elsewhere", "in_body"} — sets of w:id, where
               every marker in document.xml was found. An id in NONE of them
               is not in document.xml at all, which is how a footnote or a
@@ -1577,6 +1580,7 @@ def _parse_docx_anchor_spans(docx_bytes):
     # structural domains (codex W8-r1 P1).
     body_paras = [ch for ch in body if ch.tag == f"{w}p"]
 
+    para_meta = []
     for p_index, para in enumerate(body_paras):
         state = {"off": 0, "parts": [], "has_objects": False,
                  "has_unknown": [], "local_open": {}}
@@ -1597,7 +1601,7 @@ def _parse_docx_anchor_spans(docx_bytes):
                     cid = child.get(f"{w}id")
                     seen_starts[cid] = seen_starts.get(cid, 0) + 1
                     state["local_open"][cid] = state["off"]
-                    cross_para_open[cid] = p_index
+                    cross_para_open[cid] = (p_index, state["off"])
                 elif tag == f"{w}commentRangeEnd":
                     cid = child.get(f"{w}id")
                     seen_ends[cid] = seen_ends.get(cid, 0) + 1
@@ -1605,13 +1609,25 @@ def _parse_docx_anchor_spans(docx_bytes):
                         spans.append({
                             "docx_id": cid, "para_index": p_index,
                             "start_off": state["local_open"].pop(cid),
+                            "end_para_index": p_index,
                             "end_off": state["off"],
                         })
                         cross_para_open.pop(cid, None)
                     elif cid in cross_para_open:
-                        problems.append(
-                            f"comment range {cid} crosses paragraphs")
-                        cross_para_open.pop(cid, None)
+                        # A selection dragged across a paragraph break — what
+                        # an editor does without thinking when the comment is
+                        # about a heading and its subtitle, or a list item and
+                        # the next one. This used to be a coordinate-free
+                        # problem that froze the whole document (#45), while
+                        # the coordinates were right there: the opening
+                        # paragraph with its offset and this one with its own.
+                        open_p, open_off = cross_para_open.pop(cid)
+                        spans.append({
+                            "docx_id": cid, "para_index": open_p,
+                            "start_off": open_off,
+                            "end_para_index": p_index,
+                            "end_off": state["off"],
+                        })
                     else:
                         problems.append(
                             f"commentRangeEnd {cid} without start")
@@ -1642,18 +1658,41 @@ def _parse_docx_anchor_spans(docx_bytes):
                     state["has_unknown"].append(tag)
 
         walk(para)
-        para_text = "".join(state["parts"])
-        for sp in spans:
-            if sp["para_index"] == p_index and "para_text" not in sp:
-                sp["para_text"] = para_text
-                sp["anchor_text"] = _slice_utf16(
-                    para_text, sp["start_off"], sp["end_off"])
-                sp["has_objects"] = state["has_objects"]
-                if state["has_unknown"]:
-                    problems.append(
-                        f"anchor {sp['docx_id']} sits in a paragraph with "
-                        f"unsupported elements ({sorted(set(state['has_unknown']))[:3]}) "
-                        f"— text/offsets unreliable")
+        para_meta.append({"text": "".join(state["parts"]),
+                          "has_objects": state["has_objects"],
+                          "has_unknown": state["has_unknown"]})
+
+    # Texts are attached AFTER the walk, not inside it: a span that crosses a
+    # paragraph break is not complete until both of its paragraphs have been
+    # read, and the old in-loop assignment could only ever see the first one.
+    for sp in spans:
+        head, tail = para_meta[sp["para_index"]], para_meta[sp["end_para_index"]]
+        sp["para_text"] = head["text"]
+        sp["end_para_text"] = tail["text"]
+        if sp["end_para_index"] == sp["para_index"]:
+            sp["anchor_text"] = _slice_utf16(
+                head["text"], sp["start_off"], sp["end_off"])
+        else:
+            # Display only — it names the anchor in refusals and nothing reads
+            # it back. Paragraphs the walker skips (a table between the ends)
+            # are missing from it; the RANGE is unaffected, because both ends
+            # are computed from their own paragraphs.
+            middle = [para_meta[i]["text"] for i
+                      in range(sp["para_index"] + 1, sp["end_para_index"])]
+            sp["anchor_text"] = "\n".join(
+                [_slice_utf16(head["text"], sp["start_off"],
+                              _utf16_len(head["text"]))]
+                + middle
+                + [_slice_utf16(tail["text"], 0, sp["end_off"])])
+        # Either end being unreadable is enough to distrust the span: the
+        # offsets are taken from both.
+        sp["has_objects"] = head["has_objects"] or tail["has_objects"]
+        unknown = sorted(set(head["has_unknown"]) | set(tail["has_unknown"]))
+        if unknown:
+            problems.append(
+                f"anchor {sp['docx_id']} sits in a paragraph with "
+                f"unsupported elements ({unknown[:3]}) "
+                f"— text/offsets unreliable")
 
     processed = set(seen_starts) & set(seen_ends)
     census = {"in_tables": frozenset(census_tables - processed),
@@ -1751,6 +1790,12 @@ def _map_anchors_to_doc(doc_tab, spans):
        a paragraph would not keep an edit elsewhere out of it. If any
        paragraph could be that home, the document fails closed exactly as it
        does today;
+    An anchor whose selection was dragged across a paragraph break is placed
+    by locating its two ends separately, each by its own paragraph's text
+    (#45). It used to freeze the document for a reason that was never about
+    danger — «we cannot count offsets across a break» — while the offsets were
+    right there, one per end.
+
     3. the API reports text that differs from `para_text` — then NOTHING
        matches and the whole document fails closed. Today this is reachable
        only through a soft line break (the parser writes `w:br` as \\n, the
@@ -1809,6 +1854,47 @@ def _map_anchors_to_doc(doc_tab, spans):
                 f"could not be read (fail closed)")
             continue
         exact = by_text.get(ptext, [])
+        if s.get("end_para_index", s["para_index"]) != s["para_index"]:
+            # An anchor dragged across a paragraph break. Its two ends are
+            # located INDEPENDENTLY, each by its own paragraph's text, and API
+            # indices are absolute — so whatever lies between them (a table, a
+            # chip, anything the walker skips) cannot move either end. This is
+            # the anchor's exact extent, not a conservative envelope.
+            etext = s.get("end_para_text")
+            end_exact = by_text.get(etext, []) if etext is not None else []
+            if not exact or not end_exact:
+                problems.append(
+                    f"anchor {s['docx_id']} spans paragraphs and one of its "
+                    f"ends matched 0 times in the doc (need exactly 1): "
+                    f"{(ptext if not exact else etext)[:50]!r}")
+                continue
+            if len(exact) > 1 or len(end_exact) > 1:
+                # Fencing the pairs of candidates is combinatorial and buys
+                # nothing today: such a document is refused as it is now, so
+                # nothing regresses by leaving it refused.
+                problems.append(
+                    f"anchor {s['docx_id']} spans paragraphs and one of its "
+                    f"ends repeats in the document word for word "
+                    f"({len(exact)}/{len(end_exact)} matches) — which copy "
+                    f"holds the comment is not readable (fail closed)")
+                continue
+            (base, head_end), (base_e, tail_end) = exact[0], end_exact[0]
+            start_at, end_at = base + s["start_off"], base_e + s["end_off"]
+            # `head_end - 1` and `tail_end - 1` are the paragraphs' own
+            # newlines: the visible text ends before them.
+            if not (base <= start_at < head_end
+                    and base_e <= end_at <= tail_end - 1
+                    and start_at < end_at and base_e > base):
+                problems.append(
+                    f"anchor {s['docx_id']} spans paragraphs but the two ends "
+                    f"do not line up in the document "
+                    f"([{start_at}, {end_at}) against paragraphs "
+                    f"[{base}, {head_end}) and [{base_e}, {tail_end})) — "
+                    f"the anchor map cannot be trusted (fail closed)")
+                continue
+            ranges.append((start_at, end_at, s.get("anchor_text", ""),
+                           s["docx_id"]))
+            continue
         if not exact:
             problems.append(
                 f"anchor {s['docx_id']} paragraph matched 0 times in the doc "
@@ -3092,6 +3178,13 @@ def _rewrite_anchor_requests(doc_tab, search_text, new_text, start, end,
         # Docs strips some control characters and turns \n into a paragraph
         # break, so the text that lands would not be the text we measured
         # positions for.
+        return None
+    if "\n" in search_text:
+        # `replaceAllText` does not match across a paragraph break, so request
+        # 2 would change nothing while requests 1 and 3 landed anyway: text
+        # damaged, outcome unknown. Unreachable before #45 made cross-paragraph
+        # anchors placeable, and checked explicitly rather than left to
+        # `_REWRITE_FORBIDDEN`, which only looks at the REPLACEMENT text.
         return None
     if has_resolved:
         # Closed threads are invisible to the export, so their anchors could

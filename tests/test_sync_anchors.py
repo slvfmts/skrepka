@@ -1103,6 +1103,48 @@ def _docx_builder(docs_stub, paras, comments, include_canary=True):
     return build
 
 
+def _crossing_docx(docs_stub, texts, cid, start, end, comments):
+    """Export builder for ONE anchor dragged across a paragraph break.
+
+    `start` and `end` are (paragraph index, offset). `make_docx_full` keeps
+    every anchor inside a single paragraph, which is exactly the shape #45 is
+    not about.
+    """
+    def build():
+        paras = list(texts)
+        if docs_stub.canary_text is not None:
+            paras = paras + [docs_stub.canary_text]
+        body = []
+        for i, t in enumerate(paras):
+            if i == start[0]:
+                runs = [f'<w:r><w:t xml:space="preserve">{t[:start[1]]}</w:t></w:r>',
+                        f'<w:commentRangeStart w:id="{cid}"/>',
+                        f'<w:r><w:t xml:space="preserve">{t[start[1]:]}</w:t></w:r>']
+            elif i == end[0]:
+                runs = [f'<w:r><w:t xml:space="preserve">{t[:end[1]]}</w:t></w:r>',
+                        f'<w:commentRangeEnd w:id="{cid}"/>',
+                        f'<w:commentReference w:id="{cid}"/>',
+                        f'<w:r><w:t xml:space="preserve">{t[end[1]:]}</w:t></w:r>']
+            else:
+                runs = [f'<w:r><w:t xml:space="preserve">{t}</w:t></w:r>']
+            body.append(f"<w:p>{''.join(runs)}</w:p>")
+        document = (f'<?xml version="1.0"?><w:document xmlns:w="{WORDML}">'
+                    f"<w:body>{''.join(body)}</w:body></w:document>")
+        centries = "".join(
+            f'<w:comment w:id="{c}" w:author="{a}" w:date="{d}">'
+            f"<w:p><w:r><w:t>c</w:t></w:r></w:p></w:comment>"
+            for c, a, d in comments)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("word/document.xml", document)
+            z.writestr(
+                "word/comments.xml",
+                f'<?xml version="1.0"?><w:comments xmlns:w="{WORDML}">'
+                f"{centries}</w:comments>")
+        return buf.getvalue()
+    return build
+
+
 class MutatingDocsStub(DocsStub):
     """DocsStub whose document actually changes when replaceAllText lands.
 
@@ -2039,6 +2081,65 @@ def test_clean_doc_patch_skips_a_noop(engine, monkeypatch, tmp_path, capsys):
 
     engine.patch_doc("doc1", str(ops))
     assert docs.batches == []
+
+
+# ---------------------------------------------------------------------------
+# r10 (#45): a comment selected across a paragraph break
+# ---------------------------------------------------------------------------
+
+CROSS_TEXTS = ["Заголовок", "Подзаголовок", "Прочий текст"]
+
+
+def _crossing_case(engine, monkeypatch):
+    """A doc whose only comment is dragged from «Заголовок» into
+    «Подзаголовок» — what an editor produces by dragging the selection down
+    without thinking."""
+    docs = DocsStub(make_doc(CROSS_TEXTS))
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        _crossing_docx(docs, CROSS_TEXTS, "0", (0, 0), (1, len("Подзаголовок")),
+                       [("0", "A", CREATED_SEC)]))
+    wire(engine, monkeypatch, docs, drive)
+    return docs
+
+
+def test_a_crossing_comment_no_longer_freezes_the_document(engine, monkeypatch,
+                                                           tmp_path, capsys):
+    """#45: the refusal had no coordinates to confine it, so ONE comment
+    selected across a break disabled every replace in the document. The
+    accounting also demanded exactly one span per comments.xml record and got
+    zero, which was a second global refusal on top."""
+    docs = _crossing_case(engine, monkeypatch)
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "replace_quote", "quote": "Прочий текст", "with": "Другой"},
+    ]), encoding="utf-8")
+
+    engine.patch_doc("doc1", str(ops))
+    out = json.loads(capsys.readouterr().out)
+    assert out["ops_applied"] == 1
+    assert any("replaceAllText" in rq for b in docs.batches for rq in b)
+
+
+def test_a_replace_covering_a_crossing_anchor_is_still_refused(engine,
+                                                              monkeypatch,
+                                                              tmp_path,
+                                                              capsys):
+    """Placement is not permission: full coverage still ghosts the thread
+    (C1), and the rewrite path cannot save this one — `replaceAllText` does
+    not match across a paragraph break."""
+    _crossing_case(engine, monkeypatch)
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "replace_quote", "quote": "Заголовок\nПодзаголовок",
+         "with": "Совсем другое"},
+    ]), encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc:
+        engine.patch_doc("doc1", str(ops))
+    assert exc.value.code == 3
+    out = json.loads(capsys.readouterr().out)
+    assert "накрывает целиком последний якорь" in out["refused"][0]["error"]
 
 
 # ---------------------------------------------------------------------------
