@@ -2365,10 +2365,13 @@ def test_an_op_made_unique_by_its_predecessor_goes_through(engine, monkeypatch,
     texts = [el["paragraph"]["elements"][0]["textRun"]["content"][:-1]
              for el in docs.base["body"]["content"] if "paragraph" in el]
     assert texts == ["Один Копия", "Два Финал", "Три"]
-    # and the receipt does not pretend the overlap check covered it
-    note = [n for n in out["op_notes"] if n.get("applied_as") == "deferred"]
-    assert len(note) == 1
-    assert "в проверке пересечений" in note[0]["note"]
+    # and the receipt does not pretend the overlap check covered it — in the
+    # operation's OWN note, not a second entry that would read as a second
+    # operation
+    notes = [n for n in out["op_notes"] if "deferred" in n]
+    assert len(notes) == 1
+    assert len(out["op_notes"]) == 1
+    assert "в проверке пересечений" in notes[0]["deferred"]
 
 
 def test_patch_refuses_one_op_and_applies_the_rest(engine, monkeypatch,

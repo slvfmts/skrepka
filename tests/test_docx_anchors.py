@@ -573,3 +573,32 @@ def test_a_crossing_anchor_whose_far_end_is_unclean_fails_closed(engine,
             '<w:commentRangeEnd w:id="5"/></w:p>')
     _spans, problems, _c = engine._parse_docx_anchor_spans(make_docx(body))
     assert any("unsupported elements" in p for p in problems)
+
+
+def test_a_soft_break_does_not_hide_an_opaque_paragraph(engine, make_docx):
+    """The API spells a soft line break `\\v`, the export writes `\\n` (#27),
+    so a chip paragraph carrying one used to fit nothing and stop counting as
+    a possible home for the anchor. Raised in review as the concrete path
+    where matching known fragments could miss a real opaque end.
+
+    It cannot be a fail-open even without this: a readable twin would have to
+    match a text containing `\\n`, and no API paragraph ever does — `\\n` is
+    what ends a paragraph. So the document is refused either way and what the
+    normalization buys is the refusal saying the true reason instead of
+    «matched 0 times». Whoever fixes #27 has to re-read this."""
+    assert engine._pieces_fit(["До\vПосле"], "До\nПосле") is True
+
+    body = ('<w:p><w:commentRangeStart w:id="5"/>'
+            '<w:r><w:t>од</w:t><w:br/><w:t>ин</w:t></w:r></w:p>'
+            '<w:p><w:r><w:t>два</w:t></w:r>'
+            '<w:commentRangeEnd w:id="5"/></w:p>')
+    spans, problems, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    assert problems == []
+    assert spans[0]["para_text"] == "од\nин"
+    # the only paragraph that could hold the anchor's start is unreadable, and
+    # its readable half carries the soft break
+    tab = _tab([["од\vин", {"person": {}}], ["два"]])
+    ranges, mproblems, _amb = engine._map_anchors_to_doc(tab, spans)
+    assert ranges == []
+    assert any("cannot read" in p for p in mproblems)
+    assert not any("matched 0 times" in p for p in mproblems)

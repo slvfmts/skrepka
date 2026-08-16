@@ -1753,9 +1753,21 @@ def _pieces_fit(pieces, text):
 
     Piecewise, not as one substring: a paragraph «До ИТОГО После» with a chip
     in the middle arrives as fragments split around the part we cannot read.
+
+    A soft line break is spelled `\\v` by the API and `\\n` by the export
+    (#27), so a fragment carrying one would otherwise fit nothing and an
+    unreadable paragraph holding a soft break would stop counting as a
+    possible home for an anchor. That is not a fail-open — a readable twin
+    would have to match a text containing `\\n`, and no API paragraph ever
+    does, so the document is refused either way — but it made the refusal name
+    the wrong reason. Normalizing here does NOT touch the exact-match proof in
+    `_map_anchors_to_doc`: that one runs on `by_text`, over readable
+    paragraphs, and still sees zero matches for a soft break. Whoever fixes
+    #27 has to re-read both.
     """
     pos = 0
     for piece in pieces:
+        piece = piece.replace("\v", "\n")
         if not piece:
             continue
         at = text.find(piece, pos)
@@ -2115,8 +2127,13 @@ def _ghost_verdict(c, records, doc_tab, file_id=None):
     created = _rfc3339_epoch(c.get("createdTime"))
     if created is None:
         return None
-    later = [r for r in records
-             if (_rfc3339_epoch(r.get("date_sec")) or 0) > created]
+    later = []
+    for r in records:
+        stamp = _rfc3339_epoch(r.get("date_sec"))
+        # `is not None`, not `or 0`: a record whose date cannot be read must
+        # be visibly not-later, not silently zero (found in review)
+        if stamp is not None and stamp > created:
+            later.append(r)
     if not later:
         return None
     quote = (c.get("quotedFileContent") or {}).get("value")
@@ -4043,22 +4060,24 @@ def patch_doc(file_id, ops_path, tab_id=None):
             finally:
                 _RAISE_ERRORS = False
             applied.append(_op_source_label(op, resolved[i]))
-            if note:
-                op_notes.append(note)
             if i in deferred:
                 # It resolved against the live document even though it did not
                 # resolve against the planning snapshot — the ops before it
                 # made its target unambiguous. That is legitimate and it is
                 # also the one case where the overlap check never saw this
                 # operation, so the receipt says so instead of implying a
-                # guarantee that was not made (#36).
-                op_notes.append({
-                    "source": _op_source_label(op, resolved[i]),
-                    "applied_as": "deferred",
-                    "note": ("на исходном снимке цель не разрешалась "
-                             f"({deferred[i]}); операция разрешена по живому "
-                             "документу и в проверке пересечений с другими "
-                             "правками не участвовала")})
+                # guarantee that was not made (#36). Merged into this op's own
+                # note, never appended as a second one: two receipt entries
+                # for one operation read as two operations.
+                note = dict(note or
+                            {"source": _op_source_label(op, resolved[i])})
+                note["deferred"] = (
+                    "на исходном снимке цель не разрешалась "
+                    f"({deferred[i]}); операция разрешена по живому документу "
+                    "и в проверке пересечений с другими правками не "
+                    "участвовала")
+            if note:
+                op_notes.append(note)
             continue
         except PatchOpError as e:
             reason, state = str(e), e.state
