@@ -3079,3 +3079,54 @@ def test_the_archive_says_one_of_n_places_not_here(engine, tmp_path):
     entry = json.loads(open(path, encoding="utf-8").read())["threads"][0]
     assert entry["probably_in_an_edited_paragraph"] is True
     assert "встречается в документе 2 раз" in entry["where"]
+
+
+def test_the_rewrite_refuses_an_unmeasured_tail_character(engine):
+    """The one deletion this batch makes lands on the last character, and what
+    Google does with a surrogate pair or a combining mark there is not
+    measured — M13 covered a plain BMP letter. The geometry says it should not
+    matter; «should» is not a measurement, and this is the only place in
+    `patch` that deletes anything (#47)."""
+    for tail in ("💡", "́"):
+        kw = _rewrite_case(engine, text="Здесь старый текст" + tail,
+                           new="Совсем иная фраза", closed_present=True)
+        assert engine._rewrite_anchor_requests(**kw) is None, tail
+        # …and without a closed thread there is no doubt to be careful about:
+        # the live anchor holds the new text by then and cannot collapse
+        kw.pop("closed_present")
+        assert engine._rewrite_anchor_requests(**kw) is not None, tail
+    assert engine._rewrite_anchor_requests(**_rewrite_case(engine)) is not None
+
+
+def test_the_refusal_names_the_real_reason_the_rewrite_did_not_fire(engine):
+    """`_rewrite_anchor_requests` answers None to half a dozen questions, and
+    the refusal used to give the same advice for all of them — «leave part of
+    the original anchor text alone», which is sound for exactly one and
+    misleading for the rest (#24 all over again)."""
+    kw = _rewrite_case(engine)
+    base = dict(doc_tab=kw["doc_tab"], search_text=kw["search_text"],
+                new_text=kw["new_text"], start=kw["start"], end=kw["end"],
+                anchors=kw["anchors"], attribution=kw["attribution"],
+                named_intervals=[])
+
+    toc = dict(base)
+    toc["doc_tab"] = {"body": {"content": list(
+        kw["doc_tab"]["body"]["content"]) + [{"tableOfContents": {}}]}}
+    assert "оглавление" in engine._why_no_rewrite(**toc)
+
+    named = dict(base)
+    named["named_intervals"] = [(kw["start"], kw["end"], "метка mark1")]
+    assert "метка mark1" in engine._why_no_rewrite(**named)
+
+    crossing = dict(base)
+    crossing["search_text"] = "первый\nвторой"
+    assert "несколько абзацев" in engine._why_no_rewrite(**crossing)
+
+    neighbour = dict(base)
+    neighbour["anchors"] = list(kw["anchors"]) + [
+        (kw["start"], kw["end"], "x", "9")]
+    assert "ещё один комментарий" in engine._why_no_rewrite(**neighbour)
+
+    # nothing structural in the way: the original sentence, which is the one
+    # that is true then
+    assert "ИСХОДНЫЙ символ якоря" in engine._why_no_rewrite(**base)

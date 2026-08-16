@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 
 from google.auth.transport.requests import Request
@@ -3352,7 +3353,8 @@ def _distinct_anchor_ranges(spans):
 
 
 def _rewrite_anchor_requests(doc_tab, search_text, new_text, start, end,
-                             anchors, attribution, named_intervals):
+                             anchors, attribution, named_intervals,
+                             closed_present=False):
     """Requests that rewrite a fully-covered anchor without ghosting it.
 
     A person does this by hand: type the new text INSIDE the comment's
@@ -3445,6 +3447,19 @@ def _rewrite_anchor_requests(doc_tab, search_text, new_text, start, end,
         return None
     head, tail = search_text[:-1], search_text[-1]
     tail_len = _utf16_len(tail)
+    if closed_present and (tail_len > 1 or unicodedata.combining(tail)):
+        # The one deletion this batch makes lands on this character. For the
+        # LIVE thread nothing here is at risk whatever the character is — its
+        # anchor holds `new_text` by then and never collapses to zero. The
+        # doubt is only about a CLOSED thread whose invisible anchor might be
+        # exactly this character: M13 measured that case on a plain BMP
+        # letter, not on a surrogate pair or a combining mark. The geometry
+        # says the class cannot matter (a whole code point goes, never half of
+        # one), but «cannot matter» is not a measurement (#47).
+        #
+        # Hence the narrow shape: no closed threads in the document, no doubt,
+        # and an emoji at the end of a commented phrase keeps working.
+        return None
 
     # Project the document as it will read between request 1 and request 2 and
     # verify there that the search string is unique AND lands where we think.
@@ -3479,6 +3494,59 @@ def _rewrite_anchor_requests(doc_tab, search_text, new_text, start, end,
             "endIndex": start + _utf16_len(new_text) + tail_len}}},
     ]
     return requests, tail_len
+
+
+def _why_no_rewrite(doc_tab, search_text, new_text, start, end, anchors,
+                    attribution, named_intervals, closed_present=False):
+    """Why the whole-fragment rewrite did not fire, in words for a person.
+
+    `_rewrite_anchor_requests` answers None to half a dozen different
+    questions, and the refusal used to give the same advice — «leave part of
+    the original anchor text alone» — for all of them. That advice is sound
+    for exactly one of the reasons and misleading for the rest: it sends the
+    person to rewrite their edit when what is in the way is a table of
+    contents, a named range or a neighbour's comment (#24 all over again).
+
+    Cheap re-checks in the order that matters, most specific first. Not a
+    second implementation of the preconditions — only the ones a person can
+    act on; anything else falls through to the original sentence, which is
+    the one that is true when nothing structural is in the way.
+    """
+    if "\n" in search_text:
+        return ("Этот фрагмент занимает несколько абзацев, а переписать "
+                "целиком skrepka умеет только фрагмент внутри одного. "
+                "Правьте абзацы по отдельности.")
+    if any("tableOfContents" in el for el in
+           (doc_tab.get("body", {}) or {}).get("content", [])):
+        return ("В документе есть оглавление, а его текст skrepka не читает — "
+                "поэтому переписать прокомментированный фрагмент целиком она "
+                "здесь не берётся. Правьте этот фрагмент в интерфейсе.")
+    for ns, ne, label in named_intervals:
+        if _ranges_overlap(start, end, ns, ne):
+            return (f"На этом фрагменте стоит {label} — перезапись задела бы "
+                    f"машинную пометку. Снимите её или правьте фрагмент в "
+                    f"интерфейсе.")
+    doomed = _doomed_threads(start, end, anchors, attribution)
+    doomed_cid = doomed[0][0] if len(doomed) == 1 else None
+    for as_, ae, _t, aid in anchors:
+        if not _ranges_overlap(start, end, as_, ae):
+            continue
+        if doomed_cid is not None and attribution.get(aid) == doomed_cid:
+            continue
+        return ("На этом же фрагменте есть ещё один комментарий, и переписать "
+                "его целиком, не задев соседний, нельзя. Правьте фрагмент в "
+                "интерфейсе.")
+    if closed_present and len(search_text) >= 2:
+        tail = search_text[-1]
+        if _utf16_len(tail) > 1 or unicodedata.combining(tail):
+            return ("Фрагмент кончается эмодзи или знаком ударения, а в "
+                    "документе есть закрытые треды — что делает Google с "
+                    "таким символом при перезаписи, мы не мерили и гадать не "
+                    "будем. Правьте фрагмент в интерфейсе или поменяйте "
+                    "границу выделения.")
+    return ("Уцелеть должен ИСХОДНЫЙ символ якоря — повтор того же текста в "
+            "замене не помогает. Оставьте в замене часть исходного якорного "
+            "текста нетронутой или правьте этот фрагмент в интерфейсе.")
 
 
 def _execute_anchor_rewrite(docs_service, file_id, tid, requests, revision_id,
@@ -3735,7 +3803,8 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
             # means the refusal below stands exactly as before.
             rewrite = _rewrite_anchor_requests(
                 doc_tab, search_text, r["text"], start_at, end_at,
-                snap["anchors"], attribution, named_intervals)
+                snap["anchors"], attribution, named_intervals,
+                closed_present=any(c.get("resolved") for c in anchored_now))
             if rewrite:
                 doomed = []
         if style_problem:
@@ -3761,14 +3830,13 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
             # destructive path (#24).
             # A closed thread used to be the usual answer here and no longer
             # is: the gate it held is gone (M13). What remains are the
-            # rewrite's own preconditions — a table of contents in the tab, a
-            # named range in the way, a neighbour's anchor, a line break in
-            # the replacement.
-            why = (
-                " Уцелеть должен ИСХОДНЫЙ символ якоря — повтор того же "
-                "текста в замене не помогает. Оставьте в замене часть "
-                "исходного якорного текста нетронутой или правьте этот "
-                "фрагмент в интерфейсе.")
+            # rewrite's own preconditions, and they need telling apart —
+            # «оставьте часть исходного текста» is sound advice for exactly
+            # one of them and misleading for the rest (found in review).
+            why = " " + _why_no_rewrite(
+                doc_tab, search_text, r["text"], start_at, end_at,
+                snap["anchors"], attribution, named_intervals,
+                closed_present=any(c.get("resolved") for c in anchored_now))
             _error(_canary_msg(
                 f"замена накрывает целиком последний якорь {who} "
                 f"(текст якоря «{atext[:60]}») — тред станет призраком (C1), "
