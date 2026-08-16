@@ -1233,6 +1233,25 @@ def list_comments(file_id, output=None):
     except HttpError as e:
         _error(f"failed to fetch comments: {e.reason if hasattr(e, 'reason') else e}")
 
+    # Drive omits a boolean holding its default value, so `resolved` is
+    # present on one listing and gone from the next — measured live 2026-08-09,
+    # where the second call returned open threads without the key at all and
+    # every consumer reading c["resolved"] died on KeyError (#41). Which fields
+    # Google feels like omitting is not the caller's problem to know.
+    unspecified = 0
+    for c in comments:
+        c["resolved"] = bool(c.get("resolved"))
+        for entry in [c] + list(c.get("replies") or []):
+            author = entry.get("author")
+            if isinstance(author, dict) and "me" not in author:
+                # Absent means «Google did not say», not «somebody else» — and
+                # the whole «отвечай только на мои комментарии» capability
+                # stands on this field. It is normalized so nothing crashes,
+                # and the count is reported so a scoped request can be checked
+                # against a number instead of being silently narrowed to zero.
+                author["me"] = False
+                unspecified += 1
+
     # a link that opens the document with this thread expanded (#20): naming
     # a thread by id left the person to find it by eye
     for c in comments:
@@ -1240,15 +1259,17 @@ def list_comments(file_id, output=None):
         if link:
             c["link"] = link
 
-    _emit_json(comments, output=output,
-               summary={"comments": len(comments),
-                        "unresolved": sum(1 for c in comments
-                                          if not c.get("resolved")),
-                        # so a scoped request («отработай мои комментарии»)
-                        # can be checked against a number, not against a
-                        # display name the agent had to guess
-                        "mine": sum(1 for c in comments
-                                    if (c.get("author") or {}).get("me"))})
+    summary = {"comments": len(comments),
+               "unresolved": sum(1 for c in comments
+                                 if not c.get("resolved")),
+               # so a scoped request («отработай мои комментарии») can be
+               # checked against a number, not against a display name the
+               # agent had to guess
+               "mine": sum(1 for c in comments
+                           if (c.get("author") or {}).get("me"))}
+    if unspecified:
+        summary["authorship_unspecified"] = unspecified
+    _emit_json(comments, output=output, summary=summary)
 
 
 # ---------------------------------------------------------------------------
@@ -2771,17 +2792,47 @@ def _refuse_on_suggestion_range(doc_tab, start, end, source):
                 f"Docs. Остальной документ правится. ({source})")
 
 
-def _check_ops_overlap(resolved):
-    sorted_for_check = sorted(resolved, key=lambda r: (r["affect_start"], r["affect_end"]))
-    for i in range(len(sorted_for_check) - 1):
-        a = sorted_for_check[i]
-        b = sorted_for_check[i + 1]
+def _ops_overlap_conflicts(indexed):
+    """Which ops in this file fight over the same text: {op index -> why}.
+
+    `indexed` is {index: resolved op}. Both members of a conflicting pair are
+    reported, because applying either one moves the other's target — there is
+    no «first one wins» here, only an ambiguity the caller has to split.
+
+    This used to `_error` and take the whole file down. Nothing has been
+    written at this point, and the ops that do not overlap anything are
+    unaffected by the ambiguity, so refusing them too was pure loss (#36).
+    """
+    conflicts = {}
+    order = sorted(indexed, key=lambda i: (indexed[i]["affect_start"],
+                                           indexed[i]["affect_end"]))
+    for pos in range(len(order) - 1):
+        i, j = order[pos], order[pos + 1]
+        a, b = indexed[i], indexed[j]
         if _ranges_overlap(a["affect_start"], a["affect_end"],
                            b["affect_start"], b["affect_end"]):
-            _error(
-                f"ops overlap: {a['source']} and {b['source']} — "
-                f"split into separate patches"
-            )
+            why = (f"ops overlap: {a['source']} and {b['source']} — "
+                   f"split into separate patches")
+            conflicts[i] = why
+            conflicts[j] = why
+    return conflicts
+
+
+def _op_source_label(op, resolved=None):
+    """How an operation is named in a receipt, resolved or not.
+
+    A deferred op has no resolved record to take `source` from, and it still
+    has to be nameable: «which of my ten edits is this» is the first thing a
+    person asks of a refusal.
+    """
+    if resolved:
+        return resolved["source"]
+    if isinstance(op, dict):
+        if "range" in op:
+            return f"range={op['range']!r}"
+        if "quote" in op:
+            return f"quote={op['quote']!r}"
+    return json.dumps(op, ensure_ascii=False)[:80]
 
 
 def _common_affixes(a, b):
@@ -3570,30 +3621,62 @@ def patch_doc(file_id, ops_path, tab_id=None):
 
     # Resolve every op against the current snapshot (validates targets early
     # for both paths) and classify what each one actually does.
-    resolved = [_resolve_op(op, doc_tab, tid) for op in ops]
-    insertions = [_op_pure_insertion(op, doc_tab, r)
-                  for op, r in zip(ops, resolved)]
-    noops = [_op_is_noop(op, doc_tab, r) for op, r in zip(ops, resolved)]
+    #
+    # Per-op refusal used to live only INSIDE the apply loop, so everything
+    # rejected earlier still took the whole file down with it: one non-unique
+    # quote cost the person 36 correct edits in a live session (#36). Nothing
+    # here writes anything, so a failure here is never a reason to throw away
+    # the operations it has no relation to.
+    global _RAISE_ERRORS
+    resolved, insertions, noops = [], [], []
+    deferred, early_refusals = {}, {}
+    _RAISE_ERRORS = True
+    try:
+        for i, op in enumerate(ops):
+            try:
+                r = _resolve_op(op, doc_tab, tid)
+                ins = _op_pure_insertion(op, doc_tab, r)
+                noop = _op_is_noop(op, doc_tab, r)
+            except PatchOpError as e:
+                resolved.append(None)
+                insertions.append(None)
+                noops.append(False)
+                deferred[i] = str(e)
+                continue
+            resolved.append(r)
+            insertions.append(ins)
+            noops.append(noop)
+    finally:
+        _RAISE_ERRORS = False
 
     # Ambiguous batches are rejected — but an op that writes nothing occupies
     # nothing, and used to veto a perfectly compatible neighbour purely by
-    # holding a range (found in review).
-    _check_ops_overlap([r for r, noop in zip(resolved, noops) if not noop])
+    # holding a range (found in review). Both members of an overlapping pair
+    # are refused: applying either one moves the other's target.
+    early_refusals.update(_ops_overlap_conflicts(
+        {i: r for i, r in enumerate(resolved) if r and not noops[i]}))
 
     # Suggestions are judged by position, not by their existence anywhere in
     # the tab (r8, after the export was measured). An op that removes nothing
     # is checked as a point; a replace is checked as a range.
-    for r, ins, noop in zip(resolved, insertions, noops):
-        if noop:
-            continue  # writes nothing at all
-        if r["kind"] == "insert" or ins:
-            point = r["start"]
-            if ins and ins[0] == "after":
-                point = r["end"]
-            _refuse_on_suggestion_at(doc_tab, point, r["source"])
-        else:
-            _refuse_on_suggestion_range(doc_tab, r["start"], r["end"],
-                                        r["source"])
+    _RAISE_ERRORS = True
+    try:
+        for i, (r, ins, noop) in enumerate(zip(resolved, insertions, noops)):
+            if r is None or noop or i in early_refusals:
+                continue  # unresolved, writes nothing at all, or already out
+            try:
+                if r["kind"] == "insert" or ins:
+                    point = r["start"]
+                    if ins and ins[0] == "after":
+                        point = r["end"]
+                    _refuse_on_suggestion_at(doc_tab, point, r["source"])
+                else:
+                    _refuse_on_suggestion_range(doc_tab, r["start"], r["end"],
+                                                r["source"])
+            except PatchOpError as e:
+                early_refusals[i] = str(e)
+    finally:
+        _RAISE_ERRORS = False
 
     _all, anchored, _, _ = _census_comments(drive_service, file_id)
 
@@ -3607,7 +3690,13 @@ def patch_doc(file_id, ops_path, tab_id=None):
                 "an anchored comment appeared while preparing the patch; "
                 "re-run — the doc now requires the anchor-safe strategy"
             )
-        ordered = sorted(range(len(resolved)),
+        # A deferred op cannot be rescued here: this path writes ONE atomic
+        # batch against the planning snapshot, with no live re-read to resolve
+        # it against later. It joins the refusals, and the batch carries the
+        # rest.
+        skipped = dict(deferred)
+        skipped.update(early_refusals)
+        ordered = sorted((i for i in range(len(resolved)) if i not in skipped),
                          key=lambda i: resolved[i]["affect_start"],
                          reverse=True)
         requests = []
@@ -3655,21 +3744,33 @@ def patch_doc(file_id, ops_path, tab_id=None):
                     f"batchUpdate failed (possibly revision conflict): {reason}. "
                     f"Re-read the doc and retry."
                 )
-        print(json.dumps({
-            "action": "patched",
+        result = {
+            "action": "patched" if not skipped else "partially-patched",
             "strategy": "index-atomic",
             "doc_id": file_id,
             "tab_id": tid,
-            "ops_applied": len(resolved),
+            "ops_applied": len(resolved) - len(skipped),
             "revision_id_before": revision_id,
-        }, ensure_ascii=False))
+        }
+        if skipped:
+            result["refused"] = [
+                {"op": i, "source": _op_source_label(ops[i], resolved[i]),
+                 "error": skipped[i]} for i in sorted(skipped)]
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            sys.exit(3)
+        print(json.dumps(result, ensure_ascii=False))
         return
 
     # ---- commented-doc path: per-op pinned batches ----
     # Replaces are protected per-op by W8 export-based anchor mapping
     # (full-anchor coverage refused; partial overlap allowed). Inserts are
     # gated by C5.
-    has_insert = any(r["kind"] == "insert" for r in resolved)
+    # A deferred op has no resolved record, so its kind is read from the op
+    # itself — the gate must not go blind just because a target did not
+    # resolve on the planning snapshot.
+    has_insert = any(r["kind"] == "insert" if r else
+                     str(ops[i].get("op", "")).startswith("insert")
+                     for i, r in enumerate(resolved))
     if has_insert and C5_INSERT_NEAR_ANCHOR_SAFE is not True:
         state = "unverified" if C5_INSERT_NEAR_ANCHOR_SAFE is None else "verified UNSAFE"
         _error(
@@ -3679,10 +3780,16 @@ def patch_doc(file_id, ops_path, tab_id=None):
             f"C5_INSERT_NEAR_ANCHOR_SAFE, or edit in the UI."
         )
 
-    global _RAISE_ERRORS
     applied, op_notes, refused = [], [], []
     failed_at, failure, app_state = None, None, None
     for i, op in enumerate(ops):
+        if i in early_refusals:
+            # rejected by a gate that judged it on the planning snapshot and
+            # will judge it the same way on any other — no reason to send it
+            refused.append({"op": i,
+                            "source": _op_source_label(op, resolved[i]),
+                            "error": early_refusals[i]})
+            continue
         try:
             _RAISE_ERRORS = True  # nested preflight errors must not exit
             try:
@@ -3690,9 +3797,23 @@ def patch_doc(file_id, ops_path, tab_id=None):
                                              file_id, op, tab_id)
             finally:
                 _RAISE_ERRORS = False
-            applied.append(resolved[i]["source"])
+            applied.append(_op_source_label(op, resolved[i]))
             if note:
                 op_notes.append(note)
+            if i in deferred:
+                # It resolved against the live document even though it did not
+                # resolve against the planning snapshot — the ops before it
+                # made its target unambiguous. That is legitimate and it is
+                # also the one case where the overlap check never saw this
+                # operation, so the receipt says so instead of implying a
+                # guarantee that was not made (#36).
+                op_notes.append({
+                    "source": _op_source_label(op, resolved[i]),
+                    "applied_as": "deferred",
+                    "note": ("на исходном снимке цель не разрешалась "
+                             f"({deferred[i]}); операция разрешена по живому "
+                             "документу и в проверке пересечений с другими "
+                             "правками не участвовала")})
             continue
         except PatchOpError as e:
             reason, state = str(e), e.state
@@ -3708,7 +3829,8 @@ def patch_doc(file_id, ops_path, tab_id=None):
             # do not overlap (checked above), so the rest are independent of
             # it. Refusing THIS operation must not cost the person the other
             # nine (r8): the refusal is collected and the loop goes on.
-            refused.append({"op": i, "source": resolved[i]["source"],
+            refused.append({"op": i,
+                            "source": _op_source_label(op, resolved[i]),
                             "error": reason})
             continue
         # unknown state: what the document looks like is no longer known,
@@ -3740,7 +3862,8 @@ def patch_doc(file_id, ops_path, tab_id=None):
         result["failed_at"] = failed_at
         result["error"] = failure
         result["failed_op_state"] = app_state
-        result["remaining"] = [r["source"] for r in resolved[failed_at:]]
+        result["remaining"] = [_op_source_label(ops[j], resolved[j])
+                               for j in range(failed_at, len(ops))]
     if failed_at is not None or refused:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         sys.exit(3)

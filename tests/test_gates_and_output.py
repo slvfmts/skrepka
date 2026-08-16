@@ -457,6 +457,49 @@ def test_list_comments_carries_a_link_to_each_thread(engine, monkeypatch,
         "https://docs.google.com/document/d/doc1/edit?disco=AAABc")
 
 
+def test_list_comments_always_carries_resolved_and_authorship(engine,
+                                                              monkeypatch,
+                                                              capsys,
+                                                              tmp_path):
+    """#41: Drive omits a boolean holding its default, so `resolved` was
+    present on one listing and absent from the next — and every consumer
+    reading c["resolved"] died on KeyError. Measured live 2026-08-09."""
+    class _Req:
+        def execute(self):
+            return {"comments": [
+                # exactly what Drive returned on the second listing: no
+                # `resolved` at all, and an author object without `me`
+                {"id": "c1", "content": "x",
+                 "author": {"displayName": "Заказчик"},
+                 "replies": [{"id": "r1", "author": {"displayName": "Автор"}}]},
+                {"id": "c2", "content": "y", "resolved": True,
+                 "author": {"displayName": "Слава", "me": True}},
+            ]}
+
+    class Drive:
+        def comments(self):
+            return self
+
+        def list(self, **kw):
+            return _Req()
+
+    monkeypatch.setattr(engine, "get_creds", lambda: object())
+    monkeypatch.setattr(engine, "get_drive_service", lambda c: Drive())
+    target = tmp_path / "comments.json"
+    engine.list_comments("doc1", output=str(target))
+    receipt = json.loads(capsys.readouterr().out)
+    out = json.loads(target.read_text())
+    assert out[0]["resolved"] is False
+    assert out[1]["resolved"] is True
+    assert out[0]["author"]["me"] is False
+    assert out[0]["replies"][0]["author"]["me"] is False
+    assert out[1]["author"]["me"] is True
+    # «Google did not say» is not «somebody else»: a scoped request has to be
+    # checkable against a number instead of being silently narrowed to zero
+    assert receipt["authorship_unspecified"] == 2
+    assert receipt["mine"] == 1
+
+
 def test_thread_link_needs_both_ids(engine):
     assert engine._thread_link("doc1", None) is None
     assert engine._thread_link(None, "c1") is None

@@ -1103,6 +1103,45 @@ def _docx_builder(docs_stub, paras, comments, include_canary=True):
     return build
 
 
+class MutatingDocsStub(DocsStub):
+    """DocsStub whose document actually changes when replaceAllText lands.
+
+    The plain stub answers every read with the same snapshot. That is enough
+    for one operation and wrong for a chain, and a chain is exactly what #36
+    is about: the second operation has to see what the first one wrote.
+    """
+
+    def batchUpdate(self, documentId=None, body=None):
+        result = super().batchUpdate(documentId=documentId, body=body)
+        for rq in body["requests"]:
+            rat = rq.get("replaceAllText")
+            if not rat:
+                continue
+            old, new = rat["containsText"]["text"], rat["replaceText"]
+            texts = [el["paragraph"]["elements"][0]["textRun"]["content"][:-1]
+                     for el in self.base["body"]["content"]
+                     if "paragraph" in el]
+            self.base = make_doc([t.replace(old, new) for t in texts])
+        return result
+
+
+def _docx_tracking(docs_stub, anchors, comments):
+    """Export builder that follows the stub's CURRENT text.
+
+    `anchors` maps paragraph index -> [(cid, start_off, end_off)]. Needed
+    wherever the document changes between operations: a frozen export would
+    stop matching the API paragraphs and the mapping would fail closed for a
+    reason the test never meant to create.
+    """
+    def build():
+        texts = [el["paragraph"]["elements"][0]["textRun"]["content"][:-1]
+                 for el in docs_stub._current()["body"]["content"]
+                 if "paragraph" in el]
+        return make_docx_full(
+            [(t, anchors.get(i, [])) for i, t in enumerate(texts)], comments)
+    return build
+
+
 def _no_content_mutation(docs):
     """True when no batch contains a non-canary deleteContentRange/insert."""
     for reqs in docs.batches:
@@ -2000,6 +2039,97 @@ def test_clean_doc_patch_skips_a_noop(engine, monkeypatch, tmp_path, capsys):
 
     engine.patch_doc("doc1", str(ops))
     assert docs.batches == []
+
+
+# ---------------------------------------------------------------------------
+# r10 (#36): the validation phase must not throw the file away either
+# ---------------------------------------------------------------------------
+
+def test_an_unresolvable_op_does_not_zero_the_clean_batch(engine, monkeypatch,
+                                                          tmp_path, capsys):
+    """Live session 2026-08-09: one non-unique quote refused the whole file
+    and 36 correct edits were never written. Per-op refusal used to live only
+    inside the apply loop; everything rejected before it took the file down."""
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    drive = DriveStub([], lambda: b"")
+    wire(engine, monkeypatch, docs, drive)
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "replace_quote", "quote": "Alpha", "with": "Yankee"},
+        {"op": "replace_quote", "quote": "Такого текста нет", "with": "X"},
+        {"op": "replace_quote", "quote": "Charlie", "with": "Xray"},
+    ]), encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc:
+        engine.patch_doc("doc1", str(ops))
+    assert exc.value.code == 3
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "partially-patched"
+    assert out["ops_applied"] == 2
+    assert [r["op"] for r in out["refused"]] == [1]
+    # the refusal names the operation, and a deferred op has no resolved
+    # record to take that name from
+    assert out["refused"][0]["source"] == "quote='Такого текста нет'"
+    written = [rq["insertText"]["text"] for b in docs.batches for rq in b
+               if "insertText" in rq]
+    assert sorted(written) == ["Xray", "Yankee"]
+
+
+def test_an_overlapping_pair_is_refused_and_the_neighbour_applies(
+        engine, monkeypatch, tmp_path, capsys):
+    """Both members of the pair go: applying either one moves the other's
+    target, so there is no «first one wins». The op that overlaps nothing has
+    no part in the ambiguity and used to be refused with them."""
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    drive = DriveStub([], lambda: b"")
+    wire(engine, monkeypatch, docs, drive)
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "replace_quote", "quote": "Bravo", "with": "Zulu"},
+        {"op": "replace_quote", "quote": "rav", "with": "RAV"},
+        {"op": "replace_quote", "quote": "Alpha", "with": "Yankee"},
+    ]), encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc:
+        engine.patch_doc("doc1", str(ops))
+    assert exc.value.code == 3
+    out = json.loads(capsys.readouterr().out)
+    assert [r["op"] for r in out["refused"]] == [0, 1]
+    assert "ops overlap" in out["refused"][0]["error"]
+    written = [rq["insertText"]["text"] for b in docs.batches for rq in b
+               if "insertText" in rq]
+    assert written == ["Yankee"]
+
+
+def test_an_op_made_unique_by_its_predecessor_goes_through(engine, monkeypatch,
+                                                           tmp_path, capsys):
+    """The engine applies against the live document, the validator judged a
+    dead snapshot — so a chain where op N makes op N+1 unique was rejected
+    before anything was written. In the live session that forced one logical
+    set of edits into seven separate `patch` calls (#36)."""
+    docs = MutatingDocsStub(make_doc(["Один Дубль", "Два Дубль", "Три"]))
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        _docx_tracking(docs, {2: [("0", 0, 3)]}, [("0", "A", CREATED_SEC)]))
+    wire(engine, monkeypatch, docs, drive)
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "replace_quote", "quote": "Один Дубль", "with": "Один Копия"},
+        {"op": "replace_quote", "quote": "Дубль", "with": "Финал"},
+    ]), encoding="utf-8")
+
+    engine.patch_doc("doc1", str(ops))
+    out = json.loads(capsys.readouterr().out)
+    assert out["ops_applied"] == 2
+    texts = [el["paragraph"]["elements"][0]["textRun"]["content"][:-1]
+             for el in docs.base["body"]["content"] if "paragraph" in el]
+    assert texts == ["Один Копия", "Два Финал", "Три"]
+    # and the receipt does not pretend the overlap check covered it
+    note = [n for n in out["op_notes"] if n.get("applied_as") == "deferred"]
+    assert len(note) == 1
+    assert "в проверке пересечений" in note[0]["note"]
 
 
 def test_patch_refuses_one_op_and_applies_the_rest(engine, monkeypatch,
