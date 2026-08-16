@@ -405,6 +405,43 @@ def test_a_vanished_thread_whose_text_is_still_here_is_fenced(engine):
     assert "disco=c1" in blocked[0][2]
 
 
+def test_dates_are_compared_as_moments_not_as_strings(engine):
+    """Found in review: '2026-01-01T01:00:00+05:00' is EARLIER than
+    '2026-01-01T00:00:00-05:00' and lexicographically later. Whether a thread
+    counts as a ghost must not depend on how Google spelled the offset."""
+    assert engine._rfc3339_epoch("2026-01-01T01:00:00+05:00") < \
+        engine._rfc3339_epoch("2026-01-01T00:00:00-05:00")
+    # unreadable rather than assumed-UTC: guessing decides a ghost verdict
+    assert engine._rfc3339_epoch("2026-01-01T00:00:00") is None
+    assert engine._rfc3339_epoch("") is None
+
+    gone = api_comment("c1", "A", "2026-01-01T01:00:00+05:00")
+    gone["quotedFileContent"] = {"value": "Вариант 1"}
+    live = api_comment("c2", "B", "2026-01-01T00:00:00-05:00")
+    anchored = [gone, live]
+    _p, metrics = engine._account_anchored_comments(
+        anchored, [{"docx_id": "0", "author": "B",
+                    "date_sec": "2026-01-01T00:00:00-05:00"}],
+        _spans("0"), universe=engine._key_owners_universe(anchored),
+        doc_tab=make_doc(["ничего похожего"]))
+    assert [g["id"] for g in metrics["ghosts"]] == ["c1"]
+
+
+def test_a_vanished_thread_whose_text_hid_in_a_footnote_still_blocks(engine):
+    """The fence walks the body; `replaceAllText` reaches headers, footers and
+    footnotes too. Old text surviving out there is a place we cannot fence,
+    so the verdict is withheld (found in review)."""
+    anchored, records, universe = _vanished_case(engine, "Вариант 1")
+    tab = make_doc(["ничего похожего"])
+    tab["footnotes"] = {"f1": {"content": [
+        {"paragraph": {"elements": [
+            {"textRun": {"content": "Вариант 1\n"}}]}}]}}
+    problems, metrics = engine._account_anchored_comments(
+        anchored, records, _spans("0"), universe=universe, doc_tab=tab)
+    assert any("missing from the export" in p for p in problems)
+    assert "ghosts" not in metrics
+
+
 def test_the_newest_thread_missing_from_the_export_still_blocks(engine):
     """Nothing in the export was created after it, so the snapshot may simply
     have been cut off before it existed — there lag really is

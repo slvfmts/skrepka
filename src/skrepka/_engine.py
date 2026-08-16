@@ -2,6 +2,7 @@
 """Google Docs toolkit: upload, download, update, comments, suggestions."""
 
 import argparse
+import datetime
 import difflib
 import json
 import os
@@ -1862,6 +1863,23 @@ def _map_anchors_to_doc(doc_tab, spans):
             # the anchor's exact extent, not a conservative envelope.
             etext = s.get("end_para_text")
             end_exact = by_text.get(etext, []) if etext is not None else []
+            # Unlike the single-match branch below, opaque paragraphs ARE
+            # checked here. That branch keeps a known hole (#30) only because
+            # it must not freeze documents that work today; a crossing anchor
+            # freezes its document today anyway, so this surface is new and
+            # gets to be strict. Found in review: a chip paragraph could be
+            # the real home of either end, and placing the anchor on the
+            # readable twin leaves the live thread unprotected.
+            hosts = [st for st, _en, pieces in possible_hosts
+                     if _pieces_fit(pieces, ptext)
+                     or (etext is not None and _pieces_fit(pieces, etext))]
+            if hosts:
+                problems.append(
+                    f"anchor {s['docx_id']} spans paragraphs, and a paragraph "
+                    f"whose text skrepka cannot read (a smart chip or a rich "
+                    f"link at {hosts[:3]}) could hold one of its ends — "
+                    f"undecidable (fail closed)")
+                continue
             if not exact or not end_exact:
                 problems.append(
                     f"anchor {s['docx_id']} spans paragraphs and one of its "
@@ -2033,6 +2051,29 @@ def _comment_label(c, file_id=None):
     return f"{label} {link}" if link else label
 
 
+def _rfc3339_epoch(ts):
+    """RFC3339 timestamp → epoch seconds, or None when it cannot be read.
+
+    Comparing the strings themselves is wrong the moment two of them carry
+    different offsets: '2026-01-01T01:00:00+05:00' is EARLIER than
+    '2026-01-01T00:00:00-05:00' and lexicographically later (found in review).
+    A timestamp without an offset is unreadable rather than assumed-UTC —
+    guessing here would decide whether a thread is a ghost.
+    """
+    if not ts:
+        return None
+    text = ts.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.timestamp()
+
+
 def _ghost_verdict(c, records, doc_tab, file_id=None):
     """Is this witness-less thread provably a ghost? None when it is not.
 
@@ -2071,17 +2112,25 @@ def _ghost_verdict(c, records, doc_tab, file_id=None):
     """
     if doc_tab is None:
         return None  # nothing to check sign 2 against — fail closed
-    created = _trunc_seconds(c.get("createdTime") or "")
-    if not created:
+    created = _rfc3339_epoch(c.get("createdTime"))
+    if created is None:
         return None
-    if not any((r.get("date_sec") or "") > created for r in records):
+    later = [r for r in records
+             if (_rfc3339_epoch(r.get("date_sec")) or 0) > created]
+    if not later:
         return None
-    if not (c.get("quotedFileContent") or {}).get("value"):
+    quote = (c.get("quotedFileContent") or {}).get("value")
+    if not quote:
         return None  # sign 2 is unverifiable, so it cannot agree
+    if _count_text_outside_body(doc_tab, quote):
+        # The old text survives in a header, a footer or a footnote, where the
+        # fence cannot reach — `_text_buffer` walks the body only, while
+        # `replaceAllText` does not. Nothing to fence with, so fail closed
+        # (found in review).
+        return None
     return {"id": c.get("id"),
             "link": _thread_link(file_id, c.get("id")),
-            "quote": ((c.get("quotedFileContent") or {}).get("value")
-                      or "")[:60],
+            "quote": quote[:60],
             "fenced": _locate_comment_in_tab(doc_tab, c)}
 
 

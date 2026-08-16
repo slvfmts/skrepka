@@ -544,3 +544,32 @@ def test_the_rewrite_refuses_a_target_spanning_paragraphs(engine):
         tab, "один\nдва", "совсем другое", 1, 9,
         [(1, 9, "один\nдва", "5")], {"5": "cmt1"}, [],
         has_resolved=False) is None
+
+
+def test_a_crossing_anchor_is_refused_when_a_chip_could_be_one_of_its_ends(
+        engine, make_docx):
+    """Found in review. The single-match branch below keeps a known hole (#30)
+    because it must not freeze documents that work today; a crossing anchor
+    freezes its document today anyway, so this surface is new and gets to be
+    strict. Otherwise the anchor lands on the readable twin while the live
+    thread sits in the chip paragraph, unprotected."""
+    spans, _p1, _c = engine._parse_docx_anchor_spans(
+        make_docx(_crossing("один", "два")))
+    tab = _tab([[{"person": {}}], ["один"], ["два"]])
+    ranges, mproblems, ambiguous = engine._map_anchors_to_doc(tab, spans)
+    assert (ranges, ambiguous) == ([], [])
+    assert any("cannot read" in p and "one of its ends" in p
+               for p in mproblems)
+
+
+def test_a_crossing_anchor_whose_far_end_is_unclean_fails_closed(engine,
+                                                                 make_docx):
+    """An unsupported element in EITHER end paragraph makes the offsets
+    unreliable — the second pass has to look at both, not just the first."""
+    body = ('<w:p><w:commentRangeStart w:id="5"/>'
+            '<w:r><w:t>один</w:t></w:r></w:p>'
+            '<w:p><w:r><w:t>два</w:t></w:r><w:sdt><w:sdtContent>'
+            '<w:r><w:t>чужое</w:t></w:r></w:sdtContent></w:sdt>'
+            '<w:commentRangeEnd w:id="5"/></w:p>')
+    _spans, problems, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    assert any("unsupported elements" in p for p in problems)
