@@ -2524,6 +2524,21 @@ def _anchor_map_remedy(shown):
                 "поэтому неясно, к какой копии он относится. Различите копии "
                 "в интерфейсе Google Docs — хватит одного слова — и повторите "
                 "команду.")
+    if "missing from the export" in shown:
+        # A thread the export does not carry AND we could not prove harmless.
+        # «Переоткрыть» is nonsense for it (it was never closed), and telling
+        # the person to delete somebody's comment is not ours to say. What
+        # actually helps: it is the newest thing in the document, so nothing
+        # in the export dates later than it — one reply anywhere, or a minute
+        # of waiting, and the next run has its bearings (#34, #46).
+        return ("Комментарий, названный выше, есть в списке комментариев, но "
+                "не доехал до выгрузки документа, а более свежих записей в "
+                "ней нет — значит отличить «он потерял привязку» от «выгрузка "
+                "просто старше него» пока нечем. Ответьте в любой другой тред "
+                "или подождите минуту и повторите команду. Если этот "
+                "комментарий оставлен не через интерфейс Google Docs, он к "
+                "тексту не привязан вовсе — тогда его можно удалить, и он "
+                "перестанет мешать.")
     return ("Разрулите комментарии-призраки в UI (удалить/переоткрыть тред) "
             "или правьте документ в UI.")
 
@@ -3337,8 +3352,7 @@ def _distinct_anchor_ranges(spans):
 
 
 def _rewrite_anchor_requests(doc_tab, search_text, new_text, start, end,
-                             anchors, attribution, named_intervals,
-                             has_resolved):
+                             anchors, attribution, named_intervals):
     """Requests that rewrite a fully-covered anchor without ghosting it.
 
     A person does this by hand: type the new text INSIDE the comment's
@@ -3367,13 +3381,21 @@ def _rewrite_anchor_requests(doc_tab, search_text, new_text, start, end,
         # anchors placeable, and checked explicitly rather than left to
         # `_REWRITE_FORBIDDEN`, which only looks at the REPLACEMENT text.
         return None
-    if has_resolved:
-        # Closed threads are invisible to the export, so their anchors could
-        # be anywhere — including under the character this batch deletes, and
-        # deleteContentRange is what turns a closed thread into a ghost.
-        # `patch` never used deletion before; it is not going to start by
-        # gambling with a thread it cannot see.
-        return None
+    # There used to be a gate here: one closed thread ANYWHERE in the document
+    # switched this whole capability off (#38), because a closed thread's
+    # anchor is invisible to the export and could be under the character this
+    # batch deletes. It cost a live session the ability to rewrite a phrase
+    # after the customer closed unrelated threads at the other end of the
+    # file, and the refusal asked the editor to reopen them — technical work
+    # asked of a person, which the product frame forbids.
+    #
+    # Measured 2026-08-16 (M13, docs/FINDINGS.md), on the worst shape there
+    # is: a closed thread whose ENTIRE anchor is the character this batch
+    # deletes. It survived — still in the resolved list, conversation intact,
+    # marked by Google as «Исходный контент удален». It loses its attachment,
+    # not its words, and that is exactly what happens when a person edits the
+    # same text by hand. Everything else in the batch is `replaceAllText`,
+    # which is measured not to hurt closed threads even at full coverage.
     if any("tableOfContents" in el for el in
            (doc_tab.get("body", {}) or {}).get("content", [])):
         # The text walkers do not read a table of contents, so the local
@@ -3689,9 +3711,6 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
         # coverage ghosts a comment (C1), partial overlap is verified safe.
         # (Inserts never reach here; they cannot remove text.)
         attribution = snap.get("attribution") or {}
-        # hoisted: the refusal below has to say WHY the rewrite was off, and
-        # a closed thread is the reason an agent cannot guess (#24)
-        has_resolved = any(c.get("resolved") for c in anchored_now)
         start_at, end_at, applied_text = r["start"], r["end"], r["text"]
         hits = _blocked_hits(start_at, end_at, snap["blocked"])
         doomed = _doomed_threads(start_at, end_at, snap["anchors"], attribution)
@@ -3716,8 +3735,7 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
             # means the refusal below stands exactly as before.
             rewrite = _rewrite_anchor_requests(
                 doc_tab, search_text, r["text"], start_at, end_at,
-                snap["anchors"], attribution, named_intervals,
-                has_resolved=has_resolved)
+                snap["anchors"], attribution, named_intervals)
             if rewrite:
                 doomed = []
         if style_problem:
@@ -3741,23 +3759,12 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
             # that did not happen, the refusal must say what stopped it —
             # otherwise the agent reads «impossible» and goes looking for the
             # destructive path (#24).
-            # Was the closed thread ACTUALLY what stopped it? The rewrite has
-            # half a dozen other preconditions (a table of contents in the
-            # tab, a named range in the way, a neighbour's anchor…), and
-            # naming the wrong one sends the person to reopen threads for
-            # nothing (found in review). The check is a pure re-run.
-            blocked_by_closed = has_resolved and _rewrite_anchor_requests(
-                doc_tab, search_text, r["text"], start_at, end_at,
-                snap["anchors"], attribution, named_intervals,
-                has_resolved=False) is not None
+            # A closed thread used to be the usual answer here and no longer
+            # is: the gate it held is gone (M13). What remains are the
+            # rewrite's own preconditions — a table of contents in the tab, a
+            # named range in the way, a neighbour's anchor, a line break in
+            # the replacement.
             why = (
-                " Переписать прокомментированный фрагмент целиком, не теряя "
-                "тред, skrepka умеет — но не на этом документе: в нём есть "
-                "закрытый тред, его якорь в выгрузке не виден, а перезапись "
-                "содержит удаление и может такой якорь расцепить. Переоткройте "
-                "или удалите закрытые треды в интерфейсе, если нужна полная "
-                "перезапись фрагмента."
-                if blocked_by_closed else
                 " Уцелеть должен ИСХОДНЫЙ символ якоря — повтор того же "
                 "текста в замене не помогает. Оставьте в замене часть "
                 "исходного якорного текста нетронутой или правьте этот "

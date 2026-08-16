@@ -1531,21 +1531,24 @@ def test_patch_full_anchor_coverage_is_rewritten(engine, monkeypatch):
                                                       "endIndex": 12}
 
 
-def test_rewrite_refuses_when_a_closed_thread_is_in_the_document(
+def test_a_closed_thread_no_longer_switches_the_rewrite_off(
         engine, monkeypatch, capsys):
-    """The rewrite is the first thing in `patch` that deletes text, and a
-    closed thread's anchor is invisible — it could be exactly under the
-    character being removed. Fall back to the old refusal instead."""
+    """#38: ONE closed thread anywhere in the file used to disable rewriting a
+    commented fragment across the whole document — a live session lost the
+    ability to fix a phrase because the customer closed unrelated threads at
+    the other end, and the refusal asked the editor to reopen them.
+
+    Measured 2026-08-16 (M13) on the worst shape there is — a closed thread
+    whose ENTIRE anchor is the one character this batch deletes: it survived,
+    still in the resolved list, conversation intact, marked by Google as
+    «Исходный контент удален». It loses its attachment, not its words, which
+    is what happens when a person edits the same text by hand."""
     docs, drive = _covered_anchor_doc(engine, monkeypatch, comments=[
         api_comment("c1", "A", CREATED),
         api_comment("c2", "B", "2026-07-13T18:00:00.000Z", resolved=True)])
     op = {"op": "replace_quote", "quote": "Bravo", "with": "Zulu"}
-    with pytest.raises(SystemExit):
-        engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
-    err = json.loads(capsys.readouterr().out)["error"]
-    assert "накрывает целиком последний якорь" in err
-    # the refusal names the thread and links straight to it (#20)
-    assert "?disco=c1" in err
+    note = engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
+    assert note["applied_as"] == "rewritten"
     assert docs.canary_text is None  # cleaned up
 
 
@@ -1823,7 +1826,6 @@ def _rewrite_case(engine, text="Здесь старый текст", new="Сов
         "anchors": [(start, end, text, "0")],
         "attribution": {"0": "c1"},
         "named_intervals": [],
-        "has_resolved": False,
     }
     kw.update(over)
     return kw
@@ -2404,12 +2406,15 @@ def test_patch_refuses_one_op_and_applies_the_rest(engine, monkeypatch,
     Alpha and Charlie have nothing to do with it. Before r8 the loop broke on
     the first refusal and the other operations never ran."""
     doc = make_doc(BASE_TEXTS)
+    # a table of contents keeps the rewrite path out of this document (the
+    # text walkers do not read one, so the uniqueness count would miss a match
+    # hiding there), so covering the anchor whole is still a refusal. A closed
+    # thread used to serve that purpose and no longer does — see M13.
+    doc["body"]["content"].append({"startIndex": 100, "endIndex": 101,
+                                   "tableOfContents": {}})
     docs = DocsStub(doc)
-    # a closed thread in the document keeps the rewrite path out of it, so
-    # covering the anchor whole is still a refusal
     drive = DriveStub(
-        [api_comment("c1", "A", CREATED),
-         api_comment("c2", "B", "2026-07-13T18:00:00.000Z", resolved=True)],
+        [api_comment("c1", "A", CREATED)],
         _docx_builder(docs, [("Alpha", []), ("Bravo", [("0", 0, 5)]),
                              ("Charlie", [])],
                       [("0", "A", CREATED_SEC)]))

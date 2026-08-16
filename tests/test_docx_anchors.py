@@ -542,8 +542,7 @@ def test_the_rewrite_refuses_a_target_spanning_paragraphs(engine):
     tab = _tab([["один"], ["два"]])
     assert engine._rewrite_anchor_requests(
         tab, "один\nдва", "совсем другое", 1, 9,
-        [(1, 9, "один\nдва", "5")], {"5": "cmt1"}, [],
-        has_resolved=False) is None
+        [(1, 9, "один\nдва", "5")], {"5": "cmt1"}, []) is None
 
 
 def test_a_crossing_anchor_is_refused_when_a_chip_could_be_one_of_its_ends(
@@ -602,3 +601,15 @@ def test_a_soft_break_does_not_hide_an_opaque_paragraph(engine, make_docx):
     assert ranges == []
     assert any("cannot read" in p for p in mproblems)
     assert not any("matched 0 times" in p for p in mproblems)
+
+
+def test_the_remedy_for_a_thread_missing_from_the_export_is_doable(engine):
+    """«Переоткрыть» is nonsense for a thread that was never closed, and
+    telling the person to delete somebody's comment is not ours to say. What
+    actually unblocks it: the thread is the newest thing in the document, so
+    one reply anywhere gives the next run its bearings (#34, #46)."""
+    missing = engine._anchor_map_remedy(
+        "comment AAAB «x» https://... is missing from the export "
+        "(ghost thread or stale export — indistinguishable)")
+    assert "Ответьте в любой другой тред" in missing
+    assert "переоткр" not in missing.lower()
