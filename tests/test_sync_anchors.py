@@ -362,6 +362,137 @@ def test_accounting_deleted_reply_not_expected(engine):
     assert problems == []
 
 
+# ---------------------------------------------------------------------------
+# r10 (#34): a thread that vanished stops holding the document hostage
+# ---------------------------------------------------------------------------
+
+def _vanished_case(engine, quote):
+    """One thread missing from the export, one live thread newer than it."""
+    gone = api_comment("c1", "A", "2026-01-01T00:00:01Z")
+    gone["quotedFileContent"] = {"value": quote} if quote else {}
+    live = api_comment("c2", "B", "2026-01-01T00:00:09Z")
+    records = [{"docx_id": "0", "author": "B",
+                "date_sec": "2026-01-01T00:00:09Z"}]
+    anchored = [gone, live]
+    return anchored, records, engine._key_owners_universe(anchored)
+
+
+def test_a_vanished_thread_whose_text_is_gone_stops_blocking(engine):
+    """Living case 2026-08-09: five edits refused as one because a thread had
+    lost its anchor when the customer moved a block. Losing a comment without
+    closing it is normal practice, and a ghost has no anchor left to protect."""
+    anchored, records, universe = _vanished_case(engine, "Вариант 1")
+    problems, metrics = engine._account_anchored_comments(
+        anchored, records, _spans("0"), universe=universe, file_id="DOC",
+        doc_tab=make_doc(["Совсем другой текст"]))
+    assert problems == []
+    assert [g["id"] for g in metrics["ghosts"]] == ["c1"]
+    assert metrics["ghosts"][0]["link"].endswith("disco=c1")
+    assert engine._fence_off_ghosts(metrics["ghosts"]) == []
+
+
+def test_a_vanished_thread_whose_text_is_still_here_is_fenced(engine):
+    """The two signs disagree: the export lost it, the document still holds
+    the text it was attached to. Being wrong here must cost a local refusal,
+    not a thread — so the place is fenced and the rest stays editable."""
+    anchored, records, universe = _vanished_case(engine, "Вариант 1")
+    _p, metrics = engine._account_anchored_comments(
+        anchored, records, _spans("0"), universe=universe, file_id="DOC",
+        doc_tab=make_doc(["до", "Вариант 1", "после"]))
+    blocked = engine._fence_off_ghosts(metrics["ghosts"])
+    assert [(s, e) for s, e, _l in blocked] == [(4, 13)]
+    assert "пропал из выгрузки" in blocked[0][2]
+    assert "disco=c1" in blocked[0][2]
+
+
+def test_dates_are_compared_as_moments_not_as_strings(engine):
+    """Found in review: '2026-01-01T01:00:00+05:00' is EARLIER than
+    '2026-01-01T00:00:00-05:00' and lexicographically later. Whether a thread
+    counts as a ghost must not depend on how Google spelled the offset."""
+    assert engine._rfc3339_epoch("2026-01-01T01:00:00+05:00") < \
+        engine._rfc3339_epoch("2026-01-01T00:00:00-05:00")
+    # unreadable rather than assumed-UTC: guessing decides a ghost verdict
+    assert engine._rfc3339_epoch("2026-01-01T00:00:00") is None
+    assert engine._rfc3339_epoch("") is None
+
+    gone = api_comment("c1", "A", "2026-01-01T01:00:00+05:00")
+    gone["quotedFileContent"] = {"value": "Вариант 1"}
+    live = api_comment("c2", "B", "2026-01-01T00:00:00-05:00")
+    anchored = [gone, live]
+    _p, metrics = engine._account_anchored_comments(
+        anchored, [{"docx_id": "0", "author": "B",
+                    "date_sec": "2026-01-01T00:00:00-05:00"}],
+        _spans("0"), universe=engine._key_owners_universe(anchored),
+        doc_tab=make_doc(["ничего похожего"]))
+    assert [g["id"] for g in metrics["ghosts"]] == ["c1"]
+
+
+def test_a_vanished_thread_whose_text_hid_in_a_footnote_still_blocks(engine):
+    """The fence walks the body; `replaceAllText` reaches headers, footers and
+    footnotes too. Old text surviving out there is a place we cannot fence,
+    so the verdict is withheld (found in review)."""
+    anchored, records, universe = _vanished_case(engine, "Вариант 1")
+    tab = make_doc(["ничего похожего"])
+    tab["footnotes"] = {"f1": {"content": [
+        {"paragraph": {"elements": [
+            {"textRun": {"content": "Вариант 1\n"}}]}}]}}
+    problems, metrics = engine._account_anchored_comments(
+        anchored, records, _spans("0"), universe=universe, doc_tab=tab)
+    assert any("missing from the export" in p for p in problems)
+    assert "ghosts" not in metrics
+
+
+def test_the_newest_thread_missing_from_the_export_still_blocks(engine):
+    """Nothing in the export was created after it, so the snapshot may simply
+    have been cut off before it existed — there lag really is
+    indistinguishable from a ghost, and the refusal stands."""
+    gone = api_comment("c1", "A", "2026-01-01T00:00:09Z")
+    live = api_comment("c2", "B", "2026-01-01T00:00:01Z")
+    anchored = [gone, live]
+    problems, metrics = engine._account_anchored_comments(
+        anchored, [{"docx_id": "0", "author": "B",
+                    "date_sec": "2026-01-01T00:00:01Z"}],
+        _spans("0"), universe=engine._key_owners_universe(anchored),
+        doc_tab=make_doc(["ничего похожего"]))
+    assert any("missing from the export" in p for p in problems)
+    assert "ghosts" not in metrics
+
+
+def test_a_thread_that_never_held_text_does_not_block(engine):
+    """Measured 2026-08-16: a comment created through the API never attaches
+    to document text, yet Drive stores the `anchor` it was handed verbatim and
+    skrepka counts anything with `anchor` as anchored. Such a thread has no
+    text anchor to lose — and it used to freeze every replace in the document,
+    which is what any other tool leaving comments through the API does to a
+    document."""
+    anchored, records, universe = _vanished_case(engine, None)
+    problems, metrics = engine._account_anchored_comments(
+        anchored, records, _spans("0"), universe=universe,
+        doc_tab=make_doc(["что угодно"]))
+    assert problems == []
+    assert [g["id"] for g in metrics["ghosts"]] == ["c1"]
+    # nothing to fence with, and nothing that needs fencing
+    assert engine._fence_off_ghosts(metrics["ghosts"]) == []
+
+
+def test_a_thread_without_a_quote_still_blocks_while_the_export_may_be_old(
+        engine):
+    """Sign 1 is not waived: without a record newer than the thread, the
+    export may simply predate it, and then its absence proves nothing about
+    what the thread is."""
+    gone = api_comment("c1", "A", "2026-01-01T00:00:09Z")
+    gone["quotedFileContent"] = {}
+    live = api_comment("c2", "B", "2026-01-01T00:00:01Z")
+    anchored = [gone, live]
+    problems, metrics = engine._account_anchored_comments(
+        anchored, [{"docx_id": "0", "author": "B",
+                    "date_sec": "2026-01-01T00:00:01Z"}],
+        _spans("0"), universe=engine._key_owners_universe(anchored),
+        doc_tab=make_doc(["что угодно"]))
+    assert any("missing from the export" in p for p in problems)
+    assert "ghosts" not in metrics
+
+
 def test_accounting_resolved_absent_from_export_is_clean(engine):
     """Google omits resolved threads from the export entirely — measured on a
     live document 2026-07-30. The previous version of this test put the
@@ -1103,6 +1234,87 @@ def _docx_builder(docs_stub, paras, comments, include_canary=True):
     return build
 
 
+def _crossing_docx(docs_stub, texts, cid, start, end, comments):
+    """Export builder for ONE anchor dragged across a paragraph break.
+
+    `start` and `end` are (paragraph index, offset). `make_docx_full` keeps
+    every anchor inside a single paragraph, which is exactly the shape #45 is
+    not about.
+    """
+    def build():
+        paras = list(texts)
+        if docs_stub.canary_text is not None:
+            paras = paras + [docs_stub.canary_text]
+        body = []
+        for i, t in enumerate(paras):
+            if i == start[0]:
+                runs = [f'<w:r><w:t xml:space="preserve">{t[:start[1]]}</w:t></w:r>',
+                        f'<w:commentRangeStart w:id="{cid}"/>',
+                        f'<w:r><w:t xml:space="preserve">{t[start[1]:]}</w:t></w:r>']
+            elif i == end[0]:
+                runs = [f'<w:r><w:t xml:space="preserve">{t[:end[1]]}</w:t></w:r>',
+                        f'<w:commentRangeEnd w:id="{cid}"/>',
+                        f'<w:commentReference w:id="{cid}"/>',
+                        f'<w:r><w:t xml:space="preserve">{t[end[1]:]}</w:t></w:r>']
+            else:
+                runs = [f'<w:r><w:t xml:space="preserve">{t}</w:t></w:r>']
+            body.append(f"<w:p>{''.join(runs)}</w:p>")
+        document = (f'<?xml version="1.0"?><w:document xmlns:w="{WORDML}">'
+                    f"<w:body>{''.join(body)}</w:body></w:document>")
+        centries = "".join(
+            f'<w:comment w:id="{c}" w:author="{a}" w:date="{d}">'
+            f"<w:p><w:r><w:t>c</w:t></w:r></w:p></w:comment>"
+            for c, a, d in comments)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("word/document.xml", document)
+            z.writestr(
+                "word/comments.xml",
+                f'<?xml version="1.0"?><w:comments xmlns:w="{WORDML}">'
+                f"{centries}</w:comments>")
+        return buf.getvalue()
+    return build
+
+
+class MutatingDocsStub(DocsStub):
+    """DocsStub whose document actually changes when replaceAllText lands.
+
+    The plain stub answers every read with the same snapshot. That is enough
+    for one operation and wrong for a chain, and a chain is exactly what #36
+    is about: the second operation has to see what the first one wrote.
+    """
+
+    def batchUpdate(self, documentId=None, body=None):
+        result = super().batchUpdate(documentId=documentId, body=body)
+        for rq in body["requests"]:
+            rat = rq.get("replaceAllText")
+            if not rat:
+                continue
+            old, new = rat["containsText"]["text"], rat["replaceText"]
+            texts = [el["paragraph"]["elements"][0]["textRun"]["content"][:-1]
+                     for el in self.base["body"]["content"]
+                     if "paragraph" in el]
+            self.base = make_doc([t.replace(old, new) for t in texts])
+        return result
+
+
+def _docx_tracking(docs_stub, anchors, comments):
+    """Export builder that follows the stub's CURRENT text.
+
+    `anchors` maps paragraph index -> [(cid, start_off, end_off)]. Needed
+    wherever the document changes between operations: a frozen export would
+    stop matching the API paragraphs and the mapping would fail closed for a
+    reason the test never meant to create.
+    """
+    def build():
+        texts = [el["paragraph"]["elements"][0]["textRun"]["content"][:-1]
+                 for el in docs_stub._current()["body"]["content"]
+                 if "paragraph" in el]
+        return make_docx_full(
+            [(t, anchors.get(i, [])) for i, t in enumerate(texts)], comments)
+    return build
+
+
 def _no_content_mutation(docs):
     """True when no batch contains a non-canary deleteContentRange/insert."""
     for reqs in docs.batches:
@@ -1319,21 +1531,24 @@ def test_patch_full_anchor_coverage_is_rewritten(engine, monkeypatch):
                                                       "endIndex": 12}
 
 
-def test_rewrite_refuses_when_a_closed_thread_is_in_the_document(
+def test_a_closed_thread_no_longer_switches_the_rewrite_off(
         engine, monkeypatch, capsys):
-    """The rewrite is the first thing in `patch` that deletes text, and a
-    closed thread's anchor is invisible — it could be exactly under the
-    character being removed. Fall back to the old refusal instead."""
+    """#38: ONE closed thread anywhere in the file used to disable rewriting a
+    commented fragment across the whole document — a live session lost the
+    ability to fix a phrase because the customer closed unrelated threads at
+    the other end, and the refusal asked the editor to reopen them.
+
+    Measured 2026-08-16 (M13) on the worst shape there is — a closed thread
+    whose ENTIRE anchor is the one character this batch deletes: it survived,
+    still in the resolved list, conversation intact, marked by Google as
+    «Исходный контент удален». It loses its attachment, not its words, which
+    is what happens when a person edits the same text by hand."""
     docs, drive = _covered_anchor_doc(engine, monkeypatch, comments=[
         api_comment("c1", "A", CREATED),
         api_comment("c2", "B", "2026-07-13T18:00:00.000Z", resolved=True)])
     op = {"op": "replace_quote", "quote": "Bravo", "with": "Zulu"}
-    with pytest.raises(SystemExit):
-        engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
-    err = json.loads(capsys.readouterr().out)["error"]
-    assert "накрывает целиком последний якорь" in err
-    # the refusal names the thread and links straight to it (#20)
-    assert "?disco=c1" in err
+    note = engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
+    assert note["applied_as"] == "rewritten"
     assert docs.canary_text is None  # cleaned up
 
 
@@ -1611,7 +1826,6 @@ def _rewrite_case(engine, text="Здесь старый текст", new="Сов
         "anchors": [(start, end, text, "0")],
         "attribution": {"0": "c1"},
         "named_intervals": [],
-        "has_resolved": False,
     }
     kw.update(over)
     return kw
@@ -2002,18 +2216,205 @@ def test_clean_doc_patch_skips_a_noop(engine, monkeypatch, tmp_path, capsys):
     assert docs.batches == []
 
 
+# ---------------------------------------------------------------------------
+# r10 (#45): a comment selected across a paragraph break
+# ---------------------------------------------------------------------------
+
+CROSS_TEXTS = ["Заголовок", "Подзаголовок", "Прочий текст"]
+
+
+def _crossing_case(engine, monkeypatch):
+    """A doc whose only comment is dragged from «Заголовок» into
+    «Подзаголовок» — what an editor produces by dragging the selection down
+    without thinking."""
+    docs = DocsStub(make_doc(CROSS_TEXTS))
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        _crossing_docx(docs, CROSS_TEXTS, "0", (0, 0), (1, len("Подзаголовок")),
+                       [("0", "A", CREATED_SEC)]))
+    wire(engine, monkeypatch, docs, drive)
+    return docs
+
+
+def test_a_crossing_comment_no_longer_freezes_the_document(engine, monkeypatch,
+                                                           tmp_path, capsys):
+    """#45: the refusal had no coordinates to confine it, so ONE comment
+    selected across a break disabled every replace in the document. The
+    accounting also demanded exactly one span per comments.xml record and got
+    zero, which was a second global refusal on top."""
+    docs = _crossing_case(engine, monkeypatch)
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "replace_quote", "quote": "Прочий текст", "with": "Другой"},
+    ]), encoding="utf-8")
+
+    engine.patch_doc("doc1", str(ops))
+    out = json.loads(capsys.readouterr().out)
+    assert out["ops_applied"] == 1
+    assert any("replaceAllText" in rq for b in docs.batches for rq in b)
+
+
+def test_a_replace_covering_a_crossing_anchor_is_still_refused(engine,
+                                                              monkeypatch,
+                                                              tmp_path,
+                                                              capsys):
+    """Placement is not permission: full coverage still ghosts the thread
+    (C1), and the rewrite path cannot save this one — `replaceAllText` does
+    not match across a paragraph break."""
+    _crossing_case(engine, monkeypatch)
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "replace_quote", "quote": "Заголовок\nПодзаголовок",
+         "with": "Совсем другое"},
+    ]), encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc:
+        engine.patch_doc("doc1", str(ops))
+    assert exc.value.code == 3
+    out = json.loads(capsys.readouterr().out)
+    assert "накрывает целиком последний якорь" in out["refused"][0]["error"]
+
+
+def test_a_ghost_is_named_in_the_receipt_and_the_patch_goes_on(engine,
+                                                               monkeypatch,
+                                                               tmp_path,
+                                                               capsys):
+    """#34 end to end: one vanished thread used to refuse every replace in the
+    document. It is now named once — not per operation — and removing it stays
+    the person's decision (CONTRACT §2.2)."""
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    gone = api_comment("c2", "B", "2026-07-13T17:00:00.000Z")
+    gone["quotedFileContent"] = {"value": "Вариант 1"}
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED), gone],
+        _docx_builder(docs, [("Alpha", []), ("Bravo", [("0", 0, 5)]),
+                             ("Charlie", [])],
+                      [("0", "A", CREATED_SEC)]))
+    wire(engine, monkeypatch, docs, drive)
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "replace_quote", "quote": "Alpha", "with": "Yankee"},
+        {"op": "replace_quote", "quote": "Charlie", "with": "Xray"},
+    ]), encoding="utf-8")
+
+    engine.patch_doc("doc1", str(ops))
+    out = json.loads(capsys.readouterr().out)
+    assert out["ops_applied"] == 2
+    assert [g["id"] for g in out["ghost_threads"]] == ["c2"]
+    assert "disco=c2" in out["ghost_threads"][0]["link"]
+    assert "Убрать его можно вручную" in out["ghost_threads"][0]["note"]
+
+
+# ---------------------------------------------------------------------------
+# r10 (#36): the validation phase must not throw the file away either
+# ---------------------------------------------------------------------------
+
+def test_an_unresolvable_op_does_not_zero_the_clean_batch(engine, monkeypatch,
+                                                          tmp_path, capsys):
+    """Live session 2026-08-09: one non-unique quote refused the whole file
+    and 36 correct edits were never written. Per-op refusal used to live only
+    inside the apply loop; everything rejected before it took the file down."""
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    drive = DriveStub([], lambda: b"")
+    wire(engine, monkeypatch, docs, drive)
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "replace_quote", "quote": "Alpha", "with": "Yankee"},
+        {"op": "replace_quote", "quote": "Такого текста нет", "with": "X"},
+        {"op": "replace_quote", "quote": "Charlie", "with": "Xray"},
+    ]), encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc:
+        engine.patch_doc("doc1", str(ops))
+    assert exc.value.code == 3
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "partially-patched"
+    assert out["ops_applied"] == 2
+    assert [r["op"] for r in out["refused"]] == [1]
+    # the refusal names the operation, and a deferred op has no resolved
+    # record to take that name from
+    assert out["refused"][0]["source"] == "quote='Такого текста нет'"
+    written = [rq["insertText"]["text"] for b in docs.batches for rq in b
+               if "insertText" in rq]
+    assert sorted(written) == ["Xray", "Yankee"]
+
+
+def test_an_overlapping_pair_is_refused_and_the_neighbour_applies(
+        engine, monkeypatch, tmp_path, capsys):
+    """Both members of the pair go: applying either one moves the other's
+    target, so there is no «first one wins». The op that overlaps nothing has
+    no part in the ambiguity and used to be refused with them."""
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    drive = DriveStub([], lambda: b"")
+    wire(engine, monkeypatch, docs, drive)
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "replace_quote", "quote": "Bravo", "with": "Zulu"},
+        {"op": "replace_quote", "quote": "rav", "with": "RAV"},
+        {"op": "replace_quote", "quote": "Alpha", "with": "Yankee"},
+    ]), encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc:
+        engine.patch_doc("doc1", str(ops))
+    assert exc.value.code == 3
+    out = json.loads(capsys.readouterr().out)
+    assert [r["op"] for r in out["refused"]] == [0, 1]
+    assert "ops overlap" in out["refused"][0]["error"]
+    written = [rq["insertText"]["text"] for b in docs.batches for rq in b
+               if "insertText" in rq]
+    assert written == ["Yankee"]
+
+
+def test_an_op_made_unique_by_its_predecessor_goes_through(engine, monkeypatch,
+                                                           tmp_path, capsys):
+    """The engine applies against the live document, the validator judged a
+    dead snapshot — so a chain where op N makes op N+1 unique was rejected
+    before anything was written. In the live session that forced one logical
+    set of edits into seven separate `patch` calls (#36)."""
+    docs = MutatingDocsStub(make_doc(["Один Дубль", "Два Дубль", "Три"]))
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        _docx_tracking(docs, {2: [("0", 0, 3)]}, [("0", "A", CREATED_SEC)]))
+    wire(engine, monkeypatch, docs, drive)
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "replace_quote", "quote": "Один Дубль", "with": "Один Копия"},
+        {"op": "replace_quote", "quote": "Дубль", "with": "Финал"},
+    ]), encoding="utf-8")
+
+    engine.patch_doc("doc1", str(ops))
+    out = json.loads(capsys.readouterr().out)
+    assert out["ops_applied"] == 2
+    texts = [el["paragraph"]["elements"][0]["textRun"]["content"][:-1]
+             for el in docs.base["body"]["content"] if "paragraph" in el]
+    assert texts == ["Один Копия", "Два Финал", "Три"]
+    # and the receipt does not pretend the overlap check covered it — in the
+    # operation's OWN note, not a second entry that would read as a second
+    # operation
+    notes = [n for n in out["op_notes"] if "deferred" in n]
+    assert len(notes) == 1
+    assert len(out["op_notes"]) == 1
+    assert "в проверке пересечений" in notes[0]["deferred"]
+
+
 def test_patch_refuses_one_op_and_applies_the_rest(engine, monkeypatch,
                                                    tmp_path, capsys):
     """The anchor sits on «Bravo», so replacing Bravo whole is refused — but
     Alpha and Charlie have nothing to do with it. Before r8 the loop broke on
     the first refusal and the other operations never ran."""
     doc = make_doc(BASE_TEXTS)
+    # a table of contents keeps the rewrite path out of this document (the
+    # text walkers do not read one, so the uniqueness count would miss a match
+    # hiding there), so covering the anchor whole is still a refusal. A closed
+    # thread used to serve that purpose and no longer does — see M13.
+    doc["body"]["content"].append({"startIndex": 100, "endIndex": 101,
+                                   "tableOfContents": {}})
     docs = DocsStub(doc)
-    # a closed thread in the document keeps the rewrite path out of it, so
-    # covering the anchor whole is still a refusal
     drive = DriveStub(
-        [api_comment("c1", "A", CREATED),
-         api_comment("c2", "B", "2026-07-13T18:00:00.000Z", resolved=True)],
+        [api_comment("c1", "A", CREATED)],
         _docx_builder(docs, [("Alpha", []), ("Bravo", [("0", 0, 5)]),
                              ("Charlie", [])],
                       [("0", "A", CREATED_SEC)]))
@@ -2639,3 +3040,93 @@ def test_sync_applies_away_from_the_copies_and_counts_them_honestly(
     accounting = out["anchor_accounting"]
     assert accounting["ambiguous_anchors"] == 1
     assert accounting["blocked_anchors"] == 2  # both copies fenced
+
+
+# ---------------------------------------------------------------------------
+# r10 (#29): «стоял здесь» is a claim, and on repeated paragraphs a false one
+# ---------------------------------------------------------------------------
+
+def test_a_closed_thread_on_a_repeated_paragraph_is_not_claimed_to_be_here(
+        engine):
+    """`_locate_comment_in_tab` returns EVERY occurrence by contract, so a
+    thread standing in the clean copy used to be reported as hit when the
+    other copy was edited — and the person went to check a thread the edit
+    never touched."""
+    tab = make_doc(["Одинаковый абзац", "прочее", "Одинаковый абзац"])
+    closed = [api_comment("c1", "A", CREATED, resolved=True)]
+    closed[0]["quotedFileContent"] = {"value": "Одинаковый абзац"}
+    # the edit covers the FIRST copy only
+    suspects = engine._closed_threads_in_edited_ranges(tab, closed, [(1, 17)])
+    assert suspects == {"c1": 2}
+
+
+def test_a_closed_thread_matching_once_is_named_plainly(engine):
+    tab = make_doc(["Единственный абзац", "прочее"])
+    closed = [api_comment("c1", "A", CREATED, resolved=True)]
+    closed[0]["quotedFileContent"] = {"value": "Единственный абзац"}
+    assert engine._closed_threads_in_edited_ranges(
+        tab, closed, [(1, 19)]) == {"c1": 1}
+
+
+def test_the_archive_says_one_of_n_places_not_here(engine, tmp_path):
+    tab = make_doc(["Одинаковый абзац", "прочее", "Одинаковый абзац"])
+    closed = [api_comment("c1", "A", CREATED, resolved=True)]
+    closed[0]["quotedFileContent"] = {"value": "Одинаковый абзац"}
+    md = tmp_path / "doc.md"
+    md.write_text("x", encoding="utf-8")
+    path = engine._archive_closed_threads(str(md), "DOC", closed,
+                                          doc_tab=tab, edited=[(1, 17)])
+    entry = json.loads(open(path, encoding="utf-8").read())["threads"][0]
+    assert entry["probably_in_an_edited_paragraph"] is True
+    assert "встречается в документе 2 раз" in entry["where"]
+
+
+def test_the_rewrite_refuses_an_unmeasured_tail_character(engine):
+    """The one deletion this batch makes lands on the last character, and what
+    Google does with a surrogate pair or a combining mark there is not
+    measured — M13 covered a plain BMP letter. The geometry says it should not
+    matter; «should» is not a measurement, and this is the only place in
+    `patch` that deletes anything (#47)."""
+    for tail in ("💡", "́"):
+        kw = _rewrite_case(engine, text="Здесь старый текст" + tail,
+                           new="Совсем иная фраза", closed_present=True)
+        assert engine._rewrite_anchor_requests(**kw) is None, tail
+        # …and without a closed thread there is no doubt to be careful about:
+        # the live anchor holds the new text by then and cannot collapse
+        kw.pop("closed_present")
+        assert engine._rewrite_anchor_requests(**kw) is not None, tail
+    assert engine._rewrite_anchor_requests(**_rewrite_case(engine)) is not None
+
+
+def test_the_refusal_names_the_real_reason_the_rewrite_did_not_fire(engine):
+    """`_rewrite_anchor_requests` answers None to half a dozen questions, and
+    the refusal used to give the same advice for all of them — «leave part of
+    the original anchor text alone», which is sound for exactly one and
+    misleading for the rest (#24 all over again)."""
+    kw = _rewrite_case(engine)
+    base = dict(doc_tab=kw["doc_tab"], search_text=kw["search_text"],
+                new_text=kw["new_text"], start=kw["start"], end=kw["end"],
+                anchors=kw["anchors"], attribution=kw["attribution"],
+                named_intervals=[])
+
+    toc = dict(base)
+    toc["doc_tab"] = {"body": {"content": list(
+        kw["doc_tab"]["body"]["content"]) + [{"tableOfContents": {}}]}}
+    assert "оглавление" in engine._why_no_rewrite(**toc)
+
+    named = dict(base)
+    named["named_intervals"] = [(kw["start"], kw["end"], "метка mark1")]
+    assert "метка mark1" in engine._why_no_rewrite(**named)
+
+    crossing = dict(base)
+    crossing["search_text"] = "первый\nвторой"
+    assert "несколько абзацев" in engine._why_no_rewrite(**crossing)
+
+    neighbour = dict(base)
+    neighbour["anchors"] = list(kw["anchors"]) + [
+        (kw["start"], kw["end"], "x", "9")]
+    assert "ещё один комментарий" in engine._why_no_rewrite(**neighbour)
+
+    # nothing structural in the way: the original sentence, which is the one
+    # that is true then
+    assert "ИСХОДНЫЙ символ якоря" in engine._why_no_rewrite(**base)

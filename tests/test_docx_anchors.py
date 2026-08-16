@@ -103,11 +103,26 @@ def test_fence_off_tables_refuses_when_the_api_shows_no_table(engine, make_docx)
     assert blocked == []
 
 
-def test_cross_paragraph_span_fails_closed(engine, make_docx):
-    body = ('<w:p><w:commentRangeStart w:id="5"/><w:r><w:t>один</w:t></w:r></w:p>'
-            '<w:p><w:r><w:t>два</w:t></w:r><w:commentRangeEnd w:id="5"/></w:p>')
+def test_cross_paragraph_span_keeps_both_ends(engine, make_docx):
+    """#45: a selection dragged across a paragraph break used to be a
+    coordinate-free problem that froze the whole document — while the
+    coordinates were right there, one per end. It is now a normal span."""
+    body = ('<w:p><w:r><w:t>до</w:t></w:r>'
+            '<w:commentRangeStart w:id="5"/><w:r><w:t>один</w:t></w:r></w:p>'
+            '<w:p><w:r><w:t>два</w:t></w:r><w:commentRangeEnd w:id="5"/>'
+            '<w:r><w:t>после</w:t></w:r></w:p>')
     spans, problems, census = engine._parse_docx_anchor_spans(make_docx(body))
-    assert any("crosses paragraphs" in p for p in problems)
+    assert problems == []
+    assert len(spans) == 1
+    s = spans[0]
+    assert (s["para_index"], s["start_off"]) == (0, 2)
+    assert (s["end_para_index"], s["end_off"]) == (1, 3)
+    assert (s["para_text"], s["end_para_text"]) == ("доодин", "двапосле")
+    # display only, and it has to read like the selection actually looks
+    assert s["anchor_text"] == "один\nдва"
+    # the census still counts it as processed, so the accounting keeps its
+    # «one record ⇒ exactly one span» bijection
+    assert census["in_body"] == frozenset({"5"})
 
 
 def test_malformed_zip_fails_closed(engine):
@@ -434,3 +449,167 @@ def test_the_refusal_names_a_remedy_that_fits_the_reason(engine):
 
     ghost = engine._anchor_map_remedy("anchor span 7 has no comments.xml entry")
     assert "призрак" in ghost
+
+
+# ---------------------------------------------------------------------------
+# #45: a comment selected across a paragraph break
+# ---------------------------------------------------------------------------
+
+def _crossing(head, tail, cid="5", head_lead="", tail_rest=""):
+    """One anchor opening inside `head` and closing inside `tail`."""
+    return (f'<w:p><w:r><w:t>{head_lead}</w:t></w:r>'
+            f'<w:commentRangeStart w:id="{cid}"/>'
+            f'<w:r><w:t>{head}</w:t></w:r></w:p>'
+            f'<w:p><w:r><w:t>{tail}</w:t></w:r>'
+            f'<w:commentRangeEnd w:id="{cid}"/>'
+            f'<w:r><w:t>{tail_rest}</w:t></w:r></w:p>')
+
+
+def test_a_crossing_anchor_is_placed_by_its_two_ends(engine, make_docx):
+    """The editorial shape: a comment on a heading together with its subtitle.
+    Both ends are located independently, each by its own paragraph's text, and
+    API indices are absolute — so the placed range is the anchor's exact
+    extent."""
+    spans, problems, _c = engine._parse_docx_anchor_spans(
+        make_docx(_crossing("Заголовок", "Подзаголовок",
+                            head_lead="До: ", tail_rest=" и дальше")))
+    assert problems == []
+    tab = _tab([["До: Заголовок"], ["Подзаголовок и дальше"]])
+    ranges, mproblems, ambiguous = engine._map_anchors_to_doc(tab, spans)
+    assert (mproblems, ambiguous) == ([], [])
+    # «До: » is 4 units, so the anchor opens at 1+4=5 and closes after
+    # «Подзаголовок» — 12 units into the second paragraph, which starts at 15
+    assert [(s, e, cid) for s, e, _t, cid in ranges] == [(5, 27, "5")]
+
+
+def test_a_crossing_anchor_survives_a_table_between_its_ends(engine, make_docx):
+    """Whatever sits between the ends cannot move either of them: each end is
+    found by its own paragraph. The API range simply covers the table too —
+    which is the truth about that selection."""
+    body = ('<w:p><w:commentRangeStart w:id="5"/>'
+            '<w:r><w:t>первый</w:t></w:r></w:p>'
+            '<w:tbl><w:tr><w:tc><w:p><w:r><w:t>ячейка</w:t></w:r>'
+            '</w:p></w:tc></w:tr></w:tbl>'
+            '<w:p><w:r><w:t>третий</w:t></w:r>'
+            '<w:commentRangeEnd w:id="5"/></w:p>')
+    spans, problems, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    assert problems == []
+    tab = {"body": {"content": [
+        {"startIndex": 1, "endIndex": 8, "paragraph": {"elements": [
+            {"startIndex": 1, "endIndex": 8,
+             "textRun": {"content": "первый\n"}}]}},
+        {"startIndex": 8, "endIndex": 20, "table": {}},
+        {"startIndex": 20, "endIndex": 27, "paragraph": {"elements": [
+            {"startIndex": 20, "endIndex": 27,
+             "textRun": {"content": "третий\n"}}]}},
+    ]}}
+    ranges, mproblems, _amb = engine._map_anchors_to_doc(tab, spans)
+    assert mproblems == []
+    assert [(s, e) for s, e, _t, _c in ranges] == [(1, 26)]
+
+
+def test_a_crossing_anchor_with_a_duplicated_end_fails_closed(engine,
+                                                              make_docx):
+    """Which copy holds the comment is unreadable, and fencing every pair of
+    candidates buys nothing: such a document is refused today, so leaving it
+    refused regresses nobody."""
+    spans, _p1, _c = engine._parse_docx_anchor_spans(
+        make_docx(_crossing("один", "два") + _p("два")))
+    ranges, mproblems, ambiguous = engine._map_anchors_to_doc(
+        _tab([["один"], ["два"], ["два"]]), spans)
+    assert (ranges, ambiguous) == ([], [])
+    assert any("repeats in the document" in p for p in mproblems)
+
+
+def test_a_crossing_anchor_whose_ends_are_out_of_order_fails_closed(engine,
+                                                                    make_docx):
+    """The export says the anchor opens in «один» and closes in «два»; the API
+    has them the other way round. The two views disagree about the document,
+    so nothing may be assumed about where the anchor is."""
+    spans, _p1, _c = engine._parse_docx_anchor_spans(
+        make_docx(_crossing("один", "два")))
+    ranges, mproblems, _amb = engine._map_anchors_to_doc(
+        _tab([["два"], ["один"]]), spans)
+    assert ranges == []
+    assert any("do not line up" in p for p in mproblems)
+
+
+def test_the_rewrite_refuses_a_target_spanning_paragraphs(engine):
+    """`replaceAllText` does not match across a paragraph break, so request 2
+    of the rewrite batch would change nothing while requests 1 and 3 landed
+    anyway: text damaged, outcome unknown. Reachable only since #45 made such
+    anchors placeable."""
+    tab = _tab([["один"], ["два"]])
+    assert engine._rewrite_anchor_requests(
+        tab, "один\nдва", "совсем другое", 1, 9,
+        [(1, 9, "один\nдва", "5")], {"5": "cmt1"}, []) is None
+
+
+def test_a_crossing_anchor_is_refused_when_a_chip_could_be_one_of_its_ends(
+        engine, make_docx):
+    """Found in review. The single-match branch below keeps a known hole (#30)
+    because it must not freeze documents that work today; a crossing anchor
+    freezes its document today anyway, so this surface is new and gets to be
+    strict. Otherwise the anchor lands on the readable twin while the live
+    thread sits in the chip paragraph, unprotected."""
+    spans, _p1, _c = engine._parse_docx_anchor_spans(
+        make_docx(_crossing("один", "два")))
+    tab = _tab([[{"person": {}}], ["один"], ["два"]])
+    ranges, mproblems, ambiguous = engine._map_anchors_to_doc(tab, spans)
+    assert (ranges, ambiguous) == ([], [])
+    assert any("cannot read" in p and "one of its ends" in p
+               for p in mproblems)
+
+
+def test_a_crossing_anchor_whose_far_end_is_unclean_fails_closed(engine,
+                                                                 make_docx):
+    """An unsupported element in EITHER end paragraph makes the offsets
+    unreliable — the second pass has to look at both, not just the first."""
+    body = ('<w:p><w:commentRangeStart w:id="5"/>'
+            '<w:r><w:t>один</w:t></w:r></w:p>'
+            '<w:p><w:r><w:t>два</w:t></w:r><w:sdt><w:sdtContent>'
+            '<w:r><w:t>чужое</w:t></w:r></w:sdtContent></w:sdt>'
+            '<w:commentRangeEnd w:id="5"/></w:p>')
+    _spans, problems, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    assert any("unsupported elements" in p for p in problems)
+
+
+def test_a_soft_break_does_not_hide_an_opaque_paragraph(engine, make_docx):
+    """The API spells a soft line break `\\v`, the export writes `\\n` (#27),
+    so a chip paragraph carrying one used to fit nothing and stop counting as
+    a possible home for the anchor. Raised in review as the concrete path
+    where matching known fragments could miss a real opaque end.
+
+    It cannot be a fail-open even without this: a readable twin would have to
+    match a text containing `\\n`, and no API paragraph ever does — `\\n` is
+    what ends a paragraph. So the document is refused either way and what the
+    normalization buys is the refusal saying the true reason instead of
+    «matched 0 times». Whoever fixes #27 has to re-read this."""
+    assert engine._pieces_fit(["До\vПосле"], "До\nПосле") is True
+
+    body = ('<w:p><w:commentRangeStart w:id="5"/>'
+            '<w:r><w:t>од</w:t><w:br/><w:t>ин</w:t></w:r></w:p>'
+            '<w:p><w:r><w:t>два</w:t></w:r>'
+            '<w:commentRangeEnd w:id="5"/></w:p>')
+    spans, problems, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    assert problems == []
+    assert spans[0]["para_text"] == "од\nин"
+    # the only paragraph that could hold the anchor's start is unreadable, and
+    # its readable half carries the soft break
+    tab = _tab([["од\vин", {"person": {}}], ["два"]])
+    ranges, mproblems, _amb = engine._map_anchors_to_doc(tab, spans)
+    assert ranges == []
+    assert any("cannot read" in p for p in mproblems)
+    assert not any("matched 0 times" in p for p in mproblems)
+
+
+def test_the_remedy_for_a_thread_missing_from_the_export_is_doable(engine):
+    """«Переоткрыть» is nonsense for a thread that was never closed, and
+    telling the person to delete somebody's comment is not ours to say. What
+    actually unblocks it: the thread is the newest thing in the document, so
+    one reply anywhere gives the next run its bearings (#34, #46)."""
+    missing = engine._anchor_map_remedy(
+        "comment AAAB «x» https://... is missing from the export "
+        "(ghost thread or stale export — indistinguishable)")
+    assert "Ответьте в любой другой тред" in missing
+    assert "переоткр" not in missing.lower()

@@ -2,6 +2,7 @@
 """Google Docs toolkit: upload, download, update, comments, suggestions."""
 
 import argparse
+import datetime
 import difflib
 import json
 import os
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 
 from google.auth.transport.requests import Request
@@ -1233,6 +1235,25 @@ def list_comments(file_id, output=None):
     except HttpError as e:
         _error(f"failed to fetch comments: {e.reason if hasattr(e, 'reason') else e}")
 
+    # Drive omits a boolean holding its default value, so `resolved` is
+    # present on one listing and gone from the next — measured live 2026-08-09,
+    # where the second call returned open threads without the key at all and
+    # every consumer reading c["resolved"] died on KeyError (#41). Which fields
+    # Google feels like omitting is not the caller's problem to know.
+    unspecified = 0
+    for c in comments:
+        c["resolved"] = bool(c.get("resolved"))
+        for entry in [c] + list(c.get("replies") or []):
+            author = entry.get("author")
+            if isinstance(author, dict) and "me" not in author:
+                # Absent means «Google did not say», not «somebody else» — and
+                # the whole «отвечай только на мои комментарии» capability
+                # stands on this field. It is normalized so nothing crashes,
+                # and the count is reported so a scoped request can be checked
+                # against a number instead of being silently narrowed to zero.
+                author["me"] = False
+                unspecified += 1
+
     # a link that opens the document with this thread expanded (#20): naming
     # a thread by id left the person to find it by eye
     for c in comments:
@@ -1240,15 +1261,17 @@ def list_comments(file_id, output=None):
         if link:
             c["link"] = link
 
-    _emit_json(comments, output=output,
-               summary={"comments": len(comments),
-                        "unresolved": sum(1 for c in comments
-                                          if not c.get("resolved")),
-                        # so a scoped request («отработай мои комментарии»)
-                        # can be checked against a number, not against a
-                        # display name the agent had to guess
-                        "mine": sum(1 for c in comments
-                                    if (c.get("author") or {}).get("me"))})
+    summary = {"comments": len(comments),
+               "unresolved": sum(1 for c in comments
+                                 if not c.get("resolved")),
+               # so a scoped request («отработай мои комментарии») can be
+               # checked against a number, not against a display name the
+               # agent had to guess
+               "mine": sum(1 for c in comments
+                           if (c.get("author") or {}).get("me"))}
+    if unspecified:
+        summary["authorship_unspecified"] = unspecified
+    _emit_json(comments, output=output, summary=summary)
 
 
 # ---------------------------------------------------------------------------
@@ -1490,12 +1513,15 @@ def _parse_docx_anchor_spans(docx_bytes):
     """Parse word/document.xml and extract comment anchor spans.
 
     Returns (spans, problems, census):
-      spans: [{"docx_id", "para_index", "para_text", "start_off", "end_off",
-               "anchor_text", "has_objects"}] — offsets are UTF-16 units
-              within the paragraph text
-      problems: reasons the mapping is unusable (unpaired ranges,
-              cross-paragraph spans, inline objects in anchor paragraphs,
-              malformed XML). Any problem ⇒ caller fails closed.
+      spans: [{"docx_id", "para_index", "para_text", "start_off",
+               "end_para_index", "end_para_text", "end_off", "anchor_text",
+               "has_objects"}] — offsets are UTF-16 units within their own
+              paragraph's text. The two paragraph indices are equal for an
+              ordinary anchor and differ when the selection was dragged
+              across a paragraph break (#45).
+      problems: reasons the mapping is unusable (unpaired ranges, inline
+              objects in anchor paragraphs, malformed XML). Any problem ⇒
+              caller fails closed.
       census: {"in_tables", "elsewhere", "in_body"} — sets of w:id, where
               every marker in document.xml was found. An id in NONE of them
               is not in document.xml at all, which is how a footnote or a
@@ -1556,6 +1582,7 @@ def _parse_docx_anchor_spans(docx_bytes):
     # structural domains (codex W8-r1 P1).
     body_paras = [ch for ch in body if ch.tag == f"{w}p"]
 
+    para_meta = []
     for p_index, para in enumerate(body_paras):
         state = {"off": 0, "parts": [], "has_objects": False,
                  "has_unknown": [], "local_open": {}}
@@ -1576,7 +1603,7 @@ def _parse_docx_anchor_spans(docx_bytes):
                     cid = child.get(f"{w}id")
                     seen_starts[cid] = seen_starts.get(cid, 0) + 1
                     state["local_open"][cid] = state["off"]
-                    cross_para_open[cid] = p_index
+                    cross_para_open[cid] = (p_index, state["off"])
                 elif tag == f"{w}commentRangeEnd":
                     cid = child.get(f"{w}id")
                     seen_ends[cid] = seen_ends.get(cid, 0) + 1
@@ -1584,13 +1611,25 @@ def _parse_docx_anchor_spans(docx_bytes):
                         spans.append({
                             "docx_id": cid, "para_index": p_index,
                             "start_off": state["local_open"].pop(cid),
+                            "end_para_index": p_index,
                             "end_off": state["off"],
                         })
                         cross_para_open.pop(cid, None)
                     elif cid in cross_para_open:
-                        problems.append(
-                            f"comment range {cid} crosses paragraphs")
-                        cross_para_open.pop(cid, None)
+                        # A selection dragged across a paragraph break — what
+                        # an editor does without thinking when the comment is
+                        # about a heading and its subtitle, or a list item and
+                        # the next one. This used to be a coordinate-free
+                        # problem that froze the whole document (#45), while
+                        # the coordinates were right there: the opening
+                        # paragraph with its offset and this one with its own.
+                        open_p, open_off = cross_para_open.pop(cid)
+                        spans.append({
+                            "docx_id": cid, "para_index": open_p,
+                            "start_off": open_off,
+                            "end_para_index": p_index,
+                            "end_off": state["off"],
+                        })
                     else:
                         problems.append(
                             f"commentRangeEnd {cid} without start")
@@ -1621,18 +1660,41 @@ def _parse_docx_anchor_spans(docx_bytes):
                     state["has_unknown"].append(tag)
 
         walk(para)
-        para_text = "".join(state["parts"])
-        for sp in spans:
-            if sp["para_index"] == p_index and "para_text" not in sp:
-                sp["para_text"] = para_text
-                sp["anchor_text"] = _slice_utf16(
-                    para_text, sp["start_off"], sp["end_off"])
-                sp["has_objects"] = state["has_objects"]
-                if state["has_unknown"]:
-                    problems.append(
-                        f"anchor {sp['docx_id']} sits in a paragraph with "
-                        f"unsupported elements ({sorted(set(state['has_unknown']))[:3]}) "
-                        f"— text/offsets unreliable")
+        para_meta.append({"text": "".join(state["parts"]),
+                          "has_objects": state["has_objects"],
+                          "has_unknown": state["has_unknown"]})
+
+    # Texts are attached AFTER the walk, not inside it: a span that crosses a
+    # paragraph break is not complete until both of its paragraphs have been
+    # read, and the old in-loop assignment could only ever see the first one.
+    for sp in spans:
+        head, tail = para_meta[sp["para_index"]], para_meta[sp["end_para_index"]]
+        sp["para_text"] = head["text"]
+        sp["end_para_text"] = tail["text"]
+        if sp["end_para_index"] == sp["para_index"]:
+            sp["anchor_text"] = _slice_utf16(
+                head["text"], sp["start_off"], sp["end_off"])
+        else:
+            # Display only — it names the anchor in refusals and nothing reads
+            # it back. Paragraphs the walker skips (a table between the ends)
+            # are missing from it; the RANGE is unaffected, because both ends
+            # are computed from their own paragraphs.
+            middle = [para_meta[i]["text"] for i
+                      in range(sp["para_index"] + 1, sp["end_para_index"])]
+            sp["anchor_text"] = "\n".join(
+                [_slice_utf16(head["text"], sp["start_off"],
+                              _utf16_len(head["text"]))]
+                + middle
+                + [_slice_utf16(tail["text"], 0, sp["end_off"])])
+        # Either end being unreadable is enough to distrust the span: the
+        # offsets are taken from both.
+        sp["has_objects"] = head["has_objects"] or tail["has_objects"]
+        unknown = sorted(set(head["has_unknown"]) | set(tail["has_unknown"]))
+        if unknown:
+            problems.append(
+                f"anchor {sp['docx_id']} sits in a paragraph with "
+                f"unsupported elements ({unknown[:3]}) "
+                f"— text/offsets unreliable")
 
     processed = set(seen_starts) & set(seen_ends)
     census = {"in_tables": frozenset(census_tables - processed),
@@ -1692,9 +1754,21 @@ def _pieces_fit(pieces, text):
 
     Piecewise, not as one substring: a paragraph «До ИТОГО После» with a chip
     in the middle arrives as fragments split around the part we cannot read.
+
+    A soft line break is spelled `\\v` by the API and `\\n` by the export
+    (#27), so a fragment carrying one would otherwise fit nothing and an
+    unreadable paragraph holding a soft break would stop counting as a
+    possible home for an anchor. That is not a fail-open — a readable twin
+    would have to match a text containing `\\n`, and no API paragraph ever
+    does, so the document is refused either way — but it made the refusal name
+    the wrong reason. Normalizing here does NOT touch the exact-match proof in
+    `_map_anchors_to_doc`: that one runs on `by_text`, over readable
+    paragraphs, and still sees zero matches for a soft break. Whoever fixes
+    #27 has to re-read both.
     """
     pos = 0
     for piece in pieces:
+        piece = piece.replace("\v", "\n")
         if not piece:
             continue
         at = text.find(piece, pos)
@@ -1730,6 +1804,12 @@ def _map_anchors_to_doc(doc_tab, spans):
        a paragraph would not keep an edit elsewhere out of it. If any
        paragraph could be that home, the document fails closed exactly as it
        does today;
+    An anchor whose selection was dragged across a paragraph break is placed
+    by locating its two ends separately, each by its own paragraph's text
+    (#45). It used to freeze the document for a reason that was never about
+    danger — «we cannot count offsets across a break» — while the offsets were
+    right there, one per end.
+
     3. the API reports text that differs from `para_text` — then NOTHING
        matches and the whole document fails closed. Today this is reachable
        only through a soft line break (the parser writes `w:br` as \\n, the
@@ -1788,6 +1868,64 @@ def _map_anchors_to_doc(doc_tab, spans):
                 f"could not be read (fail closed)")
             continue
         exact = by_text.get(ptext, [])
+        if s.get("end_para_index", s["para_index"]) != s["para_index"]:
+            # An anchor dragged across a paragraph break. Its two ends are
+            # located INDEPENDENTLY, each by its own paragraph's text, and API
+            # indices are absolute — so whatever lies between them (a table, a
+            # chip, anything the walker skips) cannot move either end. This is
+            # the anchor's exact extent, not a conservative envelope.
+            etext = s.get("end_para_text")
+            end_exact = by_text.get(etext, []) if etext is not None else []
+            # Unlike the single-match branch below, opaque paragraphs ARE
+            # checked here. That branch keeps a known hole (#30) only because
+            # it must not freeze documents that work today; a crossing anchor
+            # freezes its document today anyway, so this surface is new and
+            # gets to be strict. Found in review: a chip paragraph could be
+            # the real home of either end, and placing the anchor on the
+            # readable twin leaves the live thread unprotected.
+            hosts = [st for st, _en, pieces in possible_hosts
+                     if _pieces_fit(pieces, ptext)
+                     or (etext is not None and _pieces_fit(pieces, etext))]
+            if hosts:
+                problems.append(
+                    f"anchor {s['docx_id']} spans paragraphs, and a paragraph "
+                    f"whose text skrepka cannot read (a smart chip or a rich "
+                    f"link at {hosts[:3]}) could hold one of its ends — "
+                    f"undecidable (fail closed)")
+                continue
+            if not exact or not end_exact:
+                problems.append(
+                    f"anchor {s['docx_id']} spans paragraphs and one of its "
+                    f"ends matched 0 times in the doc (need exactly 1): "
+                    f"{(ptext if not exact else etext)[:50]!r}")
+                continue
+            if len(exact) > 1 or len(end_exact) > 1:
+                # Fencing the pairs of candidates is combinatorial and buys
+                # nothing today: such a document is refused as it is now, so
+                # nothing regresses by leaving it refused.
+                problems.append(
+                    f"anchor {s['docx_id']} spans paragraphs and one of its "
+                    f"ends repeats in the document word for word "
+                    f"({len(exact)}/{len(end_exact)} matches) — which copy "
+                    f"holds the comment is not readable (fail closed)")
+                continue
+            (base, head_end), (base_e, tail_end) = exact[0], end_exact[0]
+            start_at, end_at = base + s["start_off"], base_e + s["end_off"]
+            # `head_end - 1` and `tail_end - 1` are the paragraphs' own
+            # newlines: the visible text ends before them.
+            if not (base <= start_at < head_end
+                    and base_e <= end_at <= tail_end - 1
+                    and start_at < end_at and base_e > base):
+                problems.append(
+                    f"anchor {s['docx_id']} spans paragraphs but the two ends "
+                    f"do not line up in the document "
+                    f"([{start_at}, {end_at}) against paragraphs "
+                    f"[{base}, {head_end}) and [{base_e}, {tail_end})) — "
+                    f"the anchor map cannot be trusted (fail closed)")
+                continue
+            ranges.append((start_at, end_at, s.get("anchor_text", ""),
+                           s["docx_id"]))
+            continue
         if not exact:
             problems.append(
                 f"anchor {s['docx_id']} paragraph matched 0 times in the doc "
@@ -1926,8 +2064,140 @@ def _comment_label(c, file_id=None):
     return f"{label} {link}" if link else label
 
 
+def _rfc3339_epoch(ts):
+    """RFC3339 timestamp → epoch seconds, or None when it cannot be read.
+
+    Comparing the strings themselves is wrong the moment two of them carry
+    different offsets: '2026-01-01T01:00:00+05:00' is EARLIER than
+    '2026-01-01T00:00:00-05:00' and lexicographically later (found in review).
+    A timestamp without an offset is unreadable rather than assumed-UTC —
+    guessing here would decide whether a thread is a ghost.
+    """
+    if not ts:
+        return None
+    text = ts.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.timestamp()
+
+
+def _ghost_verdict(c, records, doc_tab, file_id=None):
+    """Is this witness-less thread provably a ghost? None when it is not.
+
+    A thread the API calls live whose records are absent from the export is
+    «a ghost or a stale export», and until #34 the two were treated as
+    indistinguishable — so ANY vanished comment froze every replace in the
+    document. Losing a comment without closing it is not a malfunction: the
+    text got rewritten, the paragraph deleted, the block moved. A ghost has no
+    anchor left, so blocking the document buys it nothing.
+
+    Two signs, independent of each other, and both must agree:
+
+    1. the export carries a record created LATER than this thread. The export
+       is a snapshot of the comment store at some instant T; a record dated D
+       proves T ≥ D, so a D later than this thread's creation leaves lag with
+       nothing to explain. When the missing thread is the newest thing in the
+       document the sign stays silent and the refusal stands — there lag
+       really is indistinguishable;
+    2. the text the comment was attached to is no longer in the document. This
+       one does not come from the export at all — it is read from the API and
+       the current snapshot, so a converter fault cannot forge it.
+
+    Sign 1 rests on the export being assembled whole rather than in pieces —
+    the same assumption the text canary already rests on, and NOT a measured
+    fact. The review held a P0 on it: in a chain of three coincidences (thread
+    alive, its text changed since, its record dropped by the converter) an
+    edit could kill a live thread. The owner took that trade knowingly on
+    2026-08-16 — see internal/DECISIONS.md — against the cost of the opposite,
+    which happens routinely.
+
+    When the stale quote IS still found in the document, the verdict carries
+    those places: they get fenced, so an edit there is refused while the rest
+    of the document stays editable. The fence proves nothing about where the
+    anchor is; it only makes being wrong cost a local refusal instead of a
+    thread.
+    """
+    if doc_tab is None:
+        return None  # nothing to check sign 2 against — fail closed
+    created = _rfc3339_epoch(c.get("createdTime"))
+    if created is None:
+        return None
+    later = []
+    for r in records:
+        stamp = _rfc3339_epoch(r.get("date_sec"))
+        # `is not None`, not `or 0`: a record whose date cannot be read must
+        # be visibly not-later, not silently zero (found in review)
+        if stamp is not None and stamp > created:
+            later.append(r)
+    if not later:
+        return None
+    quote = (c.get("quotedFileContent") or {}).get("value")
+    if not quote:
+        # No quoted text at all, and no record in the export. Measured
+        # 2026-08-16: a comment created through the API never attaches to
+        # document text — but Drive stores the `anchor` field it was given
+        # verbatim, and skrepka counts anything carrying `anchor` as anchored.
+        # Such a thread has no text anchor to lose, yet it used to freeze
+        # every replace in the document, which is what any other tool leaving
+        # comments through the API does to a document today.
+        #
+        # A genuinely text-anchored comment always carries the quote (it is
+        # filled at creation and survives losing the anchor — the living ghost
+        # of 2026-08-09 still had it). One anchored to an image might not, but
+        # that one has a record in the export and never reaches this branch.
+        # So here the thread is either never-anchored or already ghosted, and
+        # either way nothing an edit does can hurt it. Sign 1 still has to
+        # hold: it is what rules out the export simply being older than the
+        # thread.
+        return {"id": c.get("id"),
+                "link": _thread_link(file_id, c.get("id")),
+                "quote": None,
+                "fenced": []}
+    if _count_text_outside_body(doc_tab, quote):
+        # The old text survives in a header, a footer or a footnote, where the
+        # fence cannot reach — `_text_buffer` walks the body only, while
+        # `replaceAllText` does not. Nothing to fence with, so fail closed
+        # (found in review).
+        return None
+    return {"id": c.get("id"),
+            "link": _thread_link(file_id, c.get("id")),
+            "quote": quote[:60],
+            "fenced": _locate_comment_in_tab(doc_tab, c)}
+
+
+def _fence_off_ghosts(ghosts):
+    """Blocked ranges for vanished threads whose old text is still here.
+
+    A ghost with nothing left to find fences nothing and costs the person
+    nothing. One whose quote still matches somewhere gets those places fenced:
+    if the thread is in fact alive and simply missing from the export, this is
+    where it most likely still sits.
+    """
+    blocked = []
+    for g in ghosts:
+        for cs, ce in g.get("fenced") or ():
+            who = (f"треда {g['id']} {g['link']}" if g.get("link")
+                   else f"комментария {g.get('id')}")
+            blocked.append((cs, ce, (
+                f"комментарий {who} пропал из выгрузки документа, а текст, на "
+                f"котором он висел («{g.get('quote', '')[:40]}»), ещё здесь — "
+                f"поэтому правка этого места отклонена, а остальной документ "
+                f"правится. Откройте тред по ссылке и посмотрите: если "
+                f"комментарий действительно потерял привязку, удалите его — "
+                f"место освободится; если он на месте, этот фрагмент правится "
+                f"в интерфейсе")))
+    return blocked
+
+
 def _account_anchored_comments(anchored, records, spans, *, universe,
-                               file_id=None, marker_census=None):
+                               file_id=None, marker_census=None,
+                               doc_tab=None):
     """Prove every live anchored THREAD keeps at least one anchor in the export.
 
     Ghosted threads vanish from the export ENTIRELY (C11a), and a stale export
@@ -1969,7 +2239,7 @@ def _account_anchored_comments(anchored, records, spans, *, universe,
     """
     from collections import Counter
 
-    problems = []
+    problems, ghosts = [], []
     signatures = []  # (thread, Counter of its live entry keys)
     resolved_n = 0
     for c in anchored:
@@ -2026,9 +2296,17 @@ def _account_anchored_comments(anchored, records, spans, *, universe,
         # At least ONE witness present is enough — a thread may have several,
         # and requiring a particular one would flap on partial staleness.
         if not any(docx_keys.get(k) for k in witnesses):
-            # Deliberately NOT scoped to an operation range (issue #10): a
-            # thread missing from the export has no span in document.xml, so
-            # there are no coordinates to confine the refusal to.
+            verdict = _ghost_verdict(c, records, doc_tab, file_id)
+            if verdict is not None:
+                # Provably gone: it has no anchor left to protect, so the
+                # document is not held hostage to it (#34). Named in the
+                # receipt — removing someone's comment is the person's call
+                # (CONTRACT §2.2), never ours.
+                ghosts.append(verdict)
+                continue
+            # Not provable, so nothing is scoped: a thread missing from the
+            # export has no span in document.xml, and there are no coordinates
+            # to confine the refusal to.
             problems.append(
                 f"comment {_comment_label(c, file_id)} is missing from the export "
                 f"(ghost thread or stale export — indistinguishable)")
@@ -2109,6 +2387,11 @@ def _account_anchored_comments(anchored, records, spans, *, universe,
         "anchor_spans": len(spans),
         "anchors_outside_body": outside_body,
     }
+    if ghosts:
+        # carried in the metrics rather than a third return value: every
+        # caller and test unpacks two, and a vanished thread is diagnosis,
+        # not a decision anybody downstream re-makes
+        metrics["ghosts"] = ghosts
     return problems, metrics
 
 
@@ -2242,6 +2525,21 @@ def _anchor_map_remedy(shown):
                 "поэтому неясно, к какой копии он относится. Различите копии "
                 "в интерфейсе Google Docs — хватит одного слова — и повторите "
                 "команду.")
+    if "missing from the export" in shown:
+        # A thread the export does not carry AND we could not prove harmless.
+        # «Переоткрыть» is nonsense for it (it was never closed), and telling
+        # the person to delete somebody's comment is not ours to say. What
+        # actually helps: it is the newest thing in the document, so nothing
+        # in the export dates later than it — one reply anywhere, or a minute
+        # of waiting, and the next run has its bearings (#34, #46).
+        return ("Комментарий, названный выше, есть в списке комментариев, но "
+                "не доехал до выгрузки документа, а более свежих записей в "
+                "ней нет — значит отличить «он потерял привязку» от «выгрузка "
+                "просто старше него» пока нечем. Ответьте в любой другой тред "
+                "или подождите минуту и повторите команду. Если этот "
+                "комментарий оставлен не через интерфейс Google Docs, он к "
+                "тексту не привязан вовсе — тогда его можно удалить, и он "
+                "перестанет мешать.")
     return ("Разрулите комментарии-призраки в UI (удалить/переоткрыть тред) "
             "или правьте документ в UI.")
 
@@ -2599,7 +2897,7 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
         records, rec_problems = _docx_comment_records(docx_bytes)
         acc_problems, metrics = _account_anchored_comments(
             anchored, records, spans, universe=universe, file_id=file_id,
-            marker_census=census)
+            marker_census=census, doc_tab=doc_tab)
         anchors, map_problems, ambiguous = _map_anchors_to_doc(doc_tab, spans)
         attribution = _attribute_records_to_threads(anchored, records,
                                                     universe)
@@ -2617,7 +2915,12 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
         # is confined to the tables instead of the document (r8).
         global_problems, table_blocked = _fence_off_tables(
             global_problems, doc_tab)
-        blocked = blocked + table_blocked + amb_blocked
+        # A thread that vanished from the export has no anchor left to
+        # protect, so it no longer freezes the document — but where its old
+        # text still stands is fenced, in case it is alive and merely missing
+        # (#34).
+        ghost_blocked = _fence_off_ghosts(metrics.get("ghosts") or ())
+        blocked = blocked + table_blocked + amb_blocked + ghost_blocked
         if global_problems:
             shown = "; ".join(str(p) for p in global_problems[:4])
             _abort(
@@ -2651,7 +2954,8 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
     metrics["ambiguous_anchors"] = len(ambiguous)
     return ({"anchors": anchors, "fp1": fp1, "canary": canary,
              "r1": canary["r1"], "metrics": metrics, "blocked": blocked,
-             "attribution": attribution}, None)
+             "attribution": attribution,
+             "ghosts": metrics.get("ghosts") or []}, None)
 
 
 def _canary_insert_ambiguous(docs_service, file_id, canary, reason):
@@ -2771,17 +3075,47 @@ def _refuse_on_suggestion_range(doc_tab, start, end, source):
                 f"Docs. Остальной документ правится. ({source})")
 
 
-def _check_ops_overlap(resolved):
-    sorted_for_check = sorted(resolved, key=lambda r: (r["affect_start"], r["affect_end"]))
-    for i in range(len(sorted_for_check) - 1):
-        a = sorted_for_check[i]
-        b = sorted_for_check[i + 1]
+def _ops_overlap_conflicts(indexed):
+    """Which ops in this file fight over the same text: {op index -> why}.
+
+    `indexed` is {index: resolved op}. Both members of a conflicting pair are
+    reported, because applying either one moves the other's target — there is
+    no «first one wins» here, only an ambiguity the caller has to split.
+
+    This used to `_error` and take the whole file down. Nothing has been
+    written at this point, and the ops that do not overlap anything are
+    unaffected by the ambiguity, so refusing them too was pure loss (#36).
+    """
+    conflicts = {}
+    order = sorted(indexed, key=lambda i: (indexed[i]["affect_start"],
+                                           indexed[i]["affect_end"]))
+    for pos in range(len(order) - 1):
+        i, j = order[pos], order[pos + 1]
+        a, b = indexed[i], indexed[j]
         if _ranges_overlap(a["affect_start"], a["affect_end"],
                            b["affect_start"], b["affect_end"]):
-            _error(
-                f"ops overlap: {a['source']} and {b['source']} — "
-                f"split into separate patches"
-            )
+            why = (f"ops overlap: {a['source']} and {b['source']} — "
+                   f"split into separate patches")
+            conflicts[i] = why
+            conflicts[j] = why
+    return conflicts
+
+
+def _op_source_label(op, resolved=None):
+    """How an operation is named in a receipt, resolved or not.
+
+    A deferred op has no resolved record to take `source` from, and it still
+    has to be nameable: «which of my ten edits is this» is the first thing a
+    person asks of a refusal.
+    """
+    if resolved:
+        return resolved["source"]
+    if isinstance(op, dict):
+        if "range" in op:
+            return f"range={op['range']!r}"
+        if "quote" in op:
+            return f"quote={op['quote']!r}"
+    return json.dumps(op, ensure_ascii=False)[:80]
 
 
 def _common_affixes(a, b):
@@ -3020,7 +3354,7 @@ def _distinct_anchor_ranges(spans):
 
 def _rewrite_anchor_requests(doc_tab, search_text, new_text, start, end,
                              anchors, attribution, named_intervals,
-                             has_resolved):
+                             closed_present=False):
     """Requests that rewrite a fully-covered anchor without ghosting it.
 
     A person does this by hand: type the new text INSIDE the comment's
@@ -3042,13 +3376,28 @@ def _rewrite_anchor_requests(doc_tab, search_text, new_text, start, end,
         # break, so the text that lands would not be the text we measured
         # positions for.
         return None
-    if has_resolved:
-        # Closed threads are invisible to the export, so their anchors could
-        # be anywhere — including under the character this batch deletes, and
-        # deleteContentRange is what turns a closed thread into a ghost.
-        # `patch` never used deletion before; it is not going to start by
-        # gambling with a thread it cannot see.
+    if "\n" in search_text:
+        # `replaceAllText` does not match across a paragraph break, so request
+        # 2 would change nothing while requests 1 and 3 landed anyway: text
+        # damaged, outcome unknown. Unreachable before #45 made cross-paragraph
+        # anchors placeable, and checked explicitly rather than left to
+        # `_REWRITE_FORBIDDEN`, which only looks at the REPLACEMENT text.
         return None
+    # There used to be a gate here: one closed thread ANYWHERE in the document
+    # switched this whole capability off (#38), because a closed thread's
+    # anchor is invisible to the export and could be under the character this
+    # batch deletes. It cost a live session the ability to rewrite a phrase
+    # after the customer closed unrelated threads at the other end of the
+    # file, and the refusal asked the editor to reopen them — technical work
+    # asked of a person, which the product frame forbids.
+    #
+    # Measured 2026-08-16 (M13, docs/FINDINGS.md), on the worst shape there
+    # is: a closed thread whose ENTIRE anchor is the character this batch
+    # deletes. It survived — still in the resolved list, conversation intact,
+    # marked by Google as «Исходный контент удален». It loses its attachment,
+    # not its words, and that is exactly what happens when a person edits the
+    # same text by hand. Everything else in the batch is `replaceAllText`,
+    # which is measured not to hurt closed threads even at full coverage.
     if any("tableOfContents" in el for el in
            (doc_tab.get("body", {}) or {}).get("content", [])):
         # The text walkers do not read a table of contents, so the local
@@ -3098,6 +3447,19 @@ def _rewrite_anchor_requests(doc_tab, search_text, new_text, start, end,
         return None
     head, tail = search_text[:-1], search_text[-1]
     tail_len = _utf16_len(tail)
+    if closed_present and (tail_len > 1 or unicodedata.combining(tail)):
+        # The one deletion this batch makes lands on this character. For the
+        # LIVE thread nothing here is at risk whatever the character is — its
+        # anchor holds `new_text` by then and never collapses to zero. The
+        # doubt is only about a CLOSED thread whose invisible anchor might be
+        # exactly this character: M13 measured that case on a plain BMP
+        # letter, not on a surrogate pair or a combining mark. The geometry
+        # says the class cannot matter (a whole code point goes, never half of
+        # one), but «cannot matter» is not a measurement (#47).
+        #
+        # Hence the narrow shape: no closed threads in the document, no doubt,
+        # and an emoji at the end of a commented phrase keeps working.
+        return None
 
     # Project the document as it will read between request 1 and request 2 and
     # verify there that the search string is unique AND lands where we think.
@@ -3132,6 +3494,59 @@ def _rewrite_anchor_requests(doc_tab, search_text, new_text, start, end,
             "endIndex": start + _utf16_len(new_text) + tail_len}}},
     ]
     return requests, tail_len
+
+
+def _why_no_rewrite(doc_tab, search_text, new_text, start, end, anchors,
+                    attribution, named_intervals, closed_present=False):
+    """Why the whole-fragment rewrite did not fire, in words for a person.
+
+    `_rewrite_anchor_requests` answers None to half a dozen different
+    questions, and the refusal used to give the same advice — «leave part of
+    the original anchor text alone» — for all of them. That advice is sound
+    for exactly one of the reasons and misleading for the rest: it sends the
+    person to rewrite their edit when what is in the way is a table of
+    contents, a named range or a neighbour's comment (#24 all over again).
+
+    Cheap re-checks in the order that matters, most specific first. Not a
+    second implementation of the preconditions — only the ones a person can
+    act on; anything else falls through to the original sentence, which is
+    the one that is true when nothing structural is in the way.
+    """
+    if "\n" in search_text:
+        return ("Этот фрагмент занимает несколько абзацев, а переписать "
+                "целиком skrepka умеет только фрагмент внутри одного. "
+                "Правьте абзацы по отдельности.")
+    if any("tableOfContents" in el for el in
+           (doc_tab.get("body", {}) or {}).get("content", [])):
+        return ("В документе есть оглавление, а его текст skrepka не читает — "
+                "поэтому переписать прокомментированный фрагмент целиком она "
+                "здесь не берётся. Правьте этот фрагмент в интерфейсе.")
+    for ns, ne, label in named_intervals:
+        if _ranges_overlap(start, end, ns, ne):
+            return (f"На этом фрагменте стоит {label} — перезапись задела бы "
+                    f"машинную пометку. Снимите её или правьте фрагмент в "
+                    f"интерфейсе.")
+    doomed = _doomed_threads(start, end, anchors, attribution)
+    doomed_cid = doomed[0][0] if len(doomed) == 1 else None
+    for as_, ae, _t, aid in anchors:
+        if not _ranges_overlap(start, end, as_, ae):
+            continue
+        if doomed_cid is not None and attribution.get(aid) == doomed_cid:
+            continue
+        return ("На этом же фрагменте есть ещё один комментарий, и переписать "
+                "его целиком, не задев соседний, нельзя. Правьте фрагмент в "
+                "интерфейсе.")
+    if closed_present and len(search_text) >= 2:
+        tail = search_text[-1]
+        if _utf16_len(tail) > 1 or unicodedata.combining(tail):
+            return ("Фрагмент кончается эмодзи или знаком ударения, а в "
+                    "документе есть закрытые треды — что делает Google с "
+                    "таким символом при перезаписи, мы не мерили и гадать не "
+                    "будем. Правьте фрагмент в интерфейсе или поменяйте "
+                    "границу выделения.")
+    return ("Уцелеть должен ИСХОДНЫЙ символ якоря — повтор того же текста в "
+            "замене не помогает. Оставьте в замене часть исходного якорного "
+            "текста нетронутой или правьте этот фрагмент в интерфейсе.")
 
 
 def _execute_anchor_rewrite(docs_service, file_id, tid, requests, revision_id,
@@ -3248,7 +3663,8 @@ def _execute_replace_all(docs_service, file_id, tid, search_text, new_text,
         )
 
 
-def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
+def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
+                          warnings=None):
     """Apply ONE op on a commented doc.
 
     Inserts: fresh read, re-resolve, pinned batch (C5 verified safe).
@@ -3341,6 +3757,12 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
         if snap is None:
             last_reason = retry_reason
             continue
+        if warnings is not None:
+            # Collected for the caller to print ONCE. A vanished thread is a
+            # property of the document, not of this operation — repeating it
+            # per op would be ten copies of the same line on a ten-edit file.
+            for g in snap.get("ghosts") or ():
+                warnings.setdefault(g.get("id"), g)
         canary = snap["canary"]
 
         def _canary_msg(msg, cleaned):
@@ -3357,9 +3779,6 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
         # coverage ghosts a comment (C1), partial overlap is verified safe.
         # (Inserts never reach here; they cannot remove text.)
         attribution = snap.get("attribution") or {}
-        # hoisted: the refusal below has to say WHY the rewrite was off, and
-        # a closed thread is the reason an agent cannot guess (#24)
-        has_resolved = any(c.get("resolved") for c in anchored_now)
         start_at, end_at, applied_text = r["start"], r["end"], r["text"]
         hits = _blocked_hits(start_at, end_at, snap["blocked"])
         doomed = _doomed_threads(start_at, end_at, snap["anchors"], attribution)
@@ -3385,7 +3804,7 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
             rewrite = _rewrite_anchor_requests(
                 doc_tab, search_text, r["text"], start_at, end_at,
                 snap["anchors"], attribution, named_intervals,
-                has_resolved=has_resolved)
+                closed_present=any(c.get("resolved") for c in anchored_now))
             if rewrite:
                 doomed = []
         if style_problem:
@@ -3409,27 +3828,15 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id):
             # that did not happen, the refusal must say what stopped it —
             # otherwise the agent reads «impossible» and goes looking for the
             # destructive path (#24).
-            # Was the closed thread ACTUALLY what stopped it? The rewrite has
-            # half a dozen other preconditions (a table of contents in the
-            # tab, a named range in the way, a neighbour's anchor…), and
-            # naming the wrong one sends the person to reopen threads for
-            # nothing (found in review). The check is a pure re-run.
-            blocked_by_closed = has_resolved and _rewrite_anchor_requests(
+            # A closed thread used to be the usual answer here and no longer
+            # is: the gate it held is gone (M13). What remains are the
+            # rewrite's own preconditions, and they need telling apart —
+            # «оставьте часть исходного текста» is sound advice for exactly
+            # one of them and misleading for the rest (found in review).
+            why = " " + _why_no_rewrite(
                 doc_tab, search_text, r["text"], start_at, end_at,
                 snap["anchors"], attribution, named_intervals,
-                has_resolved=False) is not None
-            why = (
-                " Переписать прокомментированный фрагмент целиком, не теряя "
-                "тред, skrepka умеет — но не на этом документе: в нём есть "
-                "закрытый тред, его якорь в выгрузке не виден, а перезапись "
-                "содержит удаление и может такой якорь расцепить. Переоткройте "
-                "или удалите закрытые треды в интерфейсе, если нужна полная "
-                "перезапись фрагмента."
-                if blocked_by_closed else
-                " Уцелеть должен ИСХОДНЫЙ символ якоря — повтор того же "
-                "текста в замене не помогает. Оставьте в замене часть "
-                "исходного якорного текста нетронутой или правьте этот "
-                "фрагмент в интерфейсе.")
+                closed_present=any(c.get("resolved") for c in anchored_now))
             _error(_canary_msg(
                 f"замена накрывает целиком последний якорь {who} "
                 f"(текст якоря «{atext[:60]}») — тред станет призраком (C1), "
@@ -3570,30 +3977,62 @@ def patch_doc(file_id, ops_path, tab_id=None):
 
     # Resolve every op against the current snapshot (validates targets early
     # for both paths) and classify what each one actually does.
-    resolved = [_resolve_op(op, doc_tab, tid) for op in ops]
-    insertions = [_op_pure_insertion(op, doc_tab, r)
-                  for op, r in zip(ops, resolved)]
-    noops = [_op_is_noop(op, doc_tab, r) for op, r in zip(ops, resolved)]
+    #
+    # Per-op refusal used to live only INSIDE the apply loop, so everything
+    # rejected earlier still took the whole file down with it: one non-unique
+    # quote cost the person 36 correct edits in a live session (#36). Nothing
+    # here writes anything, so a failure here is never a reason to throw away
+    # the operations it has no relation to.
+    global _RAISE_ERRORS
+    resolved, insertions, noops = [], [], []
+    deferred, early_refusals = {}, {}
+    _RAISE_ERRORS = True
+    try:
+        for i, op in enumerate(ops):
+            try:
+                r = _resolve_op(op, doc_tab, tid)
+                ins = _op_pure_insertion(op, doc_tab, r)
+                noop = _op_is_noop(op, doc_tab, r)
+            except PatchOpError as e:
+                resolved.append(None)
+                insertions.append(None)
+                noops.append(False)
+                deferred[i] = str(e)
+                continue
+            resolved.append(r)
+            insertions.append(ins)
+            noops.append(noop)
+    finally:
+        _RAISE_ERRORS = False
 
     # Ambiguous batches are rejected — but an op that writes nothing occupies
     # nothing, and used to veto a perfectly compatible neighbour purely by
-    # holding a range (found in review).
-    _check_ops_overlap([r for r, noop in zip(resolved, noops) if not noop])
+    # holding a range (found in review). Both members of an overlapping pair
+    # are refused: applying either one moves the other's target.
+    early_refusals.update(_ops_overlap_conflicts(
+        {i: r for i, r in enumerate(resolved) if r and not noops[i]}))
 
     # Suggestions are judged by position, not by their existence anywhere in
     # the tab (r8, after the export was measured). An op that removes nothing
     # is checked as a point; a replace is checked as a range.
-    for r, ins, noop in zip(resolved, insertions, noops):
-        if noop:
-            continue  # writes nothing at all
-        if r["kind"] == "insert" or ins:
-            point = r["start"]
-            if ins and ins[0] == "after":
-                point = r["end"]
-            _refuse_on_suggestion_at(doc_tab, point, r["source"])
-        else:
-            _refuse_on_suggestion_range(doc_tab, r["start"], r["end"],
-                                        r["source"])
+    _RAISE_ERRORS = True
+    try:
+        for i, (r, ins, noop) in enumerate(zip(resolved, insertions, noops)):
+            if r is None or noop or i in early_refusals:
+                continue  # unresolved, writes nothing at all, or already out
+            try:
+                if r["kind"] == "insert" or ins:
+                    point = r["start"]
+                    if ins and ins[0] == "after":
+                        point = r["end"]
+                    _refuse_on_suggestion_at(doc_tab, point, r["source"])
+                else:
+                    _refuse_on_suggestion_range(doc_tab, r["start"], r["end"],
+                                                r["source"])
+            except PatchOpError as e:
+                early_refusals[i] = str(e)
+    finally:
+        _RAISE_ERRORS = False
 
     _all, anchored, _, _ = _census_comments(drive_service, file_id)
 
@@ -3607,7 +4046,13 @@ def patch_doc(file_id, ops_path, tab_id=None):
                 "an anchored comment appeared while preparing the patch; "
                 "re-run — the doc now requires the anchor-safe strategy"
             )
-        ordered = sorted(range(len(resolved)),
+        # A deferred op cannot be rescued here: this path writes ONE atomic
+        # batch against the planning snapshot, with no live re-read to resolve
+        # it against later. It joins the refusals, and the batch carries the
+        # rest.
+        skipped = dict(deferred)
+        skipped.update(early_refusals)
+        ordered = sorted((i for i in range(len(resolved)) if i not in skipped),
                          key=lambda i: resolved[i]["affect_start"],
                          reverse=True)
         requests = []
@@ -3655,21 +4100,33 @@ def patch_doc(file_id, ops_path, tab_id=None):
                     f"batchUpdate failed (possibly revision conflict): {reason}. "
                     f"Re-read the doc and retry."
                 )
-        print(json.dumps({
-            "action": "patched",
+        result = {
+            "action": "patched" if not skipped else "partially-patched",
             "strategy": "index-atomic",
             "doc_id": file_id,
             "tab_id": tid,
-            "ops_applied": len(resolved),
+            "ops_applied": len(resolved) - len(skipped),
             "revision_id_before": revision_id,
-        }, ensure_ascii=False))
+        }
+        if skipped:
+            result["refused"] = [
+                {"op": i, "source": _op_source_label(ops[i], resolved[i]),
+                 "error": skipped[i]} for i in sorted(skipped)]
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            sys.exit(3)
+        print(json.dumps(result, ensure_ascii=False))
         return
 
     # ---- commented-doc path: per-op pinned batches ----
     # Replaces are protected per-op by W8 export-based anchor mapping
     # (full-anchor coverage refused; partial overlap allowed). Inserts are
     # gated by C5.
-    has_insert = any(r["kind"] == "insert" for r in resolved)
+    # A deferred op has no resolved record, so its kind is read from the op
+    # itself — the gate must not go blind just because a target did not
+    # resolve on the planning snapshot.
+    has_insert = any(r["kind"] == "insert" if r else
+                     str(ops[i].get("op", "")).startswith("insert")
+                     for i, r in enumerate(resolved))
     if has_insert and C5_INSERT_NEAR_ANCHOR_SAFE is not True:
         state = "unverified" if C5_INSERT_NEAR_ANCHOR_SAFE is None else "verified UNSAFE"
         _error(
@@ -3679,18 +4136,42 @@ def patch_doc(file_id, ops_path, tab_id=None):
             f"C5_INSERT_NEAR_ANCHOR_SAFE, or edit in the UI."
         )
 
-    global _RAISE_ERRORS
     applied, op_notes, refused = [], [], []
+    ghosts = {}
     failed_at, failure, app_state = None, None, None
     for i, op in enumerate(ops):
+        if i in early_refusals:
+            # rejected by a gate that judged it on the planning snapshot and
+            # will judge it the same way on any other — no reason to send it
+            refused.append({"op": i,
+                            "source": _op_source_label(op, resolved[i]),
+                            "error": early_refusals[i]})
+            continue
         try:
             _RAISE_ERRORS = True  # nested preflight errors must not exit
             try:
                 note = _apply_op_anchor_safe(docs_service, drive_service,
-                                             file_id, op, tab_id)
+                                             file_id, op, tab_id,
+                                             warnings=ghosts)
             finally:
                 _RAISE_ERRORS = False
-            applied.append(resolved[i]["source"])
+            applied.append(_op_source_label(op, resolved[i]))
+            if i in deferred:
+                # It resolved against the live document even though it did not
+                # resolve against the planning snapshot — the ops before it
+                # made its target unambiguous. That is legitimate and it is
+                # also the one case where the overlap check never saw this
+                # operation, so the receipt says so instead of implying a
+                # guarantee that was not made (#36). Merged into this op's own
+                # note, never appended as a second one: two receipt entries
+                # for one operation read as two operations.
+                note = dict(note or
+                            {"source": _op_source_label(op, resolved[i])})
+                note["deferred"] = (
+                    "на исходном снимке цель не разрешалась "
+                    f"({deferred[i]}); операция разрешена по живому документу "
+                    "и в проверке пересечений с другими правками не "
+                    "участвовала")
             if note:
                 op_notes.append(note)
             continue
@@ -3708,7 +4189,8 @@ def patch_doc(file_id, ops_path, tab_id=None):
             # do not overlap (checked above), so the rest are independent of
             # it. Refusing THIS operation must not cost the person the other
             # nine (r8): the refusal is collected and the loop goes on.
-            refused.append({"op": i, "source": resolved[i]["source"],
+            refused.append({"op": i,
+                            "source": _op_source_label(op, resolved[i]),
                             "error": reason})
             continue
         # unknown state: what the document looks like is no longer known,
@@ -3734,13 +4216,29 @@ def patch_doc(file_id, ops_path, tab_id=None):
     }
     if op_notes:
         result["op_notes"] = op_notes
+    if ghosts:
+        # Named, never removed: deleting somebody's comment is the person's
+        # decision (CONTRACT §2.2). Before #34 each of these stopped every
+        # replace in the document instead.
+        result["ghost_threads"] = [
+            {"id": g.get("id"), "link": g.get("link"), "quote": g.get("quote"),
+             "note": ("комментарий пропал из документа — якоря у него больше "
+                      "нет, на правки он не влияет. Убрать его можно вручную: "
+                      "«Удалить» в панели комментариев"
+                      if not g.get("fenced") else
+                      "комментарий пропал из выгрузки, но текст, на котором он "
+                      "висел, ещё в документе — правки этого места отклонены, "
+                      "остальной документ правится. Посмотрите тред по ссылке: "
+                      "он либо потерял привязку, либо цел, и это видно глазами")}
+            for g in ghosts.values()]
     if refused:
         result["refused"] = refused
     if failed_at is not None:
         result["failed_at"] = failed_at
         result["error"] = failure
         result["failed_op_state"] = app_state
-        result["remaining"] = [r["source"] for r in resolved[failed_at:]]
+        result["remaining"] = [_op_source_label(ops[j], resolved[j])
+                               for j in range(failed_at, len(ops))]
     if failed_at is not None or refused:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         sys.exit(3)
@@ -4462,19 +4960,25 @@ def _opaque_hash(el):
 def _closed_threads_in_edited_ranges(doc_tab, closed, edited):
     """Best-effort: which closed threads probably sat in an edited paragraph.
 
-    The thread's stale quote is looked up in the tab, the same way
-    `_informational_replies` does. Display only — it never decides anything,
-    the snapshot is stale by construction. Measured useful: on the acceptance
-    run it named the doomed thread correctly.
+    Returns {thread id: how many places its stale quote matches}. The count is
+    not decoration: `_locate_comment_in_tab` returns EVERY occurrence, so on a
+    document with repeated paragraphs a thread standing in a clean copy is
+    reported as hit when the other copy is edited (#29). One match means «here»;
+    several mean «one of these», and the person deserves the difference — the
+    note sends them to check a thread by eye.
+
+    Display only — it never decides anything, the snapshot is stale by
+    construction. Measured useful: on the acceptance run it named the doomed
+    thread correctly.
     """
-    suspects = set()
+    suspects = {}
     if doc_tab is None or not edited:
         return suspects
     for c in closed:
-        for cs, ce in _locate_comment_in_tab(doc_tab, c):
-            if any(_ranges_overlap(s, e, cs, ce) for s, e in edited):
-                suspects.add(c.get("id"))
-                break
+        where = _locate_comment_in_tab(doc_tab, c)
+        if any(_ranges_overlap(s, e, cs, ce)
+               for cs, ce in where for s, e in edited):
+            suspects[c.get("id")] = len(where)
     return suspects
 
 
@@ -4500,7 +5004,7 @@ def _archive_closed_threads(md_path, file_id, closed, doc_tab=None,
     suspects = _closed_threads_in_edited_ranges(doc_tab, closed, edited)
     entries = []
     for c in closed:
-        near = c.get("id") in suspects
+        matches = suspects.get(c.get("id"))
         entries.append({
             "id": c.get("id"),
             "link": _thread_link(file_id, c.get("id")),
@@ -4508,7 +5012,16 @@ def _archive_closed_threads(md_path, file_id, closed, doc_tab=None,
             "created": c.get("createdTime"),
             "quote": (c.get("quotedFileContent") or {}).get("value"),
             "content": c.get("content"),
-            "probably_in_an_edited_paragraph": near,
+            "probably_in_an_edited_paragraph": matches is not None,
+            # «here» and «one of N places» are different messages: the flag
+            # sends the person to check a thread by eye, and on a document
+            # with repeated paragraphs the old flat `true` sent them to a
+            # thread the edit never touched (#29)
+            "where": ("текст этого треда встречается в документе "
+                      f"{matches} раз — правка задела одно из этих мест"
+                      if matches and matches > 1 else
+                      "правка переписывает место, где стоял этот тред"
+                      if matches else None),
             "replies": [
                 {"author": (r.get("author") or {}).get("displayName"),
                  "created": r.get("createdTime"),
@@ -5606,11 +6119,18 @@ def sync_doc(file_id, md_path, tab_id=None):
                      "возвращает. Разговор сохранён в файле."),
         }
         if suspects:
+            # «стояли» would be a claim, and on a document with repeated
+            # paragraphs it is sometimes a false one — the quote matches in
+            # several places and only one of them is being edited (#29)
+            unsure = sum(1 for n in suspects.values() if n > 1)
+            hedge = (f" (у {unsure} из них текст встречается в документе "
+                     f"не один раз, так что это может быть и другая копия)"
+                     if unsure else "")
             _warn(f"закрытых тредов в документе: {len(closed)}, из них "
-                  f"{len(suspects)} стояли в абзацах, которые правка "
-                  f"переписывает — эти треды исчезнут из документа, и "
-                  f"переоткрытие их не вернёт (замерено). Разговор сохранён: "
-                  f"{archive}")
+                  f"{len(suspects)} по нашей оценке стояли в абзацах, которые "
+                  f"правка переписывает{hedge} — такие треды исчезают из "
+                  f"документа, и переоткрытие их не вернёт (замерено). "
+                  f"Разговор сохранён: {archive}")
         else:
             _warn(f"в документе {len(closed)} закрытых тредов; их якоря "
                   f"экспорт не показывает, и правка могла их задеть. "
