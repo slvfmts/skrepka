@@ -48,20 +48,43 @@ def test_attack_marker_hidden_in_tracked_insert_fails_closed(engine, make_docx):
     assert any("outside plain body paragraphs" in p for p in problems)
 
 
-def test_marker_inside_table_is_reported_as_a_table(engine, make_docx):
-    """A comment in a cell is still a problem — but a bounded one: the census
-    says the anchor is in a table, and the caller fences off tables instead of
-    freezing the document (r8)."""
+def test_marker_inside_a_cell_is_parsed_with_its_path(engine, make_docx):
+    """r11: a comment in a cell is no longer a problem at all. The parser
+    walks cells and hands the span the path that names its cell."""
     body = ('<w:tbl><w:tr><w:tc><w:p>'
             '<w:commentRangeStart w:id="3"/><w:r><w:t>cell</w:t></w:r>'
             '<w:commentRangeEnd w:id="3"/></w:p></w:tc></w:tr></w:tbl>'
             + _p("обычный абзац"))
     spans, problems, census = engine._parse_docx_anchor_spans(make_docx(body))
-    assert len(problems) == 1
-    assert "inside tables" in problems[0]
-    assert problems[0].in_tables == frozenset({"3"})
-    assert problems[0].elsewhere == frozenset()
-    assert census["in_tables"] == frozenset({"3"})
+    assert problems == []
+    assert len(spans) == 1
+    assert spans[0]["path"] == ((0, 0, 0),)
+    assert spans[0]["anchor_text"] == "cell"
+    assert census["in_body"] == frozenset({"3"})
+    assert census["in_tables"] == frozenset()
+
+
+def test_a_body_paragraph_keeps_an_empty_path(engine, make_docx):
+    spans, _problems, _census = engine._parse_docx_anchor_spans(make_docx(
+        '<w:p><w:commentRangeStart w:id="1"/><w:r><w:t>x</w:t></w:r>'
+        '<w:commentRangeEnd w:id="1"/></w:p>'))
+    assert spans[0]["path"] == ()
+
+
+def test_the_path_counts_grid_columns_not_cells(engine, make_docx):
+    """M16: the export merges two cells into one `w:tc` with gridSpan, the API
+    keeps the covered square in its list. Addressing by list position would
+    put this anchor in the empty stub next door."""
+    body = ('<w:tbl><w:tr>'
+            '<w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr>'
+            '<w:p><w:r><w:t>шапка</w:t></w:r></w:p></w:tc>'
+            '<w:tc><w:p><w:commentRangeStart w:id="5"/>'
+            '<w:r><w:t>третья</w:t></w:r>'
+            '<w:commentRangeEnd w:id="5"/></w:p></w:tc>'
+            '</w:tr></w:tbl>')
+    spans, problems, _census = engine._parse_docx_anchor_spans(make_docx(body))
+    assert problems == []
+    assert spans[0]["path"] == ((0, 0, 2),)  # NOT (0, 0, 1)
 
 
 def test_marker_hidden_outside_a_table_stays_global(engine, make_docx):
@@ -75,27 +98,591 @@ def test_marker_hidden_outside_a_table_stays_global(engine, make_docx):
     assert hidden[0].in_tables == frozenset()
 
 
-def test_fence_off_tables_blocks_tables_not_the_document(engine, make_docx):
+def _tab_with_one_cell(cell_text, tail_text="обычный абзац"):
+    """documentTab: one 1x1 table holding `cell_text`, then a body paragraph."""
+    return {"body": {"content": [
+        {"startIndex": 1, "endIndex": 20, "table": {
+            "tableRows": [{"startIndex": 2, "endIndex": 19, "tableCells": [
+                {"startIndex": 3, "endIndex": 18, "content": [
+                    {"startIndex": 4, "endIndex": 4 + len(cell_text) + 1,
+                     "paragraph": {"elements": [
+                         {"startIndex": 4,
+                          "endIndex": 4 + len(cell_text) + 1,
+                          "textRun": {"content": cell_text + "\n"}}]}}]}]}]}},
+        {"startIndex": 20, "endIndex": 20 + len(tail_text) + 1,
+         "paragraph": {"elements": [
+             {"startIndex": 20, "endIndex": 20 + len(tail_text) + 1,
+              "textRun": {"content": tail_text + "\n"}}]}},
+    ]}}
+
+
+def test_a_cell_anchor_is_placed_at_exact_coordinates(engine, make_docx):
     body = ('<w:tbl><w:tr><w:tc><w:p>'
-            '<w:commentRangeStart w:id="3"/><w:r><w:t>cell</w:t></w:r>'
+            '<w:r><w:t>До </w:t></w:r>'
+            '<w:commentRangeStart w:id="3"/><w:r><w:t>якорь</w:t></w:r>'
             '<w:commentRangeEnd w:id="3"/></w:p></w:tc></w:tr></w:tbl>'
             + _p("обычный абзац"))
-    _spans, problems, _census = engine._parse_docx_anchor_spans(make_docx(body))
+    spans, problems, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    assert problems == []
+    ranges, mproblems, ambiguous = engine._map_anchors_to_doc(
+        _tab_with_one_cell("До якорь"), spans)
+    assert mproblems == [] and ambiguous == []
+    assert ranges == [(7, 12, "якорь", "3")]
+
+
+def test_identical_text_in_body_and_cell_stays_in_its_own_domain(engine,
+                                                                 make_docx):
+    """The r8 rule — a text-alone match may not cross a structural boundary —
+    now lives in the mapper. The body twin must not be a candidate."""
+    body = ('<w:tbl><w:tr><w:tc><w:p>'
+            '<w:commentRangeStart w:id="3"/><w:r><w:t>повтор</w:t></w:r>'
+            '<w:commentRangeEnd w:id="3"/></w:p></w:tc></w:tr></w:tbl>'
+            + _p("повтор"))
+    spans, _p2, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    ranges, mproblems, ambiguous = engine._map_anchors_to_doc(
+        _tab_with_one_cell("повтор", "повтор"), spans)
+    assert mproblems == [] and ambiguous == []
+    # placed inside the CELL (index 4), not on the body paragraph (index 20)
+    assert ranges == [(4, 10, "повтор", "3")]
+
+
+def test_identical_paragraphs_inside_one_cell_fence_that_cell(engine,
+                                                              make_docx):
+    """#26 inside a cell. In the body each candidate copy is fenced
+    separately, because they can be anywhere; inside a cell that is pointless
+    work — the anchor is in THIS cell whichever copy holds it, so the cell is
+    already the tightest honest answer."""
+    body = ('<w:tbl><w:tr><w:tc>'
+            '<w:p><w:commentRangeStart w:id="3"/><w:r><w:t>повтор</w:t></w:r>'
+            '<w:commentRangeEnd w:id="3"/></w:p>'
+            '<w:p><w:r><w:t>повтор</w:t></w:r></w:p>'
+            '</w:tc></w:tr></w:tbl>')
+    spans, _p2, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    tab = _tab_with_one_cell("повтор")
+    cell = tab["body"]["content"][0]["table"]["tableRows"][0]["tableCells"][0]
+    cell["content"].append({"startIndex": 11, "endIndex": 18, "paragraph": {
+        "elements": [{"startIndex": 11, "endIndex": 18,
+                      "textRun": {"content": "повтор\n"}}]}})
+    ranges, mproblems, ambiguous = engine._map_anchors_to_doc(tab, spans)
+    assert ranges == []
+    assert ambiguous == []          # not the body's candidate-by-candidate path
+    assert mproblems and mproblems[0].ranges == ((3, 18),)
+    assert "2 identical copies" in str(mproblems[0])
+
+
+def test_a_soft_break_in_a_cell_fences_only_that_cell(engine, make_docx):
+    """The one shape that reaches «matches nothing in that cell»: a soft line
+    break, which the export writes as \\n and the API returns as \\v (#27).
+
+    The cell is still PROVEN — the contents agree once that known mismatch is
+    normalized — so the anchor is confined to it instead of freezing the
+    document, which is what the same paragraph in the body still costs."""
+    body = ('<w:tbl><w:tr><w:tc><w:p>'
+            '<w:commentRangeStart w:id="3"/><w:r><w:t>первая</w:t></w:r>'
+            '<w:r><w:br/></w:r><w:r><w:t>вторая</w:t></w:r>'
+            '<w:commentRangeEnd w:id="3"/></w:p></w:tc></w:tr></w:tbl>')
+    spans, _p2, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    assert spans[0]["para_text"] == "первая\nвторая"
+    ranges, mproblems, _amb = engine._map_anchors_to_doc(
+        _tab_with_one_cell("первая\vвторая"), spans)
+    assert ranges == []
+    assert len(mproblems) == 1
+    assert mproblems[0].ranges == ((3, 18),)  # the cell, not the table
+    assert mproblems[0].docx_id == "3"
+
+
+def test_an_unreadable_neighbour_in_the_cell_blocks_placement(engine,
+                                                             make_docx):
+    """At a single match the body keeps the #30 hole open on purpose. A cell
+    anchor is placed for the first time in this release, so it gets the strict
+    answer — and stricter than «fence this cell»: a cell holding a paragraph
+    the API will not spell out cannot be told apart from any other cell of the
+    same shape, so the fence widens to every table (r8's answer, which needs
+    no address to be right)."""
+    # The export renders a person chip as an ordinary hyperlink with text
+    # (M8), so the cell holds TWO paragraphs on both sides — the anchored one
+    # and the chip one. The API cannot read the second at all.
+    body = ('<w:tbl><w:tr><w:tc>'
+            '<w:p><w:commentRangeStart w:id="3"/><w:r><w:t>Слава</w:t></w:r>'
+            '<w:commentRangeEnd w:id="3"/></w:p>'
+            '<w:p><w:hyperlink><w:r><w:t>Слава</w:t></w:r></w:hyperlink>'
+            '</w:p></w:tc></w:tr></w:tbl>')
+    spans, _p2, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    tab = _tab_with_one_cell("Слава")
+    cell = tab["body"]["content"][0]["table"]["tableRows"][0]["tableCells"][0]
+    cell["content"].append({"startIndex": 11, "endIndex": 17, "paragraph": {
+        "elements": [{"startIndex": 11, "endIndex": 16, "person": {}},
+                     {"startIndex": 16, "endIndex": 17,
+                      "textRun": {"content": "\n"}}]}})
+    ranges, mproblems, _amb = engine._map_anchors_to_doc(tab, spans)
+    assert ranges == []
+    assert mproblems and mproblems[0].ranges == ((1, 20),)  # the table
+    assert "cannot read" in str(mproblems[0])
+
+
+def test_a_cross_cell_anchor_fences_the_table_instead_of_being_placed(
+        engine, make_docx):
+    """Both ends resolve, but `patch` allows an operation lying INSIDE a
+    healthy anchor — so an exact range would let the intermediate cell be
+    emptied. Confine it to the common ancestor."""
+    body = ('<w:tbl><w:tr>'
+            '<w:tc><w:p><w:commentRangeStart w:id="3"/>'
+            '<w:r><w:t>левая</w:t></w:r></w:p></w:tc>'
+            '<w:tc><w:p><w:r><w:t>правая</w:t></w:r>'
+            '<w:commentRangeEnd w:id="3"/></w:p></w:tc>'
+            '</w:tr></w:tbl>'
+            '<w:tbl><w:tr><w:tc><w:p><w:r><w:t>другая</w:t></w:r>'
+            '</w:p></w:tc></w:tr></w:tbl>')
+    spans, _p2, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    assert spans[0]["path"] != spans[0]["end_path"]
+    # A SECOND table stands next to it, so «the table that holds both ends» is
+    # visibly narrower than «every table» — the two answers would look alike
+    # on a document with only one.
+    other = {"startIndex": 40, "endIndex": 60, "table": {"tableRows": [
+        {"startIndex": 41, "endIndex": 59, "tableCells": [
+            {"startIndex": 42, "endIndex": 58, "content": [
+                {"startIndex": 43, "endIndex": 50, "paragraph": {
+                    "elements": [{"startIndex": 43, "endIndex": 50,
+                                  "textRun": {"content": "другая\n"}}]}}]}]}]}}
     tab = {"body": {"content": [
-        {"startIndex": 1, "endIndex": 40, "table": {"rows": 1}},
-        {"startIndex": 40, "endIndex": 55, "paragraph": {"elements": []}},
+        {"startIndex": 1, "endIndex": 40, "table": {"tableRows": [
+            {"startIndex": 2, "endIndex": 39, "tableCells": [
+                {"startIndex": 3, "endIndex": 12, "content": [
+                    {"startIndex": 4, "endIndex": 10, "paragraph": {
+                        "elements": [{"startIndex": 4, "endIndex": 10,
+                                      "textRun": {"content": "левая\n"}}]}}]},
+                {"startIndex": 12, "endIndex": 22, "content": [
+                    {"startIndex": 13, "endIndex": 20, "paragraph": {
+                        "elements": [{"startIndex": 13, "endIndex": 20,
+                                      "textRun": {"content": "правая\n"}}]}}]},
+            ]}]}},
+        other,
+    ]}}
+    ranges, mproblems, _amb = engine._map_anchors_to_doc(tab, spans)
+    assert ranges == []
+    # the table that holds both ends, and NOT the neighbour
+    assert mproblems and mproblems[0].ranges == ((1, 40),)
+
+
+def test_an_anchor_running_from_the_body_into_a_cell_fails_closed(engine,
+                                                                  make_docx):
+    body = ('<w:p><w:commentRangeStart w:id="3"/>'
+            '<w:r><w:t>в теле</w:t></w:r></w:p>'
+            '<w:tbl><w:tr><w:tc><w:p><w:r><w:t>в ячейке</w:t></w:r>'
+            '<w:commentRangeEnd w:id="3"/></w:p></w:tc></w:tr></w:tbl>')
+    spans, _p2, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    ranges, mproblems, _amb = engine._map_anchors_to_doc(
+        _tab_with_one_cell("в ячейке"), spans)
+    assert ranges == []
+    assert any("share nothing but the document body" in str(p)
+               for p in mproblems)
+    assert not any(getattr(p, "ranges", ()) for p in mproblems)
+
+
+def test_a_lattice_the_api_does_not_confirm_fails_closed(engine, make_docx):
+    """The export puts the anchor in table 1; the API has one table. The two
+    views describe different documents — no guessing at the nearest cell."""
+    body = (_p("до")
+            + '<w:tbl><w:tr><w:tc><w:p><w:r><w:t>первая</w:t></w:r>'
+              '</w:p></w:tc></w:tr></w:tbl>'
+            + '<w:tbl><w:tr><w:tc><w:p><w:commentRangeStart w:id="3"/>'
+              '<w:r><w:t>вторая</w:t></w:r>'
+              '<w:commentRangeEnd w:id="3"/></w:p></w:tc></w:tr></w:tbl>')
+    spans, _p2, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    assert spans[0]["path"] == ((1, 0, 0),)
+    ranges, mproblems, _amb = engine._map_anchors_to_doc(
+        _tab_with_one_cell("вторая"), spans)
+    assert ranges == []
+    assert any("no such table" in str(p) or "disagree" in str(p)
+               for p in mproblems)
+
+
+def test_a_table_count_the_api_does_not_confirm_fails_closed(engine,
+                                                             make_docx):
+    """The export holds one table, the API two. The path (table 0) resolves
+    to SOME table either way — but the two sides may be numbering different
+    ones, and placing the anchor would then put it in the wrong table. The
+    count has to be checked even when the lookup succeeds."""
+    body = ('<w:tbl><w:tr><w:tc><w:p><w:commentRangeStart w:id="3"/>'
+            '<w:r><w:t>ячейка</w:t></w:r>'
+            '<w:commentRangeEnd w:id="3"/></w:p></w:tc></w:tr></w:tbl>')
+    spans, _p2, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    tab = _tab_with_one_cell("ячейка")
+    tab["body"]["content"].append(
+        {"startIndex": 60, "endIndex": 80, "table": {"tableRows": [
+            {"startIndex": 61, "endIndex": 79, "tableCells": [
+                {"startIndex": 62, "endIndex": 78, "content": [
+                    {"startIndex": 63, "endIndex": 70, "paragraph": {
+                        "elements": [{"startIndex": 63, "endIndex": 70,
+                                      "textRun": {"content": "вторая\n"}}]}}]}]}]}})
+    ranges, mproblems, _amb = engine._map_anchors_to_doc(tab, spans)
+    assert ranges == []
+    assert any("disagree about how many tables" in str(p) for p in mproblems)
+
+
+def test_a_row_width_the_api_does_not_confirm_fails_closed(engine, make_docx):
+    """The export says the row is two grid columns wide, the API lists three
+    cells. Merges are exactly what makes those two numbers differ, so a
+    disagreement means one of the sides is being read wrong (M16)."""
+    body = ('<w:tbl><w:tr>'
+            '<w:tc><w:p><w:r><w:t>первая</w:t></w:r></w:p></w:tc>'
+            '<w:tc><w:p><w:commentRangeStart w:id="3"/>'
+            '<w:r><w:t>вторая</w:t></w:r>'
+            '<w:commentRangeEnd w:id="3"/></w:p></w:tc>'
+            '</w:tr></w:tbl>')
+    spans, _p2, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    assert spans[0]["path"] == ((0, 0, 1),)
+    tab = {"body": {"content": [
+        {"startIndex": 1, "endIndex": 60, "table": {"tableRows": [
+            {"startIndex": 2, "endIndex": 59, "tableCells": [
+                {"startIndex": 3, "endIndex": 12, "content": [
+                    {"startIndex": 4, "endIndex": 11, "paragraph": {
+                        "elements": [{"startIndex": 4, "endIndex": 11,
+                                      "textRun": {"content": "первая\n"}}]}}]},
+                {"startIndex": 12, "endIndex": 21, "content": [
+                    {"startIndex": 13, "endIndex": 20, "paragraph": {
+                        "elements": [{"startIndex": 13, "endIndex": 20,
+                                      "textRun": {"content": "вторая\n"}}]}}]},
+                {"startIndex": 21, "endIndex": 30, "content": [
+                    {"startIndex": 22, "endIndex": 29, "paragraph": {
+                        "elements": [{"startIndex": 22, "endIndex": 29,
+                                      "textRun": {"content": "третья\n"}}]}}]},
+            ]}]}},
+    ]}}
+    ranges, mproblems, _amb = engine._map_anchors_to_doc(tab, spans)
+    assert ranges == []
+    assert any("grid columns against" in str(p) for p in mproblems)
+
+
+def test_a_row_count_the_api_does_not_confirm_fails_closed(engine, make_docx):
+    """Widths agree row by row, but the API table has a row the export does
+    not. Then row 0 on one side need not be row 0 on the other."""
+    body = ('<w:tbl>'
+            '<w:tr><w:tc><w:p><w:commentRangeStart w:id="3"/>'
+            '<w:r><w:t>ячейка</w:t></w:r>'
+            '<w:commentRangeEnd w:id="3"/></w:p></w:tc></w:tr>'
+            '</w:tbl>')
+    spans, _p2, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    tab = _tab_with_one_cell("ячейка")
+    rows = tab["body"]["content"][0]["table"]["tableRows"]
+    rows.append({"startIndex": 19, "endIndex": 19, "tableCells": [
+        {"startIndex": 19, "endIndex": 19, "content": []}]})
+    ranges, mproblems, _amb = engine._map_anchors_to_doc(tab, spans)
+    assert ranges == []
+    assert any("how many rows" in str(p) for p in mproblems)
+
+
+def test_a_cell_the_two_sides_read_differently_fails_closed(engine, make_docx):
+    """Shape agrees all the way down, but the cell holds one paragraph in the
+    export and two in the API — so skrepka is reading that cell wrong, and a
+    placement inside it would be a guess."""
+    body = ('<w:tbl><w:tr><w:tc><w:p><w:commentRangeStart w:id="3"/>'
+            '<w:r><w:t>ячейка</w:t></w:r>'
+            '<w:commentRangeEnd w:id="3"/></w:p></w:tc></w:tr></w:tbl>')
+    spans, _p2, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    tab = _tab_with_one_cell("ячейка")
+    cell = tab["body"]["content"][0]["table"]["tableRows"][0]["tableCells"][0]
+    cell["content"].append({"startIndex": 12, "endIndex": 17, "paragraph": {
+        "elements": [{"startIndex": 12, "endIndex": 17,
+                      "textRun": {"content": "ещё\n"}}]}})
+    ranges, mproblems, _amb = engine._map_anchors_to_doc(tab, spans)
+    assert ranges == []
+    assert any("disagree about the contents" in str(p) for p in mproblems)
+    # NOT the one table the unproven path points at — every table, which needs
+    # no address to be right
+    assert mproblems[0].ranges == ((1, 20),)
+
+
+def _two_tables_tab(first_text, second_text):
+    """Two 1x1 tables of identical shape, with the given cell texts."""
+    def table(start, text):
+        p_end = start + 2 + len(text) + 1
+        return {"startIndex": start, "endIndex": p_end + 1,
+                "table": {"tableRows": [
+                    {"startIndex": start + 1, "endIndex": p_end,
+                     "tableCells": [
+                         {"startIndex": start + 2, "endIndex": p_end,
+                          "content": [
+                              {"startIndex": start + 3, "endIndex": p_end,
+                               "paragraph": {"elements": [
+                                   {"startIndex": start + 3,
+                                    "endIndex": p_end,
+                                    "textRun": {
+                                        "content": text + "\n"}}]}}]}]}]}}
+    t1 = table(1, first_text)
+    t2 = table(t1["endIndex"], second_text)
+    return {"body": {"content": [t1, t2]}}, t1, t2
+
+
+_SWAP_DOCX = (
+    '<w:tbl><w:tr><w:tc><w:p><w:commentRangeStart w:id="3"/>'
+    '<w:r><w:t>первая</w:t></w:r>'
+    '<w:commentRangeEnd w:id="3"/></w:p></w:tc></w:tr></w:tbl>'
+    '<w:tbl><w:tr><w:tc><w:p><w:r><w:t>вторая</w:t></w:r>'
+    '</w:p></w:tc></w:tr></w:tbl>')
+
+
+def test_two_tables_of_the_same_shape_swapped_over_fail_closed(engine,
+                                                               make_docx):
+    """The premise the whole design rests on, attacked directly: two tables
+    with identical shape and different content, ordered differently by the two
+    sides. Every count agrees, so only the contents can tell them apart — and
+    without that check the anchor would be fenced in the wrong table while the
+    real one stayed editable, with `_replace_all_match_count` seeing 1."""
+    spans, _p2, _c = engine._parse_docx_anchor_spans(make_docx(_SWAP_DOCX))
+    assert spans[0]["path"] == ((0, 0, 0),)
+    swapped, s1, s2 = _two_tables_tab("вторая", "первая")
+    ranges, mproblems, _amb = engine._map_anchors_to_doc(swapped, spans)
+    assert ranges == []
+    assert any("not the same cell" in str(p) for p in mproblems)
+    # both tables fenced, so wherever the anchor really is, it is inside
+    assert mproblems[0].ranges == (
+        (s1["startIndex"], s1["endIndex"]), (s2["startIndex"], s2["endIndex"]))
+    # and in the right order the very same anchor is placed
+    straight, t1, _t2 = _two_tables_tab("первая", "вторая")
+    ranges, mproblems, _amb = engine._map_anchors_to_doc(straight, spans)
+    assert mproblems == []
+    cell = t1["table"]["tableRows"][0]["tableCells"][0]
+    assert ranges == [(cell["content"][0]["startIndex"],
+                       cell["content"][0]["startIndex"] + 6, "первая", "3")]
+
+
+def test_a_hidden_path_into_swapped_tables_falls_back_to_every_table(
+        engine, make_docx):
+    """Same attack against the fence built from a census path: it goes through
+    the same gate, fails it, and drops to r8's every-table fence rather than
+    naming a cell it cannot prove."""
+    body = ('<w:tbl><w:tr><w:tc>'
+            '<w:sdt><w:commentRangeStart w:id="3"/><w:r><w:t>x</w:t></w:r>'
+            '<w:commentRangeEnd w:id="3"/></w:sdt>'
+            '<w:p><w:r><w:t>первая</w:t></w:r></w:p></w:tc></w:tr></w:tbl>'
+            '<w:tbl><w:tr><w:tc><w:p><w:r><w:t>вторая</w:t></w:r>'
+            '</w:p></w:tc></w:tr></w:tbl>')
+    _spans, problems, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    assert problems[0].cell_paths == {"3": ((0, 0, 0),)}
+    swapped, t1, t2 = _two_tables_tab("вторая", "первая")
+    remaining, blocked = engine._fence_off_tables(problems, swapped)
+    assert remaining == []
+    assert [(s, e) for s, e, _ in blocked] == [
+        (t1["startIndex"], t1["endIndex"]), (t2["startIndex"], t2["endIndex"])]
+
+
+def test_a_cross_cell_anchor_over_swapped_tables_fails_closed(engine,
+                                                              make_docx):
+    """And the same for the common-ancestor branch, which used to compute an
+    ancestor without confirming either end."""
+    body = ('<w:tbl><w:tr>'
+            '<w:tc><w:p><w:commentRangeStart w:id="3"/>'
+            '<w:r><w:t>первая</w:t></w:r></w:p></w:tc>'
+            '<w:tc><w:p><w:r><w:t>вторая</w:t></w:r>'
+            '<w:commentRangeEnd w:id="3"/></w:p></w:tc>'
+            '</w:tr></w:tbl>')
+    spans, _p2, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    tab = {"body": {"content": [
+        {"startIndex": 1, "endIndex": 40, "table": {"tableRows": [
+            {"startIndex": 2, "endIndex": 39, "tableCells": [
+                {"startIndex": 3, "endIndex": 12, "content": [
+                    {"startIndex": 4, "endIndex": 11, "paragraph": {
+                        "elements": [{"startIndex": 4, "endIndex": 11,
+                                      "textRun": {
+                                          "content": "ЧУЖОЕ\n"}}]}}]},
+                {"startIndex": 12, "endIndex": 22, "content": [
+                    {"startIndex": 13, "endIndex": 20, "paragraph": {
+                        "elements": [{"startIndex": 13, "endIndex": 20,
+                                      "textRun": {
+                                          "content": "вторая\n"}}]}}]},
+            ]}]}},
+    ]}}
+    ranges, mproblems, _amb = engine._map_anchors_to_doc(tab, spans)
+    assert ranges == []
+    assert any("not the same cell" in str(p) for p in mproblems)
+    assert mproblems[0].ranges == ((1, 40),)  # every table
+
+
+def test_an_opaque_cell_cannot_prove_a_swapped_table_apart(engine, make_docx):
+    """The wildcard hole, closed: the API shows table 0 holding a cell whose
+    text it will not spell out, while the real anchor sits in table 1. Every
+    count agrees, so a paragraph that «matches anything» would have confirmed
+    the wrong cell — and then `replaceAllText` would have found the real one
+    with a count of 1 and rewritten it."""
+    spans, _p2, _c = engine._parse_docx_anchor_spans(make_docx(_SWAP_DOCX))
+    swapped, s1, s2 = _two_tables_tab("вторая", "первая")
+    cell = s1["table"]["tableRows"][0]["tableCells"][0]
+    para = cell["content"][0]
+    para["paragraph"]["elements"] = [
+        {"startIndex": para["startIndex"], "endIndex": para["endIndex"],
+         "person": {}}]
+    ranges, mproblems, _amb = engine._map_anchors_to_doc(swapped, spans)
+    assert ranges == []
+    assert any("cannot read" in str(p) for p in mproblems)
+    assert mproblems[0].ranges == (
+        (s1["startIndex"], s1["endIndex"]), (s2["startIndex"], s2["endIndex"]))
+
+
+def test_a_marker_hidden_inside_a_cell_fences_that_cell(engine, make_docx):
+    """`w:sdt` inside a cell: the walk cannot process the marker, but the
+    census knows which cell it was in — so the fence is that cell, not every
+    table in the file."""
+    body = ('<w:tbl><w:tr><w:tc>'
+            '<w:sdt><w:commentRangeStart w:id="3"/>'
+            '<w:r><w:t>скрыто</w:t></w:r>'
+            '<w:commentRangeEnd w:id="3"/></w:sdt>'
+            '<w:p><w:r><w:t>видно</w:t></w:r></w:p></w:tc></w:tr></w:tbl>')
+    _spans, problems, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    hidden = [p for p in problems if getattr(p, "in_tables", None)]
+    assert hidden and hidden[0].cell_paths == {"3": ((0, 0, 0),)}
+    remaining, blocked = engine._fence_off_tables(
+        problems, _tab_with_one_cell("видно"))
+    assert remaining == []
+    assert [(s, e) for s, e, _ in blocked] == [(3, 18)]  # the cell
+
+
+def test_a_hidden_marker_straddling_two_cells_fences_the_whole_table(
+        engine, make_docx):
+    """Its start hides in one cell and its end in another. Fencing either half
+    would leave the other editable, and an edit there would damage the anchor
+    the fence claims to protect — so such an id goes back to r8's fence."""
+    body = ('<w:tbl><w:tr>'
+            '<w:tc><w:sdt><w:commentRangeStart w:id="3"/>'
+            '<w:r><w:t>левая</w:t></w:r></w:sdt>'
+            '<w:p><w:r><w:t>видно слева</w:t></w:r></w:p></w:tc>'
+            '<w:tc><w:sdt><w:commentRangeEnd w:id="3"/></w:sdt>'
+            '<w:p><w:r><w:t>видно справа</w:t></w:r></w:p></w:tc>'
+            '</w:tr></w:tbl>')
+    _spans, problems, census = engine._parse_docx_anchor_spans(make_docx(body))
+    hidden = [p for p in problems if getattr(p, "in_tables", None)]
+    assert hidden and hidden[0].cell_paths == {}
+    assert census["paths"] == {}
+    tab = {"body": {"content": [
+        {"startIndex": 1, "endIndex": 60, "table": {"tableRows": [
+            {"startIndex": 2, "endIndex": 59, "tableCells": [
+                {"startIndex": 3, "endIndex": 20, "content": [
+                    {"startIndex": 4, "endIndex": 16, "paragraph": {
+                        "elements": [{"startIndex": 4, "endIndex": 16,
+                                      "textRun": {
+                                          "content": "видно слева\n"}}]}}]},
+                {"startIndex": 20, "endIndex": 40, "content": [
+                    {"startIndex": 21, "endIndex": 34, "paragraph": {
+                        "elements": [{"startIndex": 21, "endIndex": 34,
+                                      "textRun": {
+                                          "content": "видно справа\n"}}]}}]},
+            ]}]}},
     ]}}
     remaining, blocked = engine._fence_off_tables(problems, tab)
     assert remaining == []
-    assert [(s, e) for s, e, _ in blocked] == [(1, 40)]
+    assert [(s, e) for s, e, _ in blocked] == [(1, 60)]  # the table, not a cell
+
+
+def test_a_hidden_path_the_api_does_not_confirm_falls_back(engine, make_docx):
+    """A fence built from a path gets the same agreement gate a placement
+    does. Here the export has one table and the API two, so the path may name
+    a different cell entirely — fall back to fencing every table."""
+    body = ('<w:tbl><w:tr><w:tc>'
+            '<w:sdt><w:commentRangeStart w:id="3"/><w:r><w:t>x</w:t></w:r>'
+            '<w:commentRangeEnd w:id="3"/></w:sdt>'
+            '<w:p><w:r><w:t>видно</w:t></w:r></w:p></w:tc></w:tr></w:tbl>')
+    _spans, problems, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    assert problems[0].cell_paths == {"3": ((0, 0, 0),)}
+    tab = _tab_with_one_cell("видно")
+    tab["body"]["content"].append(
+        {"startIndex": 60, "endIndex": 80, "table": {"tableRows": [
+            {"startIndex": 61, "endIndex": 79, "tableCells": [
+                {"startIndex": 62, "endIndex": 78, "content": [
+                    {"startIndex": 63, "endIndex": 70, "paragraph": {
+                        "elements": [{"startIndex": 63, "endIndex": 70,
+                                      "textRun": {"content": "вторая\n"}}]}}]}]}]}})
+    remaining, blocked = engine._fence_off_tables(problems, tab)
+    assert remaining == []
+    assert [(s, e) for s, e, _ in blocked] == [(1, 20), (60, 80)]
+
+
+def test_two_nested_tables_in_one_cell_fence_that_cell(engine, make_docx):
+    """The two ends sit in different NESTED tables, but both nested tables sit
+    in the same outer cell — so the outer cell bounds the anchor. Refusing the
+    whole document here would be overblocking, not caution."""
+    inner = ('<w:tbl><w:tr><w:tc><w:p>{}</w:p></w:tc></w:tr></w:tbl>')
+    body = ('<w:tbl><w:tr><w:tc>'
+            + inner.format('<w:commentRangeStart w:id="3"/>'
+                           '<w:r><w:t>первая</w:t></w:r>')
+            + inner.format('<w:r><w:t>вторая</w:t></w:r>'
+                           '<w:commentRangeEnd w:id="3"/>')
+            + '</w:tc></w:tr></w:tbl>')
+    spans, _p2, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    assert spans[0]["path"] == ((0, 0, 0), (0, 0, 0))
+    assert spans[0]["end_path"] == ((0, 0, 0), (1, 0, 0))
+
+    def _cell(start, text):
+        return {"startIndex": start, "endIndex": start + len(text) + 3,
+                "content": [{"startIndex": start + 1,
+                             "endIndex": start + len(text) + 2,
+                             "paragraph": {"elements": [
+                                 {"startIndex": start + 1,
+                                  "endIndex": start + len(text) + 2,
+                                  "textRun": {"content": text + "\n"}}]}}]}
+
+    def _table(start, text):
+        cell = _cell(start + 1, text)
+        return {"startIndex": start, "endIndex": cell["endIndex"] + 1,
+                "table": {"tableRows": [
+                    {"startIndex": start + 1, "endIndex": cell["endIndex"],
+                     "tableCells": [cell]}]}}
+
+    t1 = _table(4, "первая")
+    t2 = _table(t1["endIndex"], "вторая")
+    outer_cell = {"startIndex": 3, "endIndex": t2["endIndex"] + 1,
+                  "content": [t1, t2]}
+    tab = {"body": {"content": [
+        {"startIndex": 1, "endIndex": outer_cell["endIndex"] + 1,
+         "table": {"tableRows": [
+             {"startIndex": 2, "endIndex": outer_cell["endIndex"],
+              "tableCells": [outer_cell]}]}}]}}
+    ranges, mproblems, _amb = engine._map_anchors_to_doc(tab, spans)
+    assert ranges == []
+    assert mproblems and mproblems[0].ranges == (
+        (outer_cell["startIndex"], outer_cell["endIndex"]),)
+
+
+def test_an_unreadable_element_in_a_cell_fences_the_cell_not_the_document(
+        engine, make_docx):
+    """`w:fldSimple` truncates the paragraph text, so its offsets cannot be
+    trusted. In the body that freezes the document; in a cell the extent is
+    known, so the refusal is confined to it."""
+    body = ('<w:tbl><w:tr><w:tc><w:p>'
+            '<w:commentRangeStart w:id="3"/><w:r><w:t>A</w:t></w:r>'
+            '<w:fldSimple w:instr="PAGE"><w:r><w:t>B</w:t></w:r></w:fldSimple>'
+            '<w:r><w:t>X</w:t></w:r><w:commentRangeEnd w:id="3"/>'
+            '</w:p></w:tc></w:tr></w:tbl>')
+    spans, problems, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    assert problems == []           # not a document-wide problem any more
+    assert "unsupported elements" in spans[0]["unreadable"]
+    ranges, mproblems, _amb = engine._map_anchors_to_doc(
+        _tab_with_one_cell("AX"), spans)
+    assert ranges == []
+    assert mproblems and mproblems[0].ranges == ((3, 18),)
+
+
+def test_a_marker_whose_path_is_untrusted_falls_back_to_all_tables(engine,
+                                                                   make_docx):
+    """A table wrapped in `w:sdt` is not the table the API numbers, so the
+    path it produces may point anywhere. Fall back to r8's fence."""
+    body = ('<w:sdt><w:tbl><w:tr><w:tc><w:p>'
+            '<w:commentRangeStart w:id="3"/><w:r><w:t>x</w:t></w:r>'
+            '<w:commentRangeEnd w:id="3"/></w:p></w:tc></w:tr></w:tbl></w:sdt>')
+    _spans, problems, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    hidden = [p for p in problems if getattr(p, "in_tables", None)]
+    assert hidden and hidden[0].cell_paths == {}
+    remaining, blocked = engine._fence_off_tables(
+        problems, _tab_with_one_cell("x"))
+    assert remaining == []
+    assert [(s, e) for s, e, _ in blocked] == [(1, 20)]  # the whole table
 
 
 def test_fence_off_tables_refuses_when_the_api_shows_no_table(engine, make_docx):
     """The export says «in a table», the API side has none — the two views
     disagree about the document, so nothing may be assumed."""
-    body = ('<w:tbl><w:tr><w:tc><w:p>'
+    body = ('<w:sdt><w:tbl><w:tr><w:tc><w:p>'
             '<w:commentRangeStart w:id="3"/><w:r><w:t>cell</w:t></w:r>'
-            '<w:commentRangeEnd w:id="3"/></w:p></w:tc></w:tr></w:tbl>')
+            '<w:commentRangeEnd w:id="3"/></w:p></w:tc></w:tr></w:tbl></w:sdt>')
     _spans, problems, _census = engine._parse_docx_anchor_spans(make_docx(body))
     remaining, blocked = engine._fence_off_tables(
         problems, {"body": {"content": []}})

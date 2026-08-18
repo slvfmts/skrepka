@@ -1500,13 +1500,64 @@ class _HiddenMarkerProblem(str):
     problem whose `elsewhere` is empty is bounded: every unseen anchor sits
     inside some table, and a table's extent IS known from the API side, so
     the caller can block table ranges instead of the whole document.
+
+    `cell_paths` narrows that further where it can: {w:id -> cell path} for
+    ids whose exact cell the census could name. An id missing from it is
+    bounded only by «some table» — that is what an unaddressable container
+    (a table wrapped in `w:sdt`) leaves behind.
     """
 
-    def __new__(cls, text, in_tables=(), elsewhere=()):
+    def __new__(cls, text, in_tables=(), elsewhere=(), cell_paths=None,
+                docx_lattice=None):
         obj = super().__new__(cls, text)
         obj.in_tables = frozenset(in_tables)
         obj.elsewhere = frozenset(elsewhere)
+        obj.cell_paths = dict(cell_paths or {})
+        # the export's lattice shape, so a fence built from one of those paths
+        # is checked against the API the same way a placement is — a path is
+        # only worth as much as the two sides agreeing under it
+        obj.docx_lattice = docx_lattice
         return obj
+
+
+class _LocalizedProblem(str):
+    """A problem that already carries the document ranges it is confined to.
+
+    `_AnchorProblem` names export ids and needs the placed `anchors` to turn
+    them into coordinates. That is exactly what is unavailable for an anchor
+    which could NOT be placed — and «could not be placed» is the ordinary
+    outcome inside a table cell (no match, several matches, an unreadable
+    neighbour). Such a problem knows its own fence: the cell, or the table.
+    """
+
+    def __new__(cls, text, ranges=(), docx_id=None):
+        obj = super().__new__(cls, text)
+        obj.ranges = tuple(ranges)
+        obj.docx_id = docx_id
+        return obj
+
+
+# A path names a table cell the same way on both sides of the mapping: a tuple
+# of (table_ordinal, row_index, GRID COLUMN) triples, one per nesting level,
+# empty for the body proper.
+#
+# The third number is the grid column, NOT the position in the cell list, and
+# that distinction is the whole reason M16 was measured. The two sides count
+# cells differently: the API keeps one entry per grid square (a square covered
+# by a horizontal merge stays in the list as an empty stub), while the export
+# keeps one `w:tc` per physical cell and marks the first with `gridSpan`. On a
+# row whose first two cells are merged, export cell #1 is API cell #2 — mapping
+# by list position would put the anchor in the empty stub next door.
+def _docx_grid_span(tc):
+    """How many grid columns this `w:tc` occupies (`w:gridSpan`, default 1)."""
+    node = tc.find(f"{_WORDML_NS}tcPr/{_WORDML_NS}gridSpan")
+    if node is None:
+        return 1
+    try:
+        n = int(node.get(f"{_WORDML_NS}val"))
+    except (TypeError, ValueError):
+        return 1
+    return n if n > 0 else 1
 
 
 def _parse_docx_anchor_spans(docx_bytes):
@@ -1515,10 +1566,15 @@ def _parse_docx_anchor_spans(docx_bytes):
     Returns (spans, problems, census):
       spans: [{"docx_id", "para_index", "para_text", "start_off",
                "end_para_index", "end_para_text", "end_off", "anchor_text",
-               "has_objects"}] — offsets are UTF-16 units within their own
-              paragraph's text. The two paragraph indices are equal for an
-              ordinary anchor and differ when the selection was dragged
-              across a paragraph break (#45).
+               "has_objects", "path", "end_path", "docx_lattice"}] — offsets
+              are UTF-16 units within their own paragraph's text. The two
+              paragraph indices are equal for an ordinary anchor and differ
+              when the selection was dragged across a paragraph break (#45).
+              `path` says which structural domain the paragraph belongs to:
+              empty for the body, a chain of (table, row, grid column) for a
+              table cell (#48). Two paragraphs with the same text in different
+              domains are different paragraphs, and the mapper never confuses
+              them.
       problems: reasons the mapping is unusable (unpaired ranges, inline
               objects in anchor paragraphs, malformed XML). Any problem ⇒
               caller fails closed.
@@ -1536,7 +1592,8 @@ def _parse_docx_anchor_spans(docx_bytes):
 
     spans, problems = [], []
     empty_census = {"in_tables": frozenset(), "elsewhere": frozenset(),
-                    "in_body": frozenset()}
+                    "in_body": frozenset(), "paths": {},
+                    "docx_lattice": {"tables": {}, "rows": {}}}
     try:
         with zipfile.ZipFile(io.BytesIO(docx_bytes)) as z:
             xml_bytes = z.read("word/document.xml")
@@ -1548,20 +1605,38 @@ def _parse_docx_anchor_spans(docx_bytes):
     seen_starts, seen_ends = {}, {}
     cross_para_open = {}
 
+    body = root.find(f"{w}body")
+    if body is None:
+        return [], ["malformed docx export: no w:body"], empty_census
+
     # Global census of ALL range markers anywhere in the document. After the
-    # body-paragraph walk, the processed multiset must equal this one — any
-    # marker hidden in an unsupported container (w:sdt, w:tbl, w:fldSimple,
+    # paragraph walk, the processed multiset must equal this one — any marker
+    # hidden in an unsupported container (w:sdt, w:fldSimple,
     # mc:AlternateContent, tracked changes, ...) becomes a problem instead
     # of being silently ignored (codex W8-r1 P0#1).
     #
-    # The census also remembers WHERE it saw each marker. A table is not the
-    # same kind of unknown as a tracked-change container: the table's extent
-    # is readable from the API side, so an anchor hiding in one can be fenced
-    # off instead of freezing the document (r8).
+    # The census also remembers WHERE it saw each marker. Since r11 that is a
+    # CELL PATH, not merely «somewhere in a table»: a marker the walk could not
+    # process fences its own cell instead of every table in the file (#48).
     global_starts, global_ends = {}, {}
     census_tables, census_other = set(), set()
+    census_paths, path_untrusted = {}, set()
 
-    def _census(node, in_table):
+    def _census(node, path, in_table, trusted, container):
+        """Count markers, tracking the enclosing cell path.
+
+        `t_ord` counts tables the way the API lists them: direct children of a
+        container (`body.content` / `tableCell.content`). A `w:tbl` reached
+        through anything else — wrapped in `w:sdt`, say — is walked for its
+        markers, but everything below it is marked untrusted, because the two
+        sides would then number tables differently and a path nobody can trust
+        must never become a fence.
+
+        Descending through a non-container element does NOT by itself spoil
+        the path: a marker hidden in a `w:sdt` inside a cell is still known to
+        be in THAT cell, which is exactly the case worth fencing tightly.
+        """
+        t_ord = 0
         for child in node:
             tag = child.tag
             if tag == f"{w}commentRangeStart" or tag == f"{w}commentRangeEnd":
@@ -1569,18 +1644,57 @@ def _parse_docx_anchor_spans(docx_bytes):
                 bucket = global_starts if tag.endswith("Start") else global_ends
                 bucket[cid] = bucket.get(cid, 0) + 1
                 (census_tables if in_table else census_other).add(cid)
+                if path:
+                    # every path this id was seen at, not the first: a marker
+                    # whose start hides in one cell and whose end hides in
+                    # another would otherwise fence only the opening cell and
+                    # leave the closing one editable (found in code review)
+                    census_paths.setdefault(cid, set()).add(path)
+                if not trusted:
+                    path_untrusted.add(cid)
                 continue
-            _census(child, in_table or tag == f"{w}tbl")
+            if tag == f"{w}tbl":
+                addressable = trusted and container
+                for j, tr in enumerate(child.findall(f"{w}tr")):
+                    col = 0
+                    for tc in tr.findall(f"{w}tc"):
+                        _census(tc, path + ((t_ord, j, col),), True,
+                                addressable, True)
+                        col += _docx_grid_span(tc)
+                t_ord += 1
+                continue
+            _census(child, path, in_table, trusted, False)
 
-    _census(root, False)
+    _census(body, (), False, True, True)
 
-    body = root.find(f"{w}body")
-    if body is None:
-        return [], ["malformed docx export: no w:body"], empty_census
-    # Only DIRECT body paragraphs are processed — API-side matching also
-    # uses only top-level paragraphs, so text-alone matches can never cross
-    # structural domains (codex W8-r1 P1).
-    body_paras = [ch for ch in body if ch.tag == f"{w}p"]
+    # Paragraphs are collected across DOMAINS now: direct children of the body
+    # and direct children of table cells, each carrying the path that says
+    # which one it is. The r8 rule that a text-alone match may never cross a
+    # structural boundary is not weakened by this — it moves into the mapper,
+    # which searches a span only among paragraphs sharing its path (#48).
+    body_paras, para_paths = [], []
+    docx_lattice = {"tables": {}, "rows": {}, "table_rows": {}, "paras": {}}
+
+    def _collect(node, path):
+        t_ord = 0
+        docx_lattice["paras"].setdefault(path, [])
+        for child in node:
+            if child.tag == f"{w}p":
+                body_paras.append(child)
+                para_paths.append(path)
+            elif child.tag == f"{w}tbl":
+                rows = child.findall(f"{w}tr")
+                docx_lattice["table_rows"][(path, t_ord)] = len(rows)
+                for j, tr in enumerate(rows):
+                    col = 0
+                    for tc in tr.findall(f"{w}tc"):
+                        _collect(tc, path + ((t_ord, j, col),))
+                        col += _docx_grid_span(tc)
+                    docx_lattice["rows"][(path, t_ord, j)] = col
+                t_ord += 1
+        docx_lattice["tables"][path] = t_ord
+
+    _collect(body, ())
 
     para_meta = []
     for p_index, para in enumerate(body_paras):
@@ -1660,9 +1774,15 @@ def _parse_docx_anchor_spans(docx_bytes):
                     state["has_unknown"].append(tag)
 
         walk(para)
-        para_meta.append({"text": "".join(state["parts"]),
+        text = "".join(state["parts"])
+        para_meta.append({"text": text,
                           "has_objects": state["has_objects"],
-                          "has_unknown": state["has_unknown"]})
+                          "has_unknown": state["has_unknown"],
+                          "path": para_paths[p_index]})
+        # the export's own text of every paragraph, in order, per container —
+        # this is what proves a resolved cell is the SAME cell and not merely
+        # a cell of the same shape (code review r11)
+        docx_lattice["paras"][para_paths[p_index]].append(text)
 
     # Texts are attached AFTER the walk, not inside it: a span that crosses a
     # paragraph break is not complete until both of its paragraphs have been
@@ -1671,6 +1791,12 @@ def _parse_docx_anchor_spans(docx_bytes):
         head, tail = para_meta[sp["para_index"]], para_meta[sp["end_para_index"]]
         sp["para_text"] = head["text"]
         sp["end_para_text"] = tail["text"]
+        sp["path"], sp["end_path"] = head["path"], tail["path"]
+        # The export's own shape of the lattice, shared by reference. The
+        # mapper checks it against the API before trusting a path: the number
+        # of tables in a container and the grid width of a row must agree, or
+        # the two sides are describing different documents (M16).
+        sp["docx_lattice"] = docx_lattice
         if sp["end_para_index"] == sp["para_index"]:
             sp["anchor_text"] = _slice_utf16(
                 head["text"], sp["start_off"], sp["end_off"])
@@ -1691,44 +1817,76 @@ def _parse_docx_anchor_spans(docx_bytes):
         sp["has_objects"] = head["has_objects"] or tail["has_objects"]
         unknown = sorted(set(head["has_unknown"]) | set(tail["has_unknown"]))
         if unknown:
-            problems.append(
-                f"anchor {sp['docx_id']} sits in a paragraph with "
-                f"unsupported elements ({unknown[:3]}) "
-                f"— text/offsets unreliable")
+            reason = (f"anchor {sp['docx_id']} sits in a paragraph with "
+                      f"unsupported elements ({unknown[:3]}) "
+                      f"— text/offsets unreliable")
+            # Inside a cell this is a local defect with a known extent, so it
+            # is handed to the mapper to fence instead of freezing the
+            # document. In the body there is nothing to fence with.
+            if sp["path"] or sp["end_path"]:
+                sp["unreadable"] = reason
+            else:
+                problems.append(reason)
 
     processed = set(seen_starts) & set(seen_ends)
     census = {"in_tables": frozenset(census_tables - processed),
               "elsewhere": frozenset(census_other - processed),
-              "in_body": frozenset(processed)}
+              "in_body": frozenset(processed),
+              # only trustworthy, unambiguous paths travel: the accounting
+              # fences by them too, and a fence is worth nothing if it can
+              # land next door or cover half of a straddling pair
+              "paths": {cid: next(iter(p)) for cid, p in census_paths.items()
+                        if cid not in path_untrusted and len(p) == 1},
+              # the export's own lattice shape, so a fence built from a path
+              # can be checked against the API exactly as a placement is
+              "docx_lattice": docx_lattice}
     if seen_starts != global_starts or seen_ends != global_ends:
         hidden = (set(global_starts) | set(global_ends)) - processed
         in_tables = sorted(census["in_tables"])
         elsewhere = sorted(census["elsewhere"])
+        # A path is only handed on when the census could name ONE cell and
+        # nothing untrustworthy stood between it and the container. Two
+        # different cells for one id means the marker pair straddles them, and
+        # a fence around either half would leave the other open — such an id
+        # goes back to the whole-table fence r8 used.
+        paths = {cid: next(iter(census_paths[cid])) for cid in in_tables
+                 if cid in census_paths and cid not in path_untrusted
+                 and len(census_paths[cid]) == 1}
         if in_tables and not elsewhere:
             problems.append(_HiddenMarkerProblem(
                 f"comment anchors sit inside tables: {in_tables} — their "
                 f"exact position is not readable from the export, so edits "
                 f"inside tables are refused and the rest of the document "
                 f"stays editable",
-                in_tables=in_tables))
+                in_tables=in_tables, cell_paths=paths,
+                docx_lattice=docx_lattice))
         else:
             problems.append(_HiddenMarkerProblem(
                 f"comment range markers outside plain body paragraphs "
                 f"(tables/containers/tracked changes): "
                 f"{sorted(hidden) or 'count mismatch'} — mapping unusable",
-                in_tables=in_tables, elsewhere=elsewhere))
+                in_tables=in_tables, elsewhere=elsewhere, cell_paths=paths,
+                docx_lattice=docx_lattice))
     for cid, n in seen_starts.items():
         if n != 1 or seen_ends.get(cid, 0) != 1:
             problems.append(
                 f"comment range {cid}: {n} starts / "
                 f"{seen_ends.get(cid, 0)} ends (need exactly 1/1)")
     for s in spans:
+        local = bool(s.get("path") or s.get("end_path"))
         if s.get("has_objects"):
-            problems.append(
-                f"anchor {s['docx_id']} sits in a paragraph with inline "
-                f"objects — offsets unreliable")
+            reason = (f"anchor {s['docx_id']} sits in a paragraph with inline "
+                      f"objects — offsets unreliable")
+            if local:
+                s.setdefault("unreadable", reason)
+            else:
+                problems.append(reason)
         if not s.get("anchor_text"):
-            problems.append(f"anchor {s['docx_id']} is empty")
+            reason = f"anchor {s['docx_id']} is empty"
+            if local:
+                s.setdefault("unreadable", reason)
+            else:
+                problems.append(reason)
     return spans, problems, census
 
 
@@ -1778,6 +1936,239 @@ def _pieces_fit(pieces, text):
     return True
 
 
+def _api_lattice(doc_tab):
+    """Read the API side of the document as domains addressed by path.
+
+    Returns a dict with, keyed the same way `_parse_docx_anchor_spans` keys
+    the export side:
+
+      paras     {path: [(start, end, text, pieces, could_host)]} — paragraphs
+                of that domain in order; `text` is None for a paragraph whose
+                text cannot be read (a smart chip, a rich link);
+      cells     {path: (start, end)} — the cell's own extent, straight from
+                the API (M16: cells, rows and tables all carry their own
+                indices, and there are no gaps between neighbours);
+      tables    {(container_path, ordinal): (start, end)};
+      n_tables  {container_path: how many tables it holds};
+      n_cells   {(container_path, ordinal, row): how many grid squares};
+      problems  paragraphs whose indices are unusable — a fence needs both
+                ends, and silently dropping one is how an anchor ends up
+                outside its own fence.
+
+    The grid column is the API's own cell ordinal, because the API keeps one
+    entry per grid square. The export does not, which is what `_docx_grid_span`
+    exists to reconcile.
+    """
+    out = {"paras": {}, "cells": {}, "tables": {}, "n_tables": {},
+           "n_cells": {}, "n_rows": {}, "problems": []}
+
+    def walk(content, path):
+        t_ord = 0
+        out["paras"].setdefault(path, [])
+        for el in content or []:
+            if "table" in el:
+                ts, te = el.get("startIndex"), el.get("endIndex")
+                if isinstance(ts, int) and isinstance(te, int) and ts < te:
+                    out["tables"][(path, t_ord)] = (ts, te)
+                rows = el["table"].get("tableRows", []) or []
+                out["n_rows"][(path, t_ord)] = len(rows)
+                for j, row in enumerate(rows):
+                    cells = row.get("tableCells", []) or []
+                    out["n_cells"][(path, t_ord, j)] = len(cells)
+                    for k, cell in enumerate(cells):
+                        sub = path + ((t_ord, j, k),)
+                        cs, ce = cell.get("startIndex"), cell.get("endIndex")
+                        if (isinstance(cs, int) and isinstance(ce, int)
+                                and cs < ce):
+                            out["cells"][sub] = (cs, ce)
+                        walk(cell.get("content", []), sub)
+                t_ord += 1
+                continue
+            para = el.get("paragraph")
+            if not para:
+                continue
+            start, end = el.get("startIndex"), el.get("endIndex")
+            if (not isinstance(start, int) or not isinstance(end, int)
+                    or start >= end):
+                out["problems"].append(
+                    f"paragraph with unusable indices {start!r}..{end!r} — the "
+                    f"anchor map cannot be trusted (fail closed)")
+                continue
+            elements = para.get("elements", [])
+            bucket = out["paras"].setdefault(path, [])
+            if any("textRun" not in e for e in elements):
+                pieces = [e["textRun"].get("content", "") for e in elements
+                          if "textRun" in e]
+                if pieces and pieces[-1].endswith("\n"):
+                    pieces[-1] = pieces[-1][:-1]
+                kinds = {k for e in elements for k in e
+                         if k not in ("startIndex", "endIndex")
+                         and not k.startswith("suggested")}
+                bucket.append((start, end, None, pieces,
+                               bool(kinds - _QUIET_ELEMENTS)))
+                continue
+            text = "".join(e["textRun"].get("content", "") for e in elements)
+            if text.endswith("\n"):
+                text = text[:-1]
+            bucket.append((start, end, text, (), False))
+        out["n_tables"][path] = t_ord
+
+    walk((doc_tab.get("body", {}) or {}).get("content", []), ())
+    return out
+
+
+def _resolve_cell(path, lattice, docx_lattice):
+    """Locate a cell path on the API side, or say why it cannot be trusted.
+
+    Returns (extent, problem): the cell's (start, end) when the path resolves
+    and the two sides provably describe the SAME cell, otherwise (None, why).
+
+    Every level of the path is checked, so a confirmed cell confirms all its
+    ancestors too. The checks are cumulative and each one exists for a reason
+    the previous cannot cover: the number of tables in a container, the number
+    of rows in a table, the number of grid squares in a row (export: the sum
+    of `gridSpan`; API: the length of `tableCells`), and finally the cell's
+    own paragraph texts.
+
+    There is deliberately NO half-way answer like «somewhere in this table».
+    A table is identified by its ordinal, and an ordinal is exactly what a
+    disagreement calls into question — fencing the table an unproven path
+    points at would put the fence next to the anchor rather than around it
+    (code review r11). Either the cell is proven, or nothing here is.
+    """
+    prefix = ()
+    for depth, (t_ord, row, col) in enumerate(path):
+        n_api = lattice["n_tables"].get(prefix)
+        n_docx = (docx_lattice or {}).get("tables", {}).get(prefix)
+        if n_api is None or n_docx is None or n_api != n_docx:
+            return None, (
+                f"the export and the API disagree about how many tables sit "
+                f"in {prefix or 'the document body'} ({n_docx} against "
+                f"{n_api})")
+        extent = lattice["tables"].get((prefix, t_ord))
+        if extent is None:
+            return None, (
+                f"the export puts the anchor in table {t_ord} of "
+                f"{prefix or 'the body'}, and the API has no such table")
+        rows_api = lattice["n_rows"].get((prefix, t_ord))
+        rows_docx = (docx_lattice or {}).get("table_rows", {}).get(
+            (prefix, t_ord))
+        if rows_api is None or rows_docx is None or rows_api != rows_docx:
+            return None, (
+                f"the export and the API disagree about how many rows table "
+                f"{t_ord} has ({rows_docx} against {rows_api})")
+        cells_api = lattice["n_cells"].get((prefix, t_ord, row))
+        cells_docx = (docx_lattice or {}).get("rows", {}).get(
+            (prefix, t_ord, row))
+        if cells_api is None or cells_docx is None or cells_api != cells_docx:
+            return None, (
+                f"the export and the API disagree about row {row} of table "
+                f"{t_ord}: {cells_docx} grid columns against {cells_api}")
+        prefix = prefix + ((t_ord, row, col),)
+        cell = lattice["cells"].get(prefix)
+        if cell is None:
+            return None, (
+                f"grid column {col} of row {row} in table {t_ord} is not "
+                f"readable from the API")
+        # Shape agreeing is not the same as the two sides describing the SAME
+        # cell. Two tables of identical shape, ordered differently by the two
+        # sides, would pass every count above and hand back a cell that only
+        # looks right — and then a fence would sit on the wrong cell while the
+        # real anchor stayed editable. So the contents are compared too.
+        #
+        # `\v` -> `\n` is the known soft-break mismatch (#27): the export
+        # writes `w:br` as \n where the API returns \v. Normalizing HERE does
+        # not touch the exact-match proof in the caller, which runs on
+        # `by_text` over raw API text and still sees no match for a soft break
+        # — such an anchor is fenced, not placed. A paragraph the API cannot
+        # read at all (a smart chip) matches anything: nothing can be compared
+        # against it, and an anchor near one is fenced by the opaque-neighbour
+        # rule anyway.
+        paras_api = lattice["paras"].get(prefix, ())
+        paras_docx = (docx_lattice or {}).get("paras", {}).get(prefix)
+        if paras_docx is None or len(paras_docx) != len(paras_api):
+            return None, (
+                f"the export and the API disagree about the contents of grid "
+                f"column {col} of row {row} in table {t_ord} "
+                f"({paras_docx if paras_docx is None else len(paras_docx)} "
+                f"paragraphs against {len(paras_api)})")
+        for d_text, (_st, _en, a_text, _pieces, _host) in zip(paras_docx,
+                                                              paras_api):
+            if a_text is None:
+                # A paragraph the API will not spell out (a smart chip) cannot
+                # confirm anything, and treating it as a wildcard was a hole:
+                # a cell holding one would «match» any cell of the same shape,
+                # which is exactly how a swapped pair of tables would slip
+                # through (code review r11). Unproven, then.
+                return None, (
+                    f"grid column {col} of row {row} in table {t_ord} holds a "
+                    f"paragraph skrepka cannot read, so it cannot be told "
+                    f"apart from a cell of the same shape")
+            if a_text.replace("\v", "\n") != d_text:
+                return None, (
+                    f"the export and the API read grid column {col} of row "
+                    f"{row} in table {t_ord} differently ({d_text[:30]!r} "
+                    f"against {a_text[:30]!r}) — this is not the same cell")
+        if depth == len(path) - 1:
+            return cell, None
+    return None, "empty cell path"
+
+
+def _common_container(a, b, lattice, docx_lattice):
+    """The innermost structure that provably holds both ends of a span.
+
+    Returns (extent, why_not). Two paths into the same table diverge at the
+    triple naming row and column, so their common ancestor is that table —
+    NOT the empty prefix, which would mean the body and bound nothing. When
+    one path is a prefix of the other (a cell and a nested cell inside it, or
+    the body and anything) the ancestor is the shorter one, and the body is no
+    bound at all.
+
+    Both ends are put through `_resolve_cell` FIRST. Without that this
+    function would happily name an ancestor computed from a path the two
+    sides read differently — the same defect the placement path had, arrived
+    at from the other side (code review r11). Confirming an end confirms every
+    level above it, so after this the ancestor needs no further proof.
+    """
+    for end in (a, b):
+        if not end:
+            continue
+        _extent, why_not = _resolve_cell(end, lattice, docx_lattice)
+        if why_not:
+            return None, why_not
+    prefix = ()
+    for x, y in zip(a, b):
+        if x == y:
+            prefix = prefix + (x,)
+            continue
+        if x[0] != y[0]:
+            # Different tables at this level. They still share whatever holds
+            # BOTH tables — an outer cell, when the divergence happens inside
+            # one. Only at the top level is that the body, which bounds
+            # nothing (found in code review: two nested tables in one outer
+            # cell used to fail closed on the whole document).
+            if not prefix:
+                return None, "the two ends sit in different tables of the body"
+            outer = lattice["cells"].get(prefix)
+            return outer, (None if outer else
+                           "the enclosing cell is not readable from the API")
+        n_api = lattice["n_tables"].get(prefix)
+        n_docx = (docx_lattice or {}).get("tables", {}).get(prefix)
+        if n_api is None or n_docx is None or n_api != n_docx:
+            return None, (f"the export and the API disagree about how many "
+                          f"tables sit in {prefix or 'the document body'}")
+        extent = lattice["tables"].get((prefix, x[0]))
+        if extent is None:
+            return None, f"the API has no table {x[0]} there"
+        return extent, None
+    shorter = prefix
+    if not shorter:
+        return None, "the two ends share nothing but the document body"
+    return lattice["cells"].get(shorter), (
+        None if lattice["cells"].get(shorter) else
+        "the enclosing cell is not readable from the API")
+
+
 def _map_anchors_to_doc(doc_tab, spans):
     """Map docx anchor spans to absolute doc index ranges.
 
@@ -1817,57 +2208,126 @@ def _map_anchors_to_doc(doc_tab, spans):
        ends a paragraph. **The proof leans on this**, not on `has_unknown`:
        whoever fixes the `w:br` mismatch has to revisit this branch.
     """
-    body = doc_tab.get("body", {}) or {}
-    paras, problems = [], []
-    for el in body.get("content", []):
-        para = el.get("paragraph")
-        if not para:
-            continue
-        start, end = el.get("startIndex"), el.get("endIndex")
-        if not isinstance(start, int) or not isinstance(end, int) or start >= end:
-            # A fence needs both ends. Skipping the paragraph would drop it
-            # from the candidate set silently, which is how an anchor ends up
-            # outside its own fence — refuse instead.
-            problems.append(
-                f"paragraph with unusable indices {start!r}..{end!r} — the "
-                f"anchor map cannot be trusted (fail closed)")
-            continue
-        elements = para.get("elements", [])
-        if any("textRun" not in e for e in elements):
-            pieces = [e["textRun"].get("content", "") for e in elements
-                      if "textRun" in e]
-            if pieces and pieces[-1].endswith("\n"):
-                pieces[-1] = pieces[-1][:-1]
-            kinds = {k for e in elements for k in e
-                     if k not in ("startIndex", "endIndex")
-                     and not k.startswith("suggested")}
-            paras.append((start, end, None, pieces,
-                          bool(kinds - _QUIET_ELEMENTS)))
-            continue
-        text = "".join(e["textRun"].get("content", "") for e in elements)
-        if text.endswith("\n"):
-            text = text[:-1]
-        paras.append((start, end, text, (), False))
+    lattice = _api_lattice(doc_tab)
+    problems = list(lattice["problems"])
 
     # indexed once, not rescanned per span: a long document with many threads
-    # would otherwise walk every paragraph for every anchor
-    by_text, possible_hosts = {}, []
-    for st, en, text, pieces, could_host in paras:
-        if text is None:
-            if could_host:
-                possible_hosts.append((st, en, pieces))
-        else:
-            by_text.setdefault(text, []).append((st, en))
+    # would otherwise walk every paragraph for every anchor. Indexed PER
+    # DOMAIN: a paragraph in a cell is not a candidate for an anchor in the
+    # body, however identical the text (#48).
+    by_text, possible_hosts = {}, {}
+    for path, paras in lattice["paras"].items():
+        for st, en, text, pieces, could_host in paras:
+            if text is None:
+                if could_host:
+                    possible_hosts.setdefault(path, []).append(
+                        (st, en, pieces))
+            else:
+                by_text.setdefault(path, {}).setdefault(
+                    text, []).append((st, en))
+
+    def _fence_every_table(s, why):
+        """The anchor is in SOME table and we cannot say which — fence them all.
+
+        This is r8's answer, and the point of keeping it is that it needs no
+        path to be right: the export says the marker is inside a table, every
+        table is fenced, so nothing an edit does can reach it. A global refusal
+        would be worse than the behaviour this release replaces, and fencing
+        the ONE table an unproven path points at would be worse still — that
+        ordinal is the very thing in doubt.
+        """
+        tables = _table_intervals(doc_tab)
+        if not tables:
+            problems.append(
+                f"anchor {s['docx_id']} sits in a table cell that cannot be "
+                f"located ({why}), and the API shows no tables at all — the "
+                f"two views disagree about the document (fail closed)")
+            return
+        problems.append(_LocalizedProblem(
+            f"anchor {s['docx_id']} sits in a table cell that cannot be "
+            f"located ({why}), so every table is refused and the rest of the "
+            f"document stays editable",
+            ranges=tuple((ts, te) for ts, te, _label in tables),
+            docx_id=s["docx_id"]))
+
+    def _fence_at(s, where, why):
+        """Confine a span we could not place to the structure that holds it.
+
+        The anchor is provably inside `where` — the export says which cell,
+        and M16 proved the path names the same cell on both sides — so the
+        fence protects the thread while the rest of the document, other cells
+        of the same table included, stays editable.
+        """
+        if where is None:
+            # unreachable today — every caller resolves the cell first — but a
+            # fence with a None range would be a fence with a hole in it, and
+            # this whole design leans on fences having none
+            problems.append(
+                f"anchor {s['docx_id']} sits in a table cell and {why}, and "
+                f"the cell has no readable extent (fail closed)")
+            return
+        problems.append(_LocalizedProblem(
+            f"anchor {s['docx_id']} sits in a table cell and {why}",
+            ranges=(where,), docx_id=s["docx_id"]))
 
     ranges, ambiguous = [], []
     for s in spans:
         ptext = s.get("para_text")
+        domain = s.get("path") or ()
+        end_domain = s.get("end_path", domain) or ()
+        in_cell = bool(domain)
+        if domain != end_domain:
+            # A span whose ends live in different containers is NOT placed.
+            # Placing it exactly would need a measurement nobody has: `patch`
+            # deliberately allows an operation lying INSIDE a healthy anchor,
+            # so an exact cross-cell range would let the text of an
+            # intermediate cell be deleted while both ends survive untouched.
+            # Confine it to the common ancestor instead; exact cross-cell
+            # placement is its own issue with its own acceptance scenario.
+            extent, why_not = _common_container(
+                domain, end_domain, lattice, s.get("docx_lattice"))
+            if extent is None:
+                if domain and end_domain:
+                    # both ends are in tables, so every table together still
+                    # bounds the anchor even when neither end is proven
+                    _fence_every_table(s, why_not)
+                    continue
+                problems.append(
+                    f"anchor {s['docx_id']} runs between two containers and "
+                    f"{why_not} — nothing bounds it (fail closed)")
+                continue
+            problems.append(_LocalizedProblem(
+                f"anchor {s['docx_id']} has its two ends in different cells, "
+                f"so it is fenced by the table that holds both instead of "
+                f"being placed",
+                ranges=(extent,), docx_id=s["docx_id"]))
+            continue
+        cell_extent = None
+        if in_cell:
+            # BEFORE anything is matched, not only when matching fails: the
+            # path decides WHICH cell's paragraphs are candidates, so a path
+            # the two sides read differently would quietly search the wrong
+            # cell and place the anchor there. Found by mutation testing —
+            # the check existed but only ran on the failure path.
+            cell_extent, why_not = _resolve_cell(
+                domain, lattice, s.get("docx_lattice"))
+            if cell_extent is None:
+                _fence_every_table(s, why_not)
+                continue
+        if s.get("unreadable"):
+            # The parser could not trust this span's text or offsets, and said
+            # so with a reason. In a cell that is a local defect: the cell is
+            # known, so it is fenced and the document keeps working.
+            _fence_at(s, cell_extent, s["unreadable"])
+            continue
+        by_text_here = by_text.get(domain, {})
+        hosts_here = possible_hosts.get(domain, [])
         if ptext is None:
             problems.append(
                 f"anchor {s['docx_id']} has no paragraph text — the export "
                 f"could not be read (fail closed)")
             continue
-        exact = by_text.get(ptext, [])
+        exact = by_text_here.get(ptext, [])
         if s.get("end_para_index", s["para_index"]) != s["para_index"]:
             # An anchor dragged across a paragraph break. Its two ends are
             # located INDEPENDENTLY, each by its own paragraph's text, and API
@@ -1875,7 +2335,7 @@ def _map_anchors_to_doc(doc_tab, spans):
             # chip, anything the walker skips) cannot move either end. This is
             # the anchor's exact extent, not a conservative envelope.
             etext = s.get("end_para_text")
-            end_exact = by_text.get(etext, []) if etext is not None else []
+            end_exact = by_text_here.get(etext, []) if etext is not None else []
             # Unlike the single-match branch below, opaque paragraphs ARE
             # checked here. That branch keeps a known hole (#30) only because
             # it must not freeze documents that work today; a crossing anchor
@@ -1883,7 +2343,10 @@ def _map_anchors_to_doc(doc_tab, spans):
             # gets to be strict. Found in review: a chip paragraph could be
             # the real home of either end, and placing the anchor on the
             # readable twin leaves the live thread unprotected.
-            hosts = [st for st, _en, pieces in possible_hosts
+            # `hosts_here` is always empty for a cell: a cell holding a
+            # paragraph the API will not spell out fails `_resolve_cell` and
+            # never reaches this loop at all. So this branch is the body's.
+            hosts = [st for st, _en, pieces in hosts_here
                      if _pieces_fit(pieces, ptext)
                      or (etext is not None and _pieces_fit(pieces, etext))]
             if hosts:
@@ -1894,6 +2357,11 @@ def _map_anchors_to_doc(doc_tab, spans):
                     f"undecidable (fail closed)")
                 continue
             if not exact or not end_exact:
+                if in_cell:
+                    _fence_at(s, cell_extent,
+                              "spans paragraphs and one of its ends matches "
+                              "nothing in that cell")
+                    continue
                 problems.append(
                     f"anchor {s['docx_id']} spans paragraphs and one of its "
                     f"ends matched 0 times in the doc (need exactly 1): "
@@ -1903,6 +2371,11 @@ def _map_anchors_to_doc(doc_tab, spans):
                 # Fencing the pairs of candidates is combinatorial and buys
                 # nothing today: such a document is refused as it is now, so
                 # nothing regresses by leaving it refused.
+                if in_cell:
+                    _fence_at(s, cell_extent,
+                              "spans paragraphs and one of its ends repeats "
+                              "inside that cell word for word")
+                    continue
                 problems.append(
                     f"anchor {s['docx_id']} spans paragraphs and one of its "
                     f"ends repeats in the document word for word "
@@ -1927,6 +2400,15 @@ def _map_anchors_to_doc(doc_tab, spans):
                            s["docx_id"]))
             continue
         if not exact:
+            if in_cell:
+                # A cell paragraph the API reports with different text. The
+                # one known way to get here is a soft line break — the export
+                # writes `w:br` as \n where the API returns \v (#27) — and it
+                # behaves inside a cell exactly as it does in the body (M16).
+                # In the body that costs the whole document; here it costs the
+                # cell.
+                _fence_at(s, cell_extent, "its paragraph matches nothing in that cell")
+                continue
             problems.append(
                 f"anchor {s['docx_id']} paragraph matched 0 times in the doc "
                 f"(need at least 1): {ptext[:50]!r}")
@@ -1940,7 +2422,16 @@ def _map_anchors_to_doc(doc_tab, spans):
             # leaves at one match is older than #26 and is gated on a
             # measurement nobody has yet (#30) — closing it by guesswork was
             # tried three times in review and broke ordinary documents twice.
-            hosts = [st for st, _en, pieces in possible_hosts
+            if in_cell:
+                # No candidate-by-candidate fence is needed here: the anchor
+                # is in THIS cell whichever copy holds it, so fencing the cell
+                # is already the tightest honest answer.
+                _fence_at(
+                    s, cell_extent,
+                    f"its paragraph has {len(exact)} identical copies inside "
+                    f"that cell")
+                continue
+            hosts = [st for st, _en, pieces in hosts_here
                      if _pieces_fit(pieces, ptext)]
             if hosts:
                 problems.append(
@@ -1955,6 +2446,12 @@ def _map_anchors_to_doc(doc_tab, spans):
                 "candidates": exact,
             })
             continue
+        # The hole #30 leaves at a single match stays open in the body — for
+        # the same reason as ever: closing it would freeze documents that work
+        # today. Inside a cell it is closed, and earlier than here: a cell
+        # holding a paragraph the API will not spell out cannot be told apart
+        # from any other cell of the same shape, so `_resolve_cell` refuses it
+        # before a candidate is ever looked at.
         base = exact[0][0]
         ranges.append((base + s["start_off"], base + s["end_off"],
                        s.get("anchor_text", ""), s["docx_id"]))
@@ -2135,8 +2632,6 @@ def _ghost_verdict(c, records, doc_tab, file_id=None):
         # be visibly not-later, not silently zero (found in review)
         if stamp is not None and stamp > created:
             later.append(r)
-    if not later:
-        return None
     quote = (c.get("quotedFileContent") or {}).get("value")
     if not quote:
         # No quoted text at all, and no record in the export. Measured
@@ -2149,16 +2644,31 @@ def _ghost_verdict(c, records, doc_tab, file_id=None):
         #
         # A genuinely text-anchored comment always carries the quote (it is
         # filled at creation and survives losing the anchor — the living ghost
-        # of 2026-08-09 still had it). One anchored to an image might not, but
-        # that one has a record in the export and never reaches this branch.
-        # So here the thread is either never-anchored or already ghosted, and
-        # either way nothing an edit does can hurt it. Sign 1 still has to
-        # hold: it is what rules out the export simply being older than the
-        # thread.
+        # of 2026-08-09 still had it). One anchored to an IMAGE might not —
+        # and that was the whole doubt, because an image anchor is real. It is
+        # measured now (2026-08-16, #46): a comment on a picture carries no
+        # quote and DOES leave a record in the export, markers and all, so it
+        # never reaches this branch at all.
+        #
+        # Sign 1 is waived here for EXACTLY the shape that needed it waived:
+        # an export with no records at all. That is what a document whose
+        # comments were all left through the API looks like — no record can
+        # ever be «later», the sign stays silent forever, and every replace is
+        # refused for threads that have nothing to lose (#46).
+        #
+        # When the export DOES carry records, the sign costs nothing and stays
+        # on. Narrower than the first version of this fix, and deliberately:
+        # a quote can in principle be missing for a reason nobody has measured,
+        # and where there is a cheap second opinion it is worth keeping
+        # (code review r11).
+        if records and not later:
+            return None
         return {"id": c.get("id"),
                 "link": _thread_link(file_id, c.get("id")),
                 "quote": None,
                 "fenced": []}
+    if not later:
+        return None
     if _count_text_outside_body(doc_tab, quote):
         # The old text survives in a header, a footer or a footnote, where the
         # fence cannot reach — `_text_buffer` walks the body only, while
@@ -2355,10 +2865,13 @@ def _account_anchored_comments(anchored, records, spans, *, universe,
             # problem, and it has to be carried the same way, or this plain
             # string would freeze the document the fence was built to keep
             # editable (found in review).
+            path = ((marker_census or {}).get("paths") or {}).get(rid)
             problems.append(_HiddenMarkerProblem(
                 f"comments.xml entry {rid} anchors inside a table — its exact "
                 f"position is not readable from the export",
-                in_tables=(rid,)))
+                in_tables=(rid,),
+                cell_paths={rid: path} if path else None,
+                docx_lattice=(marker_census or {}).get("docx_lattice")))
             continue
         # LOAD-BEARING for the witness rule: it proves a thread has an anchor
         # by "witness record ⇒ exactly one span ⇒ that span is protected".
@@ -2424,6 +2937,25 @@ def _scope_anchor_problems(problems, anchors, attribution=None, file_id=None):
 
     global_problems, blocked = [], []
     for p in problems:
+        own = getattr(p, "ranges", ())
+        if own:
+            # A problem that carries its own coordinates. It exists because
+            # the anchor could NOT be placed — so there is nothing in
+            # `anchors` to look its position up by, and the range came from
+            # the structure instead: the cell that holds it (#48).
+            cid = (attribution or {}).get(getattr(p, "docx_id", None))
+            link = _thread_link(file_id, cid)
+            who = (f"треда {cid} {link}" if link
+                   else f"docx id {getattr(p, 'docx_id', '?')}")
+            for s, e in own:
+                blocked.append((s, e, (
+                    f"комментарий {who} стоит в этой ячейке таблицы, но его "
+                    f"точное место в ней из выгрузки не читается ({p}), "
+                    f"поэтому правки этой ячейки отклонены — остальной "
+                    f"документ, включая другие ячейки, правится как обычно. "
+                    f"Правьте эту ячейку в интерфейсе Google Docs — "
+                    f"комментарий там не пострадает")))
+            continue
         ids = getattr(p, "docx_ids", ())
         if not ids:
             global_problems.append(p)
@@ -2470,29 +3002,56 @@ def _table_intervals(doc_tab):
 
 
 def _fence_off_tables(global_problems, doc_tab):
-    """Turn "the anchor is somewhere in a table" into blocked table ranges.
+    """Turn "the anchor is somewhere in a table" into blocked ranges.
 
-    A comment in a table cell used to freeze the whole document: the marker
-    census counts markers anywhere in document.xml, while the span parser
-    walks only direct body paragraphs, so the two disagreed and the mismatch
-    was a coordinate-free problem (r8).
+    Since r11 the span parser walks table cells, so an ordinary comment in a
+    cell never reaches here at all — it is placed like any other anchor. What
+    is left for this function is a marker the walk still cannot process: one
+    wrapped in `w:sdt`, in a tracked change, in a container nobody has taught
+    the parser about.
 
-    It does have coordinates, just coarser ones. If every unseen marker sits
-    inside a table, the anchor is inside SOME table, and text-removing edits
-    that touch no table cannot reach it. Tables are not editable through
-    skrepka anyway (LIMITATIONS), so the fence costs the person nothing.
+    Such a marker is bounded all the same, and usually tighter than r8 could
+    bound it: the census remembers the CELL it saw the marker in, so the fence
+    is that cell. Only when the path is missing or untrustworthy does the
+    fence fall back to every table in the file — which is where r8 left it.
 
-    Returns (remaining_global_problems, blocked). A mismatch that is not
-    fully explained by tables keeps blocking everything.
+    Returns (remaining_global_problems, blocked). A mismatch that is not fully
+    explained by tables keeps blocking everything.
     """
     remaining, blocked = [], []
     tables = None
+    lattice = None
     for p in global_problems:
         in_tables = getattr(p, "in_tables", frozenset())
         elsewhere = getattr(p, "elsewhere", frozenset())
         if not in_tables or elsewhere:
             remaining.append(p)
             continue
+        cell_paths = getattr(p, "cell_paths", None) or {}
+        if cell_paths and set(cell_paths) >= set(in_tables):
+            if lattice is None:
+                lattice = _api_lattice(doc_tab)
+            # the SAME agreement gate a placement goes through: a path is
+            # only worth as much as the two sides agreeing under it, and a
+            # fence built on a path the API reads differently would sit on
+            # the wrong cell while the real one stayed editable (code review)
+            extents = [_resolve_cell(path, lattice,
+                                     getattr(p, "docx_lattice", None))[0]
+                       for path in cell_paths.values()]
+            # `_table_intervals` below fences EVERY table in the file, which
+            # is r8's answer and needs no path to be right. That is the only
+            # fallback there is: a path the two sides read differently cannot
+            # name a table any more reliably than it names a cell.
+            if all(extents):
+                # One fence per distinct cell: two markers hiding in the same
+                # cell must not stack two identical intervals, which
+                # `_blocked_hits` would then walk twice for every operation.
+                for s, e in sorted(set(extents)):
+                    blocked.append((s, e, (
+                        f"ячейка таблицы, в которой стоит комментарий ({p}). "
+                        f"Правьте её в интерфейсе Google Docs — комментарий "
+                        f"там не пострадает")))
+                continue
         if tables is None:
             tables = _table_intervals(doc_tab)
         if not tables:
@@ -2505,6 +3064,33 @@ def _fence_off_tables(global_problems, doc_tab):
                 f"{label} ({p}). Правьте этот фрагмент в интерфейсе Google "
                 f"Docs — комментарий там не пострадает")))
     return remaining, blocked
+
+
+def _dedupe_blocked(blocked):
+    """One fence per range, order preserved, distinct reasons kept.
+
+    Two sources can describe the same cell — the parser's hidden-marker
+    problem and the accounting's missing-span problem are the same marker seen
+    twice — and every duplicate is walked again by `_blocked_hits` for every
+    single operation and counted again in the receipt.
+
+    Identical labels collapse to one. DIFFERENT labels do not: two distinct
+    comments in one cell are two threads the person may need to look at, and
+    dropping the second would make the refusal name one of them and hide the
+    other (code review r11).
+    """
+    out, seen = [], {}
+    for s, e, label in blocked:
+        if (s, e) not in seen:
+            seen[(s, e)] = [label]
+            out.append((s, e))
+            continue
+        if label not in seen[(s, e)]:
+            seen[(s, e)].append(label)
+    return [(s, e, seen[(s, e)][0] if len(seen[(s, e)]) == 1
+             else f"{seen[(s, e)][0]} (и ещё причин здесь: "
+                  f"{len(seen[(s, e)]) - 1})")
+            for s, e in out]
 
 
 def _anchor_map_remedy(shown):
@@ -2920,7 +3506,13 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
         # text still stands is fenced, in case it is alive and merely missing
         # (#34).
         ghost_blocked = _fence_off_ghosts(metrics.get("ghosts") or ())
-        blocked = blocked + table_blocked + amb_blocked + ghost_blocked
+        # One interval per range. The same cell can be fenced twice — the
+        # parser and the accounting report the same hidden marker separately —
+        # and a duplicate costs a second walk in `_blocked_hits` for every
+        # operation, a second candidate in `_narrow_replace`, and a receipt
+        # that overcounts what was refused (code review r11).
+        blocked = _dedupe_blocked(
+            blocked + table_blocked + amb_blocked + ghost_blocked)
         if global_problems:
             shown = "; ".join(str(p) for p in global_problems[:4])
             _abort(
@@ -2952,9 +3544,19 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
     # spans, not intervals: one anchor with ten candidates is ONE anchor we
     # could not place, and a receipt saying "ten" would be a lie
     metrics["ambiguous_anchors"] = len(ambiguous)
+    # Which tables to hand `sync` as indivisible. Only when a cell anchor was
+    # actually placed: a document with no comments inside tables is untouched
+    # by this, and one where nothing could be placed is already fenced.
+    cell_tables = []
+    if any(s.get("path") for s in spans):
+        cell_tables = [(ts, te, (
+            "таблица, в одной из ячеек которой стоит комментарий — `sync` "
+            "правит таблицу только целиком, поэтому такая правка отклонена; "
+            "точечную правку ячейки делает `patch`"))
+            for ts, te, _label in _table_intervals(doc_tab)]
     return ({"anchors": anchors, "fp1": fp1, "canary": canary,
              "r1": canary["r1"], "metrics": metrics, "blocked": blocked,
-             "attribution": attribution,
+             "attribution": attribution, "cell_anchor_tables": cell_tables,
              "ghosts": metrics.get("ghosts") or []}, None)
 
 
@@ -3352,6 +3954,33 @@ def _distinct_anchor_ranges(spans):
     return sorted({(s, e) for s, e, _t, _i in spans})
 
 
+# Code points that continue a grapheme cluster rather than starting one.
+# The rewrite batch inserts immediately before the LAST character of the old
+# text, and Google refuses an insert that lands inside a cluster — measured
+# 2026-08-18 on a stressed vowel: «The insertion index cannot be within a
+# grapheme cluster» (#47).
+#
+# This is not full UAX #29 segmentation, and does not pretend to be: it names
+# the continuations that actually turn up at the end of edited prose. Anything
+# exotic it misses is still refused — by Google, one step later, which costs a
+# refusal and never a damaged document.
+_ZWJ = "\u200d"
+
+
+def _splits_grapheme_cluster(head, tail):
+    """Would inserting between `head` and `tail` land inside a cluster?"""
+    if unicodedata.combining(tail):
+        return True                      # буква со знаком ударения: measured
+    if "\ufe00" <= tail <= "\ufe0f" or tail == "\u20e3":
+        return True                      # variation selector, keycap
+    if head.endswith(_ZWJ):
+        return True                      # склеенное эмодзи: 👨‍👩‍👦
+    if head and 0x1F1E6 <= ord(head[-1]) <= 0x1F1FF \
+            and 0x1F1E6 <= ord(tail) <= 0x1F1FF:
+        return True                      # флаг из пары региональных индикаторов
+    return False
+
+
 def _rewrite_anchor_requests(doc_tab, search_text, new_text, start, end,
                              anchors, attribution, named_intervals,
                              closed_present=False):
@@ -3447,18 +4076,13 @@ def _rewrite_anchor_requests(doc_tab, search_text, new_text, start, end,
         return None
     head, tail = search_text[:-1], search_text[-1]
     tail_len = _utf16_len(tail)
-    if closed_present and (tail_len > 1 or unicodedata.combining(tail)):
-        # The one deletion this batch makes lands on this character. For the
-        # LIVE thread nothing here is at risk whatever the character is — its
-        # anchor holds `new_text` by then and never collapses to zero. The
-        # doubt is only about a CLOSED thread whose invisible anchor might be
-        # exactly this character: M13 measured that case on a plain BMP
-        # letter, not on a surrogate pair or a combining mark. The geometry
-        # says the class cannot matter (a whole code point goes, never half of
-        # one), but «cannot matter» is not a measurement (#47).
-        #
-        # Hence the narrow shape: no closed threads in the document, no doubt,
-        # and an emoji at the end of a commented phrase keeps working.
+    if _splits_grapheme_cluster(head, tail):
+        # The batch inserts the new text immediately BEFORE this character, and
+        # Google refuses an insert that lands inside a grapheme cluster —
+        # measured on a stressed vowel (#47): «The insertion index cannot be
+        # within a grapheme cluster». Nothing is at risk here, the operation
+        # simply cannot be built, so it is refused by its real reason instead
+        # of by a raw API error further down.
         return None
 
     # Project the document as it will read between request 1 and request 2 and
@@ -3536,14 +4160,14 @@ def _why_no_rewrite(doc_tab, search_text, new_text, start, end, anchors,
         return ("На этом же фрагменте есть ещё один комментарий, и переписать "
                 "его целиком, не задев соседний, нельзя. Правьте фрагмент в "
                 "интерфейсе.")
-    if closed_present and len(search_text) >= 2:
-        tail = search_text[-1]
-        if _utf16_len(tail) > 1 or unicodedata.combining(tail):
-            return ("Фрагмент кончается эмодзи или знаком ударения, а в "
-                    "документе есть закрытые треды — что делает Google с "
-                    "таким символом при перезаписи, мы не мерили и гадать не "
-                    "будем. Правьте фрагмент в интерфейсе или поменяйте "
-                    "границу выделения.")
+    if len(search_text) >= 2 and _splits_grapheme_cluster(search_text[:-1],
+                                                          search_text[-1]):
+        return ("Фрагмент кончается символом, который нельзя отделить от "
+                "предыдущего — буквой со знаком ударения, составным эмодзи. "
+                "Перезапись вставляет новый текст прямо перед последним "
+                "символом, а Google не даёт вставить его внутрь такой пары. "
+                "Правьте фрагмент в интерфейсе или сдвиньте границу "
+                "выделения на один символ.")
     return ("Уцелеть должен ИСХОДНЫЙ символ якоря — повтор того же текста в "
             "замене не помогает. Оставьте в замене часть исходного якорного "
             "текста нетронутой или правьте этот фрагмент в интерфейсе.")
@@ -6072,6 +6696,21 @@ def sync_doc(file_id, md_path, tab_id=None):
         # anchors the accounting could not vouch for but could still place —
         # they narrow the refusal to the paragraphs they sit in (issue #10)
         protected += snap["blocked"]
+        # An anchor placed inside a table cell protects its own range, which
+        # is enough for `patch` — a replace has to be unique across the tab,
+        # so an identical twin elsewhere refuses the operation before position
+        # matters. `sync` does no such count: it deletes by absolute range and
+        # treats a table as indivisible. So for sync every table is protected
+        # as soon as one cell anchor exists — the same thing that happened
+        # before r11, and it costs sync nothing it could do anyway.
+        #
+        # Insurance, not a live check, and deliberately untested for the same
+        # reason the canary-intersection guard above is: to place an anchor in
+        # the WRONG table the two sides would have to agree on that cell's
+        # contents word for word, and then no test could tell the two tables
+        # apart either. Kept because the argument is about today's checks, and
+        # a fence must not depend on another check staying as it is.
+        protected += snap.get("cell_anchor_tables") or []
     if flat and protected:
         overlap = _find_protected_overlap(flat, protected)
         if overlap:

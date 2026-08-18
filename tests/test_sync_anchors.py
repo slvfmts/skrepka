@@ -475,13 +475,49 @@ def test_a_thread_that_never_held_text_does_not_block(engine):
     assert engine._fence_off_ghosts(metrics["ghosts"]) == []
 
 
-def test_a_thread_without_a_quote_still_blocks_while_the_export_may_be_old(
+def test_a_quoteless_thread_keeps_the_sign_while_the_export_has_records(
         engine):
-    """Sign 1 is not waived: without a record newer than the thread, the
-    export may simply predate it, and then its absence proves nothing about
-    what the thread is."""
+    """The #46 waiver is narrow on purpose: it applies only to an export with
+    NO records at all, the one shape where sign 1 can never speak. Here the
+    export does carry a record, just not a newer one — so the cheap second
+    opinion is still available and is still required."""
     gone = api_comment("c1", "A", "2026-01-01T00:00:09Z")
     gone["quotedFileContent"] = {}
+    live = api_comment("c2", "B", "2026-01-01T00:00:01Z")
+    anchored = [gone, live]
+    problems, metrics = engine._account_anchored_comments(
+        anchored, [{"docx_id": "0", "author": "B",
+                    "date_sec": "2026-01-01T00:00:01Z"}],
+        _spans("0"), universe=engine._key_owners_universe(anchored),
+        doc_tab=make_doc(["что угодно"]))
+    assert any("missing from the export" in p for p in problems)
+    assert "ghosts" not in metrics
+
+
+def test_a_document_whose_comments_are_all_api_made_is_not_frozen(engine):
+    """The shape #46 is actually about: another tool left every comment
+    through the Drive API, so `word/comments.xml` is absent entirely. Before,
+    the freshness sign had nothing to speak with and every replace was
+    refused."""
+    made_by_api = [api_comment("c1", "A", "2026-01-01T00:00:01Z"),
+                   api_comment("c2", "A", "2026-01-01T00:00:02Z")]
+    for c in made_by_api:
+        c["quotedFileContent"] = {}
+    problems, metrics = engine._account_anchored_comments(
+        made_by_api, [], [],
+        universe=engine._key_owners_universe(made_by_api),
+        doc_tab=make_doc(["обычный абзац"]))
+    assert problems == []
+    assert sorted(g["id"] for g in metrics["ghosts"]) == ["c1", "c2"]
+    assert engine._fence_off_ghosts(metrics["ghosts"]) == []
+
+
+def test_a_thread_with_a_quote_still_waits_for_the_freshness_sign(engine):
+    """The waiver is for quote-less threads only. A thread that HAS a quote is
+    a real text anchor that vanished, and there sign 1 is the only thing
+    telling a ghost from an export older than the thread."""
+    gone = api_comment("c1", "A", "2026-01-01T00:00:09Z")
+    gone["quotedFileContent"] = {"value": "пропавший фрагмент"}
     live = api_comment("c2", "B", "2026-01-01T00:00:01Z")
     anchored = [gone, live]
     problems, metrics = engine._account_anchored_comments(
@@ -584,14 +620,37 @@ def test_record_anchored_in_a_table_is_bounded_not_global(engine):
     assert [(s, e) for s, e, _ in blocked] == [(1, 40)]
 
 
-def test_table_anchor_survives_the_whole_problem_pipeline(engine, make_docx):
-    """The real path, both problem sources together: the parser reports the
-    hidden marker AND the accounting reports the record with no span. If
-    either one stays global, the document is frozen and the table fence buys
-    nothing — which is exactly what the first version of it did."""
+def test_an_ordinary_cell_anchor_makes_no_problems_at_all(engine, make_docx):
+    """r11: the parser walks cells, so a plain comment in a cell produces a
+    span like any other. Both problem sources must stay silent — the record
+    joins its span, the census sees nothing hidden — or the document would be
+    refused for an anchor that is perfectly readable."""
     body = ('<w:tbl><w:tr><w:tc><w:p>'
             '<w:commentRangeStart w:id="3"/><w:r><w:t>cell</w:t></w:r>'
             '<w:commentRangeEnd w:id="3"/></w:p></w:tc></w:tr></w:tbl>'
+            '<w:p><w:r><w:t>обычный абзац</w:t></w:r></w:p>')
+    spans, problems, census = engine._parse_docx_anchor_spans(make_docx(body))
+    assert problems == []
+    anchored = [api_comment("c1", "A", CREATED)]
+    records = [{"docx_id": "3", "author": "A", "date_sec": CREATED_SEC}]
+    acc, _metrics = engine._account_anchored_comments(
+        anchored, records, spans,
+        universe=engine._key_owners_universe(anchored), marker_census=census)
+    assert acc == []
+
+
+def test_hidden_cell_anchor_survives_the_whole_problem_pipeline(engine,
+                                                                make_docx):
+    """Both problem sources together on a marker the walk still cannot reach
+    (`w:sdt` inside a cell): the parser reports the hidden marker AND the
+    accounting reports the record with no span. If either stays global the
+    document is frozen and the fence buys nothing — which is exactly what the
+    first version of it did. Both must fence the CELL, not every table."""
+    body = ('<w:tbl><w:tr><w:tc>'
+            '<w:sdt><w:commentRangeStart w:id="3"/><w:r><w:t>cell</w:t></w:r>'
+            '<w:commentRangeEnd w:id="3"/></w:sdt>'
+            '<w:p><w:r><w:t>видно</w:t></w:r></w:p>'
+            '</w:tc></w:tr></w:tbl>'
             '<w:p><w:r><w:t>обычный абзац</w:t></w:r></w:p>')
     spans, problems, census = engine._parse_docx_anchor_spans(make_docx(body))
     anchored = [api_comment("c1", "A", CREATED)]
@@ -599,13 +658,41 @@ def test_table_anchor_survives_the_whole_problem_pipeline(engine, make_docx):
     acc, _metrics = engine._account_anchored_comments(
         anchored, records, spans,
         universe=engine._key_owners_universe(anchored), marker_census=census)
+    assert acc and getattr(acc[0], "in_tables", None) == frozenset({"3"})
     tab = {"body": {"content": [
-        {"startIndex": 1, "endIndex": 40, "table": {"rows": 1}},
+        {"startIndex": 1, "endIndex": 40, "table": {"tableRows": [
+            {"startIndex": 2, "endIndex": 39, "tableCells": [
+                {"startIndex": 3, "endIndex": 38, "content": [
+                    {"startIndex": 4, "endIndex": 10, "paragraph": {
+                        "elements": [{"startIndex": 4, "endIndex": 10,
+                                      "textRun": {"content": "видно\n"}}]}}]}]}]}},
         {"startIndex": 40, "endIndex": 55, "paragraph": {"elements": []}},
     ]}}
     remaining, blocked = engine._fence_off_tables(problems + acc, tab)
     assert remaining == []
-    assert [(s, e) for s, e, _ in blocked] == [(1, 40), (1, 40)]
+    assert [(s, e) for s, e, _ in blocked] == [(3, 38), (3, 38)]
+
+
+def test_one_cell_fenced_twice_becomes_one_interval(engine):
+    """The parser and the accounting report the same hidden marker
+    separately, so the same cell arrives twice. Every duplicate is walked
+    again by `_blocked_hits` for every operation and counted again in the
+    receipt — one interval per range."""
+    same_twice = [(3, 18, "одна причина"), (3, 18, "одна причина"),
+                  (40, 55, "другая ячейка")]
+    assert engine._dedupe_blocked(same_twice) == [
+        (3, 18, "одна причина"), (40, 55, "другая ячейка")]
+
+
+def test_two_different_reasons_on_one_cell_are_both_named(engine):
+    """Two distinct comments in one cell are two threads the person may need
+    to look at. Collapsing them to one interval is right; hiding the second
+    reason is not."""
+    out = engine._dedupe_blocked(
+        [(3, 18, "комментарий A"), (3, 18, "комментарий B")])
+    assert len(out) == 1
+    assert out[0][:2] == (3, 18)
+    assert "комментарий A" in out[0][2] and "ещё причин здесь: 1" in out[0][2]
 
 
 def test_record_whose_marker_hides_elsewhere_stays_global(engine):
@@ -1148,6 +1235,38 @@ def test_a_fenced_range_stops_a_sync_delete(engine):
     assert overlap and "одинаковых копий" in overlap
 
 
+def test_sync_protects_every_table_once_a_cell_anchor_exists(engine):
+    """`patch` is safe on a placed cell anchor because a replace must be
+    unique across the whole tab — a byte-identical twin table refuses the
+    operation before position matters. `sync` does no such count: it deletes
+    by absolute range. So it is handed every table as protected the moment one
+    cell anchor exists, which is what happened before r11 anyway and costs
+    sync nothing it could do (it treats a table as indivisible)."""
+    tables = [(1, 40, "таблица, в одной из ячеек которой стоит комментарий")]
+    # the anchor was placed in table 1, sync deletes table 2 — without this
+    # list nothing would overlap and the thread could be lost
+    second_table = [{"deleteContentRange": {"range": {"startIndex": 41,
+                                                      "endIndex": 80}}}]
+    assert engine._find_protected_overlap(second_table, tables) is None
+    both = tables + [(41, 80, "и вторая такая же")]
+    assert engine._find_protected_overlap(second_table, both)
+
+
+def test_a_cell_fence_stops_a_sync_rewrite_of_its_table(engine):
+    """`sync` treats a table as indivisible, so any change inside one arrives
+    as a delete over the WHOLE table. A cell fence sits inside that range, so
+    the overlap check refuses it — the narrower fence does not let a
+    table-level rewrite through."""
+    cell_fence = [(12, 30, "ячейка таблицы, в которой стоит комментарий")]
+    whole_table = [{"deleteContentRange": {"range": {"startIndex": 5,
+                                                     "endIndex": 60}}}]
+    assert engine._find_protected_overlap(whole_table, cell_fence)
+    # and an edit to a paragraph outside the table still goes through
+    elsewhere = [{"deleteContentRange": {"range": {"startIndex": 61,
+                                                   "endIndex": 70}}}]
+    assert engine._find_protected_overlap(elsewhere, cell_fence) is None
+
+
 # ---------------------------------------------------------------------------
 # units: named ranges + overlap
 # ---------------------------------------------------------------------------
@@ -1640,6 +1759,82 @@ def test_narrowing_keeps_the_anchor_when_one_word_changes(engine):
     assert text.replace(core, repl) == new_text
     assert start2 > a_start  # the anchor's first character is out of range
     assert engine._doomed_threads(start2, end2, anchors, {"0": "c1"}) == []
+
+
+def _tab_body_and_cell(engine, body_text, cell_text):
+    """Tab with one body paragraph and one 1x1 table after it.
+
+    Returns (tab, body_start, body_end, cell_interval) — the cell interval is
+    what a cell fence puts into `blocked`.
+    """
+    b_end = 1 + engine._utf16_len(body_text)
+    t_start = b_end + 1
+    c_start = t_start + 2
+    p_end = c_start + 1 + engine._utf16_len(cell_text) + 1
+    tab = {"documentId": "doc1", "revisionId": "R0", "body": {"content": [
+        {"startIndex": 1, "endIndex": b_end + 1, "paragraph": {
+            "elements": [{"startIndex": 1, "endIndex": b_end + 1,
+                          "textRun": {"content": body_text + "\n",
+                                      "textStyle": {}}}],
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"}}},
+        {"startIndex": t_start, "endIndex": p_end + 1, "table": {"tableRows": [
+            {"startIndex": t_start + 1, "endIndex": p_end,
+             "tableCells": [
+                 {"startIndex": c_start, "endIndex": p_end, "content": [
+                     {"startIndex": c_start + 1, "endIndex": p_end,
+                      "paragraph": {
+                          "elements": [
+                              {"startIndex": c_start + 1, "endIndex": p_end,
+                               "textRun": {"content": cell_text + "\n",
+                                           "textStyle": {}}}],
+                          "paragraphStyle": {
+                              "namedStyleType": "NORMAL_TEXT"}}}]}]}]}},
+    ]}}
+    return tab, 1, b_end, (c_start, p_end)
+
+
+def test_narrowing_refuses_when_the_same_text_lives_in_a_fenced_cell(engine):
+    """The target is in the body and the fenced cell holds the same words.
+    `replaceAllText` acts on the whole tab and DOES reach into cells (M16b),
+    so the narrowed core is not unique and the narrowing has to be dropped —
+    the cell fence alone would not have stopped this."""
+    tab, start, end, cell = _tab_body_and_cell(
+        engine, "Здесь слишком мало примеров", "слишком мало примеров")
+    a_start = start + len("Здесь ")
+    anchors = [(a_start, a_start + len("слишком мало"), "слишком мало", "0")]
+    out = engine._narrow_replace(
+        tab, "Здесь слишком мало примеров", "Здесь слишком мало образцов",
+        start, end, anchors, [(cell[0], cell[1], "ячейка")], {"0": "c1"})
+    assert out is None
+
+
+def test_narrowing_never_crosses_into_a_fenced_cell(engine):
+    """Whatever the narrowing settles on, it must not overlap the cell fence.
+    The check runs again on the narrowed range, not only on the original."""
+    tab, start, end, cell = _tab_body_and_cell(
+        engine, "Здесь слишком мало примеров", "текст в ячейке")
+    a_start = start + len("Здесь ")
+    anchors = [(a_start, a_start + len("слишком мало"), "слишком мало", "0")]
+    blocked = [(cell[0], cell[1], "ячейка")]
+    out = engine._narrow_replace(
+        tab, "Здесь слишком мало примеров", "Здесь слишком мало образцов",
+        start, end, anchors, blocked, {"0": "c1"})
+    assert out is not None
+    _core, _repl, start2, end2 = out
+    assert engine._blocked_hits(start2, end2, blocked) == []
+    assert end2 <= cell[0]
+
+
+def test_a_cell_fence_refuses_an_edit_inside_that_cell(engine):
+    """The other direction: the operation itself lands inside the fenced cell.
+    Any overlap is refused — unlike a healthy anchor, a fence has no partial
+    case, because what it protects has no known position inside it."""
+    tab, _start, _end, cell = _tab_body_and_cell(
+        engine, "Обычный абзац", "текст в ячейке")
+    blocked = [(cell[0], cell[1], "ячейка")]
+    hit = engine._find_quote_in_doctab(tab, "текст в ячейке")
+    assert hit is not None
+    assert engine._blocked_hits(hit[0], hit[1], blocked)
 
 
 def test_narrowing_gives_up_when_the_anchor_is_inside_the_change(engine):
@@ -3081,20 +3276,33 @@ def test_the_archive_says_one_of_n_places_not_here(engine, tmp_path):
     assert "встречается в документе 2 раз" in entry["where"]
 
 
-def test_the_rewrite_refuses_an_unmeasured_tail_character(engine):
-    """The one deletion this batch makes lands on the last character, and what
-    Google does with a surrogate pair or a combining mark there is not
-    measured — M13 covered a plain BMP letter. The geometry says it should not
-    matter; «should» is not a measurement, and this is the only place in
-    `patch` that deletes anything (#47)."""
-    for tail in ("💡", "́"):
-        kw = _rewrite_case(engine, text="Здесь старый текст" + tail,
-                           new="Совсем иная фраза", closed_present=True)
-        assert engine._rewrite_anchor_requests(**kw) is None, tail
-        # …and without a closed thread there is no doubt to be careful about:
-        # the live anchor holds the new text by then and cannot collapse
-        kw.pop("closed_present")
-        assert engine._rewrite_anchor_requests(**kw) is not None, tail
+def test_the_rewrite_refuses_a_tail_it_cannot_get_in_front_of(engine):
+    """The batch inserts the new text immediately BEFORE the last character,
+    and Google refuses an insert landing inside a grapheme cluster — measured
+    2026-08-18 on a stressed vowel (#47). So the refusal is about the shape of
+    the text, not about closed threads: it holds either way, and it holds for
+    the composite shapes built the same way."""
+    for tail, head in (("\u0301", "письмо"),          # буква со знаком ударения
+                       ("\ufe0f", "телефон\u260e"),    # variation selector
+                       ("\U0001f466", "семья\U0001f468\u200d")):  # склейка через ZWJ
+        for closed in (True, False):
+            kw = _rewrite_case(engine, text=head + tail,
+                               new="Совсем иная фраза", closed_present=closed)
+            assert engine._rewrite_anchor_requests(**kw) is None, (tail, closed)
+
+
+def test_an_emoji_tail_no_longer_blocks_the_rewrite(engine):
+    """M13 measured the worst case — a closed thread whose whole anchor is the
+    single character this batch deletes — on a plain BMP letter, and 0.12 kept
+    a guard because a surrogate pair was not covered. Measured 2026-08-18 on a
+    live document: the batch runs to completion on a phrase ending in an emoji
+    whose last character is covered by a closed thread, and the thread is still
+    there afterwards. The guard is gone, so an emoji at the end of a commented
+    phrase works whether or not the document has closed threads."""
+    for closed in (True, False):
+        kw = _rewrite_case(engine, text="Здесь старый текст\U0001f4a1",
+                           new="Совсем иная фраза", closed_present=closed)
+        assert engine._rewrite_anchor_requests(**kw) is not None, closed
     assert engine._rewrite_anchor_requests(**_rewrite_case(engine)) is not None
 
 
