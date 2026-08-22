@@ -2,6 +2,7 @@
 """Google Docs toolkit: upload, download, update, comments, suggestions."""
 
 import argparse
+import copy
 import datetime
 import difflib
 import json
@@ -580,6 +581,72 @@ def _select_tab(doc, tab_id=None):
     )
 
 
+# Where each request kind carries tab identity. Measured, not assumed (M19):
+# a request that does not name a tab is NOT tab-neutral. `insertText` and
+# `deleteContentRange` land in the FIRST tab of the document — silently,
+# whenever the index happens to be valid there (M19-9) — and `replaceAllText`
+# rewrites EVERY tab at once (M19-12).
+#
+# Values name the field that carries the tab: `tabsCriteria` for the kinds
+# that act on a whole tab, otherwise the sub-objects one of which must be
+# present and gets a `tabId`.
+_TAB_SCOPE = {
+    "replaceAllText": ("tabsCriteria",),
+    "deleteNamedRange": ("tabsCriteria",),
+    "insertText": ("location", "endOfSegmentLocation"),
+    "insertInlineImage": ("location", "endOfSegmentLocation"),
+    "deleteContentRange": ("range",),
+    "createNamedRange": ("range",),
+    "updateTextStyle": ("range",),
+    "updateParagraphStyle": ("range",),
+    "createParagraphBullets": ("range",),
+    "deleteParagraphBullets": ("range",),
+}
+
+
+def _scope_requests(requests, tid):
+    """Put the target tab into every request of a batch, or refuse to send it.
+
+    A WHITE list on purpose: a kind nobody taught to carry a tab is refused
+    before anything is written, instead of being passed through unscoped and
+    landing wherever Google decides. The previous shape — decorate the three
+    kinds we knew, pass the rest — is what made the canary a mine: the
+    requests it prepends never went through it at all.
+
+    `tid` is None only for a legacy document with no `tabs` field; a document
+    with several tabs and no chosen tab is refused earlier, by `_select_tab`.
+    """
+    if not tid:
+        return list(requests)
+    out = []
+    for req in requests:
+        kinds = [k for k in req]
+        if len(kinds) != 1:
+            _error(f"internal: a batch request naming {len(kinds)} kinds "
+                   f"({', '.join(sorted(kinds)) or 'none'}) cannot be scoped "
+                   f"to a tab (fail closed)")
+        kind = kinds[0]
+        where = _TAB_SCOPE.get(kind)
+        if where is None:
+            _error(f"internal: request {kind!r} has no known place for a tab "
+                   f"id, and an unscoped request goes to the first tab or to "
+                   f"all of them (M19) — refused before writing")
+        req = copy.deepcopy(req)
+        body = req[kind]
+        if where == ("tabsCriteria",):
+            body["tabsCriteria"] = {"tabIds": [tid]}
+            out.append(req)
+            continue
+        holder = next((w for w in where if isinstance(body.get(w), dict)),
+                      None)
+        if holder is None:
+            _error(f"internal: request {kind!r} carries none of "
+                   f"{list(where)} to put the tab id in (fail closed)")
+        body[holder]["tabId"] = tid
+        out.append(req)
+    return out
+
+
 def _extract_text_from_doctab(doc_tab):
     """Yield (start, end, text) tuples from a documentTab's body."""
     body = doc_tab.get("body", {}) or {}
@@ -717,8 +784,20 @@ def post_process_highlights(docs_service, doc_id):
     """
     try:
         doc = docs_service.documents().get(
-            documentId=doc_id, suggestionsViewMode="SUGGESTIONS_INLINE"
+            documentId=doc_id, suggestionsViewMode="SUGGESTIONS_INLINE",
+            includeTabsContent=True,
         ).execute()
+        # This read and the writes below agree by construction: without a tab
+        # id both address the FIRST tab (M19-9). What they cannot do is see
+        # the others — so a multi-tab document loses its markers there, and
+        # that used to happen in silence (codex, final round). Publication
+        # creates single-tab documents, which is why this is a warning and not
+        # a refusal.
+        if len(_collect_tabs(doc)) > 1:
+            _warn("документ многовкладочный: подсветки обрабатываются "
+                  "только в первой вкладке, в остальных служебные метки "
+                  "останутся как есть")
+        _tid, doc = _select_tab(doc, tab_id=_collect_tabs(doc)[0][0])
     except HttpError as e:
         _warn(f"Could not read doc for highlight processing: {e}")
         return
@@ -972,10 +1051,18 @@ def post_process_images(docs_service, drive_service, doc_id, images, folder_id=N
     for marker, alt, rel_path, full_path in reversed(images):
         # Re-read doc for fresh indices + revision pinning
         doc = docs_service.documents().get(
-            documentId=doc_id, suggestionsViewMode="SUGGESTIONS_INLINE"
+            documentId=doc_id, suggestionsViewMode="SUGGESTIONS_INLINE",
+            includeTabsContent=True,
         ).execute()
         revision_id = doc.get("revisionId")
-        synthetic_tab = {"body": doc.get("body", {})}
+        tabs = _collect_tabs(doc)
+        if len(tabs) > 1:
+            # Same shape as the highlight pass: read and write agree on the
+            # first tab, but markers in the others are invisible to both.
+            # Said out loud instead of silently skipped (codex, final round).
+            _warn("документ многовкладочный: картинки подставляются только "
+                  "в первой вкладке, метки в остальных останутся как есть")
+        synthetic_tab = {"body": tabs[0][2].get("body", {})}
         found = _find_quote_in_doctab(synthetic_tab, marker)
         if not found:
             _warn(f"Could not find image marker '{marker}' in doc")
@@ -1672,25 +1759,44 @@ def _parse_docx_anchor_spans(docx_bytes):
     # which one it is. The r8 rule that a text-alone match may never cross a
     # structural boundary is not weakened by this — it moves into the mapper,
     # which searches a span only among paragraphs sharing its path (#48).
-    body_paras, para_paths = [], []
+    body_paras, para_paths, para_top = [], [], []
+    # The body as a flat list of its OWN elements, in order — what the proof
+    # of a tab segment walks (`_prove_target_segment`). Every paragraph
+    # remembers which of them holds it, including paragraphs nested in cells,
+    # so a span can be told from which side of a tab boundary it came.
+    outline = []
     docx_lattice = {"tables": {}, "rows": {}, "table_rows": {}, "paras": {}}
 
-    def _collect(node, path):
+    def _collect(node, path, top=None):
         t_ord = 0
         docx_lattice["paras"].setdefault(path, [])
         for child in node:
+            here = top
             if child.tag == f"{w}p":
+                if not path:
+                    here = len(outline)
+                    outline.append({"kind": "p", "para": len(body_paras)})
                 body_paras.append(child)
                 para_paths.append(path)
+                para_top.append(here)
             elif child.tag == f"{w}tbl":
+                if not path:
+                    here = len(outline)
+                    outline.append({"kind": "tbl", "t_ord": t_ord,
+                                    "cells": {}, "row_widths": {}})
                 rows = child.findall(f"{w}tr")
                 docx_lattice["table_rows"][(path, t_ord)] = len(rows)
                 for j, tr in enumerate(rows):
                     col = 0
                     for tc in tr.findall(f"{w}tc"):
-                        _collect(tc, path + ((t_ord, j, col),))
+                        sub_path = path + ((t_ord, j, col),)
+                        if not path:
+                            outline[here]["cells"][(j, col)] = sub_path
+                        _collect(tc, sub_path, here)
                         col += _docx_grid_span(tc)
                     docx_lattice["rows"][(path, t_ord, j)] = col
+                    if not path:
+                        outline[here]["row_widths"][j] = col
                 t_ord += 1
         docx_lattice["tables"][path] = t_ord
 
@@ -1787,8 +1893,30 @@ def _parse_docx_anchor_spans(docx_bytes):
     # Texts are attached AFTER the walk, not inside it: a span that crosses a
     # paragraph break is not complete until both of its paragraphs have been
     # read, and the old in-loop assignment could only ever see the first one.
+    # texts of the body's own elements, for the segment proof. A paragraph
+    # the walker could not read whole (an object, an unsupported element) is
+    # marked: it can never be PROVEN equal to an API paragraph, and the proof
+    # refuses instead of counting elements.
+    for el in outline:
+        if el["kind"] == "p":
+            meta = para_meta[el["para"]]
+            el["text"] = meta["text"]
+            # `has_objects` deliberately does NOT count here: a drawing puts no
+            # text into either side, so the paragraph still compares by text.
+            # An anchor inside it is refused anyway, one layer down.
+            el["unreadable"] = bool(meta["has_unknown"])
+        else:
+            texts = {}
+            for pos, cpath in el["cells"].items():
+                parts = [para_meta[i]["text"] for i, pth
+                         in enumerate(para_paths) if pth == cpath]
+                texts[pos] = "\n".join(parts)
+            el["cell_text"] = texts
+
     for sp in spans:
         head, tail = para_meta[sp["para_index"]], para_meta[sp["end_para_index"]]
+        sp["top"] = para_top[sp["para_index"]]
+        sp["end_top"] = para_top[sp["end_para_index"]]
         sp["para_text"] = head["text"]
         sp["end_para_text"] = tail["text"]
         sp["path"], sp["end_path"] = head["path"], tail["path"]
@@ -1839,7 +1967,10 @@ def _parse_docx_anchor_spans(docx_bytes):
                         if cid not in path_untrusted and len(p) == 1},
               # the export's own lattice shape, so a fence built from a path
               # can be checked against the API exactly as a placement is
-              "docx_lattice": docx_lattice}
+              "docx_lattice": docx_lattice,
+              # the body's own elements in order — the material the tab
+              # segment proof works on
+              "outline": outline}
     if seen_starts != global_starts or seen_ends != global_ends:
         hidden = (set(global_starts) | set(global_ends)) - processed
         in_tables = sorted(census["in_tables"])
@@ -1880,13 +2011,16 @@ def _parse_docx_anchor_spans(docx_bytes):
             if local:
                 s.setdefault("unreadable", reason)
             else:
-                problems.append(reason)
+                # carries its own id so a caller that knows this span belongs
+                # to ANOTHER tab can drop it: an anchor no write can reach is
+                # not a reason to refuse (opus, final round)
+                problems.append(_AnchorProblem(reason, (s["docx_id"],)))
         if not s.get("anchor_text"):
             reason = f"anchor {s['docx_id']} is empty"
             if local:
                 s.setdefault("unreadable", reason)
             else:
-                problems.append(reason)
+                problems.append(_AnchorProblem(reason, (s["docx_id"],)))
     return spans, problems, census
 
 
@@ -1905,6 +2039,345 @@ def _parse_docx_anchor_spans(docx_bytes):
 _QUIET_ELEMENTS = frozenset((
     "textRun", "inlineObjectElement", "equation", "footnoteReference",
     "pageBreak", "columnBreak", "horizontalRule"))
+
+# Element kinds that contribute NO text to the export, so a paragraph holding
+# them still compares by its text runs alone. Used only by the segment proof:
+# a picture in a paragraph is ordinary in an editorial document, and refusing
+# the whole tab over it would leave the live case of #31 unfixed (opus, final
+# round). `pageBreak` and `columnBreak` are NOT here — the export writes them
+# as \n, so such a paragraph really does read differently on the two sides.
+_TEXTLESS_ELEMENTS = frozenset((
+    "inlineObjectElement", "equation", "footnoteReference", "horizontalRule"))
+
+
+def _api_cell_text(cell):
+    """Text of a table cell as the export writes it, or None if unreadable."""
+    parts = []
+    for el in cell.get("content", []) or []:
+        para = el.get("paragraph")
+        if not para:
+            return None  # a nested table: not compared, not guessed
+        elements = para.get("elements", [])
+        if any("textRun" not in e for e in elements):
+            return None
+        text = "".join(e["textRun"].get("content", "") for e in elements)
+        parts.append(text[:-1] if text.endswith("\n") else text)
+    return "\n".join(parts)
+
+
+def _api_outline(doc_tab):
+    """The tab's own body elements in order, in the shape the export has.
+
+    `text` is None for a paragraph the API will not spell out (a smart chip,
+    a rich link): such an element can never be PROVEN equal to an exported
+    one, and the proof of a segment refuses rather than counting elements.
+    """
+    out = []
+    for el in (doc_tab.get("body", {}) or {}).get("content", []):
+        if "table" in el:
+            rows = el["table"].get("tableRows", []) or []
+            cells = {}
+            for j, row in enumerate(rows):
+                for k, cell in enumerate(row.get("tableCells", []) or []):
+                    cells[(j, k)] = _api_cell_text(cell)
+            out.append({"kind": "tbl", "rows": len(rows), "cells": cells})
+        elif "paragraph" in el:
+            elements = el["paragraph"].get("elements", [])
+            kinds = {k for e in elements for k in e
+                     if k not in ("startIndex", "endIndex")
+                     and not k.startswith("suggested")}
+            if kinds - {"textRun"} - _TEXTLESS_ELEMENTS:
+                out.append({"kind": "p", "text": None})
+                continue
+            text = "".join(e["textRun"].get("content", "") for e in elements
+                           if "textRun" in e)
+            out.append({"kind": "p",
+                        "text": text[:-1] if text.endswith("\n") else text})
+    return out
+
+
+def _same_body_text(api_text, docx_text):
+    """Equality for the SEGMENT PROOF only — never for placing an anchor.
+
+    A soft line break is `\v` on the API side and `w:br` (read as `\n`) in
+    the export (#27). The two are in bijection here: `\v` appears in API text
+    only as a soft break, and `\n` cannot appear inside an API paragraph at
+    all, since it is what ends one. `_resolve_cell` and `_pieces_fit` already
+    compare this way — proving which tab an element belongs to is the same
+    class of proof and uses the same relation.
+
+    Placement keeps comparing raw text: case 3 of the fence proof in
+    `_map_anchors_to_doc` leans on a soft break matching NOTHING, and that
+    stays true. The gain is only that one Shift+Enter no longer costs the
+    whole document its tab identity.
+    """
+    if api_text is None or docx_text is None:
+        return False
+    return api_text.replace("\v", "\n") == docx_text
+
+
+def _prove_target_segment(outline, tabs, tid, canary_text=None):
+    """Prove where the target tab's own elements start and end in the export.
+
+    Returns (first, last, None) — inclusive indices into `outline`, the head
+    paragraph included — or (None, None, why).
+
+    The proof is deliberately about ONE tab. The question anchors ask is
+    binary — inside the target tab or not — and answering it needs two
+    offsets, not a partition of the whole document. A soft break, a picture
+    or a pending suggestion in some OTHER tab then costs nothing at all.
+
+    Nothing is counted: every element of the segment is either proven equal to
+    an API element, or one of a CLOSED set of phantoms proven by its own
+    content — the head paragraph (its text is the tab's title, which Google
+    keeps unique and non-empty across a document, M19-21) and the freshness
+    canary (its own uuid text, at the tail). A tolerance of one element would
+    be invisible: tab index spaces start at the same 1 (M19-11) and coincide
+    in length just as easily (M19-7).
+
+    A tab's title may legitimately equal the TEXT of some paragraph elsewhere
+    (M19-22), so a candidate head is not required to be unique in the export.
+    Every candidate is walked instead, and the proof holds when exactly one of
+    them accounts for the tab whole (opus, final round). Two would mean the
+    document really is ambiguous, and then nothing is placed.
+    """
+    by_id = {t: (title, dt) for t, title, dt in tabs}
+    order = [t for t, _title, _dt in tabs]
+    if tid not in by_id:
+        return None, None, f"целевая вкладка {tid!r} не найдена в документе"
+    title, doc_tab = by_id[tid]
+    if not title:
+        return None, None, ("у целевой вкладки нет названия, а по названию "
+                            "опознаётся её начало в выгрузке")
+    heads = [i for i, el in enumerate(outline)
+             if el["kind"] == "p" and not el.get("unreadable")
+             and el.get("text") == title]
+    if not heads:
+        return None, None, (
+            f"в выгрузке нет абзаца с названием вкладки «{title}», по "
+            f"которому опознаётся её начало")
+    nxt = order.index(tid) + 1
+    next_title = by_id[order[nxt]][0] if nxt < len(order) else None
+    api_elements = _api_outline(doc_tab)
+
+    proven, whys = [], []
+    for head in heads:
+        last, why = _segment_from(outline, head, api_elements, title,
+                                  canary_text, next_title)
+        if why is None:
+            proven.append((head, last))
+        else:
+            whys.append(why)
+    if len(proven) == 1:
+        return proven[0][0], proven[0][1], None
+    # Two candidates accounting for the tab whole is insurance, not a live
+    # case: the tail of a segment is pinned by the next tab's title or by the
+    # end of the body, so a second candidate runs out before it gets there.
+    # Deliberately not covered by a mutation for that reason — like
+    # `cell_anchor_tables`, the formulation stays because a fence with a hole
+    # in it is worse than an unreachable branch.
+    if not proven:
+        return None, None, whys[0]
+    return None, None, (
+        f"вкладке «{title}» в выгрузке одинаково подходят {len(proven)} "
+        f"мест — какое из них её начало, из выгрузки не читается")
+
+
+def _segment_from(outline, head, api_elements, title, canary_text,
+                  next_title):
+    """Walk one candidate segment. Returns (last_index, None) or (None, why)."""
+    i = head + 1
+    for n, api in enumerate(api_elements):
+        if i >= len(outline):
+            return None, (f"выгрузка кончилась на элементе {n} вкладки "
+                          f"«{title}»")
+        got = outline[i]
+        if api["kind"] != got["kind"]:
+            return None, (
+                f"элемент {n} вкладки «{title}»: по документу это "
+                f"{'таблица' if api['kind'] == 'tbl' else 'абзац'}, "
+                f"а в выгрузке "
+                f"{'таблица' if got['kind'] == 'tbl' else 'абзац'}")
+        if api["kind"] == "p":
+            if got.get("unreadable"):
+                return None, (
+                    f"абзац «{str(got.get('text'))[:40]}» вкладки «{title}» "
+                    f"выгрузка отдаёт не целиком, поэтому границу вкладки "
+                    f"доказать нечем")
+            if api["text"] is None:
+                return None, (
+                    f"текст абзаца «{str(got.get('text'))[:40]}» вкладки "
+                    f"«{title}» документ не отдаёт — так выглядят смарт-чип, "
+                    f"разрыв страницы и подобное")
+            if not _same_body_text(api["text"], got.get("text")):
+                return None, (
+                    f"элемент {n} вкладки «{title}»: текст расходится "
+                    f"({api['text'][:40]!r} по документу против "
+                    f"{str(got.get('text'))[:40]!r} по выгрузке)")
+        else:
+            why = _cells_agree(api, got, title, n)
+            if why:
+                return None, why
+        i += 1
+    if canary_text is not None:
+        if (i >= len(outline) or outline[i]["kind"] != "p"
+                or outline[i].get("text") != canary_text):
+            return None, ("канарейка не нашлась в хвосте целевой вкладки — "
+                          "выгрузка не та, что ожидалась")
+        i += 1
+    if next_title is not None:
+        if (i >= len(outline) or outline[i]["kind"] != "p"
+                or outline[i].get("text") != next_title):
+            return None, (
+                f"после вкладки «{title}» ожидался заголовок следующей "
+                f"вкладки «{next_title}», а лежит другое — граница не "
+                f"доказана")
+    elif i != len(outline):
+        return None, (f"после последней вкладки в выгрузке осталось "
+                      f"{len(outline) - i} лишних элементов")
+    return i - 1, None
+
+
+def _cells_agree(api, got, title, n):
+    """Compare a table by CONTENT, not by shape — the r11 rule.
+
+    Two tabs of the «draft / clean copy» kind hold tables of identical shape,
+    so rows, columns and gridSpan all agree while the cells hold different
+    text. Every cell the export names is checked against the API cell at the
+    same GRID position, which is the address M16 proved the two sides share.
+    """
+    if api["rows"] != len(got["row_widths"]):
+        return (f"элемент {n} вкладки «{title}»: строк в таблице "
+                f"{api['rows']} по API против {len(got['row_widths'])} "
+                f"по выгрузке")
+    # The whole grid, not only the squares the export names. The two sides
+    # count cells differently — the API keeps one entry per grid square, the
+    # export one per physical cell plus `gridSpan` (M16) — so a row whose
+    # widths disagree means the tables are not the same table, and an API
+    # square the export never covers must be the empty placeholder a merge
+    # leaves behind. Without this a table could pass on its named cells alone
+    # (codex, final round).
+    for j, width in sorted(got["row_widths"].items()):
+        api_width = len([1 for jj, _k in api["cells"] if jj == j])
+        if api_width != width:
+            return (f"элемент {n} вкладки «{title}»: в строке {j} по API "
+                    f"{api_width} клеток сетки против {width} по выгрузке")
+    for (j, col), text in sorted(got["cell_text"].items()):
+        expect = api["cells"].get((j, col))
+        if expect is None:
+            return (f"элемент {n} вкладки «{title}»: ячейки ({j}, {col}) нет "
+                    f"на стороне API или её текст не читается")
+        if not _same_body_text(expect, text):
+            return (f"элемент {n} вкладки «{title}»: ячейка ({j}, {col}) "
+                    f"расходится ({expect[:30]!r} против {text[:30]!r})")
+    for (j, k), text in sorted(api["cells"].items()):
+        if (j, k) in got["cell_text"]:
+            continue
+        if text:
+            return (f"элемент {n} вкладки «{title}»: клетка ({j}, {k}) есть "
+                    f"по API с текстом {text[:30]!r}, а выгрузка её не "
+                    f"показывает")
+    return None
+
+
+def _confine_spans_to_segment(spans, first, last):
+    """Split spans into the target tab's own and the rest.
+
+    Returns (inside, outside, why). A span with one end inside the segment
+    and the other outside is not placed and not dismissed: it is a refusal,
+    because an anchor that crosses a tab boundary is territory nobody has
+    measured.
+
+    «Did not match here» is NEVER a reason to call a span foreign — that is
+    how a live thread in the TARGET tab would be dropped over a soft break
+    (#27). Foreign is decided by position in the proven segment, positively.
+    """
+    inside, outside = [], []
+    for sp in spans:
+        tops = (sp.get("top"), sp.get("end_top"))
+        if any(t is None for t in tops):
+            return None, None, (f"спан {sp.get('docx_id')} не привязан ни к "
+                                f"одному элементу тела — границу вкладки для "
+                                f"него доказать нечем")
+        # Three positions, not two. «Обе не внутри» недостаточно: спан,
+        # начавшийся ДО отрезка и кончившийся ПОСЛЕ него, охватывает целевую
+        # вкладку целиком, а по признаку «не внутри» выглядел бы чужим и
+        # остался бы без защиты (найдено тестом).
+        sides = [(-1 if t < first else (0 if t <= last else 1)) for t in tops]
+        if sides == [0, 0]:
+            inside.append(sp)
+        elif sides[0] == sides[1]:
+            outside.append(sp)
+        else:
+            return None, None, (
+                f"комментарий {sp.get('docx_id')} растянут через границу "
+                f"вкладки — такое размещение не замерено (fail closed)")
+    return inside, outside, None
+
+
+def _localize_spans(spans, outline, first, last, docx_lattice):
+    """Re-address the target tab's spans to the segment.
+
+    A span's path names a table by its ordinal in the whole body, and its
+    lattice is the whole document's — both count the tables of every tab
+    against the API's count for one (measured, M19-19). Returns
+    (spans, None) or (None, why); a span in a table the segment does not
+    contain is a refusal, not a silent drop.
+    """
+    lattice, remap = _segment_lattice(outline, first, last, docx_lattice)
+    out = []
+    for sp in spans:
+        sp = dict(sp)
+        sp["path"] = remap(sp["path"])
+        sp["end_path"] = remap(sp["end_path"])
+        if sp["path"] is None or sp["end_path"] is None:
+            return None, (f"якорь {sp.get('docx_id')} лежит в таблице, "
+                          f"которой нет в доказанном отрезке вкладки "
+                          f"(fail closed)")
+        sp["docx_lattice"] = lattice
+        out.append(sp)
+    return out, None
+
+
+def _segment_lattice(outline, first, last, docx_lattice):
+    """Re-number the export lattice to the segment, or drop what is outside.
+
+    Without this the export counts the tables of ALL tabs against the API's
+    count for one (measured, M19-19), and every anchor in a cell is refused
+    with a reason that names a disagreement nobody has.
+    """
+    tmap = {}
+    for i in range(first, last + 1):
+        el = outline[i]
+        if el["kind"] == "tbl":
+            tmap[el["t_ord"]] = len(tmap)
+
+    def remap(path):
+        if not path:
+            return ()
+        (t, j, col), rest = path[0], path[1:]
+        if t not in tmap:
+            return None
+        return ((tmap[t], j, col),) + rest
+
+    out = {"tables": {}, "rows": {}, "table_rows": {}, "paras": {}}
+    out["tables"][()] = len(tmap)
+    for key in ("tables", "paras"):
+        for path, v in docx_lattice.get(key, {}).items():
+            if not path:
+                continue
+            moved = remap(path)
+            if moved is not None:
+                out[key][moved] = v
+    for (path, t), v in docx_lattice.get("table_rows", {}).items():
+        moved = remap(path + ((t, 0, 0),))
+        if moved is not None:
+            out["table_rows"][(moved[:-1], moved[-1][0])] = v
+    for (path, t, j), v in docx_lattice.get("rows", {}).items():
+        moved = remap(path + ((t, j, 0),))
+        if moved is not None:
+            out["rows"][(moved[:-1], moved[-1][0], j)] = v
+    return out, remap
 
 
 def _pieces_fit(pieces, text):
@@ -2584,7 +3057,7 @@ def _rfc3339_epoch(ts):
     return parsed.timestamp()
 
 
-def _ghost_verdict(c, records, doc_tab, file_id=None):
+def _ghost_verdict(c, records, doc_tab, file_id=None, other_tabs=()):
     """Is this witness-less thread provably a ghost? None when it is not.
 
     A thread the API calls live whose records are absent from the export is
@@ -2669,6 +3142,15 @@ def _ghost_verdict(c, records, doc_tab, file_id=None):
                 "fenced": []}
     if not later:
         return None
+    # The quote may simply live in ANOTHER TAB. Sign 2 asks whether the text
+    # is gone from the DOCUMENT, and reading it in the target tab alone makes
+    # every thread of every neighbouring tab look dead: the quote is not
+    # there, the fence comes out empty, and the person is told their comment
+    # vanished while its protection is quietly dropped (r12, round 2).
+    for other in other_tabs:
+        if (_count_quote_occurrences(other, quote)
+                or _count_text_outside_body(other, quote)):
+            return None
     if _count_text_outside_body(doc_tab, quote):
         # The old text survives in a header, a footer or a footnote, where the
         # fence cannot reach — `_text_buffer` walks the body only, while
@@ -2707,7 +3189,7 @@ def _fence_off_ghosts(ghosts):
 
 def _account_anchored_comments(anchored, records, spans, *, universe,
                                file_id=None, marker_census=None,
-                               doc_tab=None):
+                               doc_tab=None, other_tabs=()):
     """Prove every live anchored THREAD keeps at least one anchor in the export.
 
     Ghosted threads vanish from the export ENTIRELY (C11a), and a stale export
@@ -2750,6 +3232,7 @@ def _account_anchored_comments(anchored, records, spans, *, universe,
     from collections import Counter
 
     problems, ghosts = [], []
+    in_other_tabs = 0
     signatures = []  # (thread, Counter of its live entry keys)
     resolved_n = 0
     for c in anchored:
@@ -2806,7 +3289,8 @@ def _account_anchored_comments(anchored, records, spans, *, universe,
         # At least ONE witness present is enough — a thread may have several,
         # and requiring a particular one would flap on partial staleness.
         if not any(docx_keys.get(k) for k in witnesses):
-            verdict = _ghost_verdict(c, records, doc_tab, file_id)
+            verdict = _ghost_verdict(c, records, doc_tab, file_id,
+                                     other_tabs=other_tabs)
             if verdict is not None:
                 # Provably gone: it has no anchor left to protect, so the
                 # document is not held hostage to it (#34). Named in the
@@ -2814,6 +3298,21 @@ def _account_anchored_comments(anchored, records, spans, *, universe,
                 # (CONTRACT §2.2), never ours.
                 ghosts.append(verdict)
                 continue
+            # A thread missing from the export, whose text is not in the
+            # target tab at all but IS in another one. Whatever happened to
+            # its record, an edit confined to this tab cannot reach it, so it
+            # is neither a ghost (nobody is told their comment vanished) nor a
+            # reason to refuse (codex, final round). The quote must be absent
+            # from THIS tab entirely — if it stands here, the anchor may be
+            # here too, and then the refusal is the honest answer.
+            quote = (c.get("quotedFileContent") or {}).get("value")
+            if quote and other_tabs and not _replace_all_match_count(
+                    doc_tab, quote):
+                if any(_count_quote_occurrences(o, quote)
+                       or _count_text_outside_body(o, quote)
+                       for o in other_tabs):
+                    in_other_tabs += 1
+                    continue
             # Not provable, so nothing is scoped: a thread missing from the
             # export has no span in document.xml, and there are no coordinates
             # to confine the refusal to.
@@ -2899,6 +3398,9 @@ def _account_anchored_comments(anchored, records, spans, *, universe,
         "docx_comment_entries": len(records),
         "anchor_spans": len(spans),
         "anchors_outside_body": outside_body,
+        # threads whose text lives in another tab entirely: an edit
+        # confined to this tab cannot reach them
+        "threads_in_other_tabs": in_other_tabs,
     }
     if ghosts:
         # carried in the metrics rather than a third return value: every
@@ -3320,8 +3822,17 @@ def _find_protected_overlap(flat, protected):
 
 
 def _canary_delete_request(canary):
-    return {"deleteContentRange": {"range": {
-        "startIndex": canary["start"], "endIndex": canary["end"]}}}
+    """Delete the canary — in ITS OWN tab.
+
+    The tab travels inside the canary because this request is prepended to
+    the final batch as `extra_requests_before`, and that list used to bypass
+    the loop that scoped requests: an unscoped delete removes a range of the
+    FIRST tab (M19-9) — somebody else's text — while the canary stays where
+    it is.
+    """
+    return _scope_requests([{"deleteContentRange": {"range": {
+        "startIndex": canary["start"], "endIndex": canary["end"]}}}],
+        canary.get("tab_id"))[0]
 
 
 def _cleanup_canary(docs_service, file_id, canary):
@@ -3335,14 +3846,28 @@ def _cleanup_canary(docs_service, file_id, canary):
     """
     try:
         doc = _safe_get_doc(docs_service, file_id)
-        _, doc_tab = _select_tab(doc, tab_id=None)
+        # the canary's OWN tab: `tab_id=None` used to be passed here, and on a
+        # multi-tab document `_select_tab` refuses — so cleanup could not run
+        # at all, and every abort left the service line behind
+        tid = canary.get("tab_id")
+        _, doc_tab = _select_tab(doc, tab_id=tid)
         if _count_quote_occurrences(doc_tab, canary["text"]) != 1:
             return False
         s, e = _find_quote_in_doctab(doc_tab, canary["text"])
+        # `s - 1` is meant to be the canary paragraph's own newline. Meant to
+        # be — nobody checked. Between the insert and the cleanup a person can
+        # merge that line, type in front of the canary or move it; then this
+        # delete takes their character along with the service line. Checked
+        # now: if the preceding character is not the newline, nothing is
+        # deleted and the caller warns with the literal text instead (codex,
+        # final round).
+        if _extract_exact_text_range(doc_tab, s - 1, s) != "\n":
+            return False
         docs_service.documents().batchUpdate(
             documentId=file_id,
-            body={"requests": [{"deleteContentRange": {"range": {
-                      "startIndex": s - 1, "endIndex": e}}}],
+            body={"requests": _scope_requests(
+                      [{"deleteContentRange": {"range": {
+                          "startIndex": s - 1, "endIndex": e}}}], tid),
                   "writeControl": _write_control(doc.get("revisionId"))},
         ).execute()
         return True
@@ -3354,7 +3879,7 @@ def _canary_present(docs_service, file_id, canary):
     """Fresh-read probe: True/False, or None when the read itself failed."""
     try:
         doc = _safe_get_doc(docs_service, file_id)
-        _, doc_tab = _select_tab(doc, tab_id=None)
+        _, doc_tab = _select_tab(doc, tab_id=canary.get("tab_id"))
         return _count_quote_occurrences(doc_tab, canary["text"]) > 0
     except Exception:
         return None
@@ -3362,7 +3887,7 @@ def _canary_present(docs_service, file_id, canary):
 
 def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
                            doc_tab, anchored, named_intervals, body_end,
-                           *, fp1, universe):
+                           *, fp1, universe, tid):
     """Provably-fresh anchor map for structural edits on a commented doc.
 
     Export freshness is not provable read-only (files.export takes no
@@ -3394,15 +3919,21 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
                 f"edit in the UI")
     canary_text = f"⚓ skrepka-canary-{uuid.uuid4().hex} {_CANARY_NOTE}"
     payload = "\n" + canary_text  # own terminal paragraph (codex r3 #1)
+    # `body_end` is counted in the TARGET tab, so the insert must name that
+    # tab: without it the request goes to the first tab (M19-9) — silently
+    # when the index happens to fit there, and with a 400 when it does not.
+    # The tab travels on in the canary itself: every later step (delete,
+    # cleanup, presence probe) needs it and none of them sees `tid`.
     canary = {"text": canary_text,
               "start": body_end - 1,
-              "end": body_end - 1 + _utf16_len(payload)}
+              "end": body_end - 1 + _utf16_len(payload),
+              "tab_id": tid}
     try:
         resp = docs_service.documents().batchUpdate(
             documentId=file_id,
-            body={"requests": [{"insertText": {
+            body={"requests": _scope_requests([{"insertText": {
                       "location": {"index": body_end - 1},
-                      "text": payload}}],
+                      "text": payload}}], tid),
                   "writeControl": _write_control(doc.get("revisionId"))},
         ).execute()
     except HttpError as e:
@@ -3481,10 +4012,40 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
         # of the R0 snapshot — it cannot match any R0 paragraph (fresh
         # uuid), so it never enters the mapping
         records, rec_problems = _docx_comment_records(docx_bytes)
+        # The accounting keeps seeing ALL spans on purpose: `comments.xml` is
+        # one per document and its w:id are document-wide (M19-16), so the
+        # join «one record ⇔ one span» is documentary by construction and
+        # multi-tab does not touch it. Only the MAPPING is confined to the
+        # target tab.
+        tabs_now = _collect_tabs(doc)
         acc_problems, metrics = _account_anchored_comments(
             anchored, records, spans, universe=universe, file_id=file_id,
-            marker_census=census, doc_tab=doc_tab)
-        anchors, map_problems, ambiguous = _map_anchors_to_doc(doc_tab, spans)
+            marker_census=census, doc_tab=doc_tab,
+            other_tabs=[dt for t, _title, dt in tabs_now if t != tid])
+        mapped_spans = spans
+        foreign_ids = set()
+        if len(tabs_now) > 1:
+            first, last, why = _prove_target_segment(
+                census["outline"], tabs_now, tid, canary_text=canary_text)
+            if why:
+                _abort(
+                    f"границу целевой вкладки в выгрузке доказать не "
+                    f"удалось: {why}. Пока она не доказана, разместить "
+                    f"якорь нельзя — у вкладок свои индексные пространства, "
+                    f"и промах молчалив. Правьте эту вкладку в интерфейсе "
+                    f"Google Docs")
+            mine, foreign, why = _confine_spans_to_segment(spans, first,
+                                                            last)
+            if why:
+                _abort(f"комментарии и вкладки не сходятся: {why}")
+            foreign_ids = {sp["docx_id"] for sp in foreign}
+            mapped_spans, why = _localize_spans(
+                mine, census["outline"], first, last,
+                census["docx_lattice"])
+            if why:
+                _abort(why)
+        anchors, map_problems, ambiguous = _map_anchors_to_doc(
+            doc_tab, mapped_spans)
         attribution = _attribute_records_to_threads(anchored, records,
                                                     universe)
         # An anchor that matches several identical paragraphs is not placed —
@@ -3494,6 +4055,18 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
             ambiguous, attribution=attribution, file_id=file_id)
         all_problems = (problems + rec_problems + acc_problems + map_problems
                         + amb_problems)
+        if foreign_ids:
+            # A problem about an anchor in ANOTHER tab is not this tab's
+            # problem: the write cannot reach it. Confining the mapping was
+            # not enough — the parser and the accounting report per-anchor
+            # troubles too (a picture in the anchor's paragraph, an empty
+            # anchor, a span with no comments.xml entry), and each of those
+            # still aborted the whole document, which is exactly the
+            # behaviour this round set out to remove (opus, final round).
+            all_problems = [
+                p for p in all_problems
+                if not (set(getattr(p, "docx_ids", ()))
+                        and set(getattr(p, "docx_ids", ())) <= foreign_ids)]
         global_problems, blocked = _scope_anchor_problems(
             all_problems, anchors, attribution=attribution, file_id=file_id)
         # An anchor hiding inside a table has no readable offset, but the
@@ -4183,14 +4756,11 @@ def _execute_anchor_rewrite(docs_service, file_id, tid, requests, revision_id,
     means the document has been changed in a way nobody planned. There is no
     `not_applied` outcome to report.
     """
-    for req in requests:
-        if tid and "replaceAllText" in req:
-            req["replaceAllText"]["tabsCriteria"] = {"tabIds": [tid]}
-        elif tid and "insertText" in req:
-            req["insertText"]["location"]["tabId"] = tid
-        elif tid and "deleteContentRange" in req:
-            req["deleteContentRange"]["range"]["tabId"] = tid
-    body = {"requests": list(extra_requests_before or []) + requests,
+    # `extra_requests_before` goes through the same white list as the rest:
+    # it used to be concatenated AFTER the scoping loop, which is how the
+    # canary delete could reach the first tab (measured M19-9).
+    body = {"requests": _scope_requests(
+                list(extra_requests_before or []) + list(requests), tid),
             "writeControl": _write_control(revision_id)}
     result = docs_service.documents().batchUpdate(
         documentId=file_id, body=body).execute()
@@ -4264,9 +4834,8 @@ def _execute_replace_all(docs_service, file_id, tid, search_text, new_text,
         "containsText": {"text": search_text, "matchCase": True},
         "replaceText": new_text,
     }}
-    if tid:
-        req["replaceAllText"]["tabsCriteria"] = {"tabIds": [tid]}
-    requests = list(extra_requests_before or []) + [req]
+    requests = _scope_requests(
+        list(extra_requests_before or []) + [req], tid)
     result = docs_service.documents().batchUpdate(
         documentId=file_id,
         body={"requests": requests,
@@ -4309,13 +4878,11 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
         _refuse_on_suggestion_at(doc_tab, r["start"], r["source"])
         if not r["text"]:
             return
-        loc = {"index": r["start"]}
-        if tid:
-            loc["tabId"] = tid
         docs_service.documents().batchUpdate(
             documentId=file_id,
-            body={"requests": [{"insertText": {"location": loc,
-                                               "text": r["text"]}}],
+            body={"requests": _scope_requests([{"insertText": {
+                      "location": {"index": r["start"]},
+                      "text": r["text"]}}], tid),
                   "writeControl": _write_control(doc.get("revisionId"))},
         ).execute()
         return
@@ -4332,10 +4899,13 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
                 f"W8 preflight read failed: "
                 f"{e.reason if hasattr(e, 'reason') else e}",
                 state="not_applied")
-        if len(_collect_tabs(doc)) > 1:
-            # DOCX ranges carry no tab identity (addendum p.6)
-            _error("multi-tab document: anchor-mapped replaces are not "
-                   "supported — edit in the UI")
+        # A multi-tab document is no longer refused here. The export
+        # carries no tab id at all (M19-4), but it does carry each tab's
+        # OWN elements, and `_fresh_anchor_snapshot` proves the target
+        # tab's extent in it before a single anchor is placed. What used
+        # to be «several tabs ⇒ refuse» is now «the tab's extent is not
+        # proven ⇒ refuse», which is a condition about this document
+        # rather than about tabs as such.
         tid, doc_tab = _select_tab(doc, tab_id=tab_id)
         r = _resolve_op(op, doc_tab, tid)
 
@@ -4352,13 +4922,11 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
             where, text = insertion
             point = r["end"] if where == "after" else r["start"]
             _refuse_on_suggestion_at(doc_tab, point, r["source"])
-            loc = {"index": point}
-            if tid:
-                loc["tabId"] = tid
             docs_service.documents().batchUpdate(
                 documentId=file_id,
-                body={"requests": [{"insertText": {"location": loc,
-                                                   "text": text}}],
+                body={"requests": _scope_requests([{"insertText": {
+                          "location": {"index": point},
+                          "text": text}}], tid),
                       "writeControl": _write_control(doc.get("revisionId"))},
             ).execute()
             return {"source": r["source"], "applied_as": "insert",
@@ -4377,7 +4945,7 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
         snap, retry_reason = _fresh_anchor_snapshot(
             docs_service, drive_service, file_id, doc, doc_tab,
             anchored_now, named_intervals, body_end, fp1=fp1,
-            universe=universe)
+            universe=universe, tid=tid)
         if snap is None:
             last_reason = retry_reason
             continue
@@ -4691,26 +5259,23 @@ def patch_doc(file_id, ops_path, tab_id=None):
                 # told, by the suggestion gate above, that this op removes
                 # nothing (found in review).
                 loc = {"index": r["end"] if ins[0] == "after" else r["start"]}
-                if r["tab_id"]:
-                    loc["tabId"] = r["tab_id"]
-                requests.append({"insertText": {"location": loc,
-                                                "text": ins[1]}})
+                requests += _scope_requests(
+                    [{"insertText": {"location": loc, "text": ins[1]}}],
+                    r["tab_id"])
             elif r["kind"] == "replace":
                 if r["end"] > r["start"]:
-                    del_range = {"startIndex": r["start"], "endIndex": r["end"]}
-                    if r["tab_id"]:
-                        del_range["tabId"] = r["tab_id"]
-                    requests.append({"deleteContentRange": {"range": del_range}})
+                    requests += _scope_requests(
+                        [{"deleteContentRange": {"range": {
+                            "startIndex": r["start"],
+                            "endIndex": r["end"]}}}], r["tab_id"])
                 if r["text"]:
-                    loc = {"index": r["start"]}
-                    if r["tab_id"]:
-                        loc["tabId"] = r["tab_id"]
-                    requests.append({"insertText": {"location": loc, "text": r["text"]}})
+                    requests += _scope_requests(
+                        [{"insertText": {"location": {"index": r["start"]},
+                                         "text": r["text"]}}], r["tab_id"])
             elif r["kind"] == "insert" and r["text"]:
-                loc = {"index": r["start"]}
-                if r["tab_id"]:
-                    loc["tabId"] = r["tab_id"]
-                requests.append({"insertText": {"location": loc, "text": r["text"]}})
+                requests += _scope_requests(
+                    [{"insertText": {"location": {"index": r["start"]},
+                                     "text": r["text"]}}], r["tab_id"])
         if requests:
             try:
                 docs_service.documents().batchUpdate(
@@ -4913,17 +5478,15 @@ def mark_range(file_id, name, quote, tab_id=None, occurrence=1):
         _error(f"quote not found in tab {tid or '(default)'}: {quote!r}")
     start_idx, end_idx = found
 
-    # Build createNamedRange request. For multi-tab docs, range must carry tabId.
-    range_obj = {"startIndex": start_idx, "endIndex": end_idx}
-    if tid:
-        range_obj["tabId"] = tid
-
-    requests = [{
+    # Through the same gate as every other write: a request that names no tab
+    # is not tab-neutral (M19), and a second hand-rolled copy of that rule is
+    # a second place to forget it (r12, round 2).
+    requests = _scope_requests([{
         "createNamedRange": {
             "name": name,
-            "range": range_obj,
+            "range": {"startIndex": start_idx, "endIndex": end_idx},
         }
-    }]
+    }], tid)
 
     try:
         result = docs_service.documents().batchUpdate(
@@ -6507,7 +7070,7 @@ def sync_doc(file_id, md_path, tab_id=None):
         snap, retry_reason = _fresh_anchor_snapshot(
             docs_service, drive_service, file_id, doc, doc_tab,
             anchored, named_intervals, body_end, fp1=fp1,
-            universe=universe)
+            universe=universe, tid=_tid)
         if snap is None:
             # retryable race, but re-planning is this whole function —
             # a CLI re-run is the retry (nothing has been applied)
