@@ -1406,6 +1406,20 @@ def _list_named_range_names(doc_tab):
     return sorted((doc_tab.get("namedRanges") or {}).keys())
 
 
+# Characters an edit may not carry, because Docs does not keep them as
+# written and the text that lands would not be the text the positions were
+# computed for. Measured 2026-08-23 on the M20 stand: `insertText` ACCEPTS a
+# form feed — the reply is a plain success — and the character simply is not
+# there afterwards. A silent drop is the worst shape a write can take.
+#
+# Three control characters are deliberately allowed, each because it is a
+# thing an author writes: the tab, the paragraph break (`\n`, which is how an
+# edit adds a paragraph), and the soft line break (`\v`, shift+enter — #40).
+# The Private Use Area is refused for the same measured reason as the control
+# characters: Docs is known to strip it.
+_OP_TEXT_FORBIDDEN = re.compile("[\x00-\x08\x0c-\x1f\x7f-\x9f\ue000-\uf8ff]")
+
+
 def _resolve_op(op, doc_tab, tab_id):
     """Resolve one op dict to an internal record with absolute indices.
 
@@ -1424,6 +1438,19 @@ def _resolve_op(op, doc_tab, tab_id):
     kind_name = op.get("op")
     if not kind_name:
         _error(f"op missing 'op' field: {op}")
+
+    new_text = op.get("text") if "text" in op else op.get("with")
+    if isinstance(new_text, str):
+        bad = _OP_TEXT_FORBIDDEN.search(new_text)
+        if bad:
+            _error(
+                f"op text holds a character Docs does not keep as written "
+                f"({bad.group()!r} = U+{ord(bad.group()):04X}), so what would "
+                f"land is not what the positions were computed for. Measured "
+                f"2026-08-23: `insertText` accepts a form feed and drops it "
+                f"silently. Allowed control characters are the tab, the "
+                f"paragraph break (\\n) and the soft line break (\\v, "
+                f"shift+enter). {op}")
 
     # Resolve target
     if "range" in op:
@@ -1647,6 +1674,54 @@ def _docx_grid_span(tc):
     return n if n > 0 else 1
 
 
+# In-paragraph breaks: the one alphabet both sides speak (#27, measured M20).
+#
+# The export used to write EVERY break as \n — soft break, page break, column
+# break alike — and \n is a character no API paragraph text can hold, since \n
+# is what ends a paragraph. So a commented paragraph with shift+enter in it
+# matched nothing, and one such paragraph closed the whole document to
+# replaces. Measured live: 50 paragraphs, edits needed in 30, one soft break —
+# every replace refused (postmortem 2026-08-20).
+#
+# Normalizing \v to \n at comparison time was the obvious fix and is a
+# MEASURED fail-open: the export writes a soft-break paragraph and a
+# page-break paragraph with the same visible text IDENTICALLY (M20-4), so an
+# anchor sitting on the page-break one would match the soft-break twin exactly
+# once — one candidate, no fence, anchor on the wrong paragraph.
+#
+# So the parser stops throwing the distinction away. `w:br` carries its kind
+# in `w:type`, and each kind gets the spelling the API uses:
+#
+#   soft break   `w:br` without a type, or type="textWrapping"   ->  \v
+#   page break   `w:br w:type="page"`                            ->  \f
+#
+# `w:cr` is NOT in the table and gets no branch of its own: WordML calls it a
+# line break, but Google wrote none in the measurement (0 of 8 breaks, M20-1),
+# so it is unmeasured — and the walker's catch-all already marks a paragraph
+# holding an unknown tag unreadable. A branch that repeated that would read
+# like logic while changing nothing (caught by the mutation stand).
+#
+# Anything else — a column break, a type nobody measured — leaves the
+# paragraph UNREADABLE rather than guessing a character: a wrong guess shifts
+# every offset after it, and an anchor placed on shifted offsets protects the
+# wrong characters. This alphabet is for COMPARING the two sides only. Nothing
+# addresses text by it: writes go through `_text_buffer`, which puts a \x00
+# sentinel at every index gap, so a quote can never cross a page break.
+_SOFT_BREAK = "\v"
+_PAGE_BREAK = "\f"
+_DOCX_BREAK_TEXT = {None: _SOFT_BREAK, "textWrapping": _SOFT_BREAK,
+                    "page": _PAGE_BREAK}
+# The API side of the same table. A soft break needs no entry — it arrives as
+# \v inside `textRun` content and is already spelled. `pageBreak` is its own
+# element, one index unit wide (M20-2), which is exactly what the export
+# counts for `w:br`.
+_API_BREAK_TEXT = {"pageBreak": _PAGE_BREAK}
+# Neither spelling may arrive as ordinary text, or an API paragraph could read
+# identical to an exported page break without holding one. Never measured in
+# the wild, and cheap to refuse (codex plan r2).
+_BREAK_CHARS = _SOFT_BREAK + _PAGE_BREAK
+
+
 def _parse_docx_anchor_spans(docx_bytes):
     """Parse word/document.xml and extract comment anchor spans.
 
@@ -1813,7 +1888,8 @@ def _parse_docx_anchor_spans(docx_bytes):
         # and produce a confidently wrong anchor range (codex W8-r2 P0).
         _BENIGN = {f"{w}pPr", f"{w}proofErr", f"{w}bookmarkStart",
                    f"{w}bookmarkEnd", f"{w}commentReference", f"{w}rPr"}
-        _RUN_TEXT = {f"{w}t", f"{w}tab", f"{w}br", f"{w}cr"}
+        # `w:t`, `w:tab`, `w:br` and `w:cr` are read one by one below — each
+        # break kind has its own spelling and its own reason (#27).
         _RUN_OBJ = {f"{w}drawing", f"{w}object", f"{w}pict"}
 
         def walk(node, state=state, p_index=p_index):
@@ -1856,12 +1932,29 @@ def _parse_docx_anchor_spans(docx_bytes):
                 elif tag == f"{w}r":
                     for rc in child:
                         if rc.tag == f"{w}t":
+                            # No guard against `w:t` carrying a break spelling
+                            # as ordinary text — one was written and deleted as
+                            # dead code. XML 1.0 forbids U+000B and U+000C in
+                            # content, entity or not, so such an export is
+                            # malformed and this parser refuses it whole, one
+                            # layer up (covered by a test). The API side is
+                            # JSON and has no such rule, so `_api_para_read`
+                            # keeps its own guard.
                             text = rc.text or ""
                             state["parts"].append(text)
                             state["off"] += _utf16_len(text)
-                        elif rc.tag in _RUN_TEXT:
-                            state["parts"].append(
-                                "\t" if rc.tag == f"{w}tab" else "\n")
+                        elif rc.tag == f"{w}tab":
+                            state["parts"].append("\t")
+                            state["off"] += 1
+                        elif rc.tag == f"{w}br":
+                            spelled = _DOCX_BREAK_TEXT.get(rc.get(f"{w}type"))
+                            if spelled is None:
+                                # a column break, or a kind Google adds
+                                # tomorrow: not guessed, not counted
+                                state["has_unknown"].append(
+                                    f"{rc.tag}[{rc.get(f'{w}type')}]")
+                                continue
+                            state["parts"].append(spelled)
                             state["off"] += 1
                         elif rc.tag in _RUN_OBJ:
                             state["has_objects"] = True
@@ -2024,30 +2117,119 @@ def _parse_docx_anchor_spans(docx_bytes):
     return spans, problems, census
 
 
-# Element kinds that CANNOT hide an anchor, each for a proven reason:
+# Element kinds that CANNOT hide an anchor, each for a proven reason. The
+# question they answer is narrow: this API paragraph cannot be read, so could
+# the anchor we are about to place somewhere else actually live HERE?
 #   inlineObjectElement / equation  — the export marks the paragraph
 #       `has_objects`, so an anchor in it fails closed before any mapping;
 #   footnoteReference               — `w:footnoteReference` is outside the
 #       parser's whitelist, so the same applies;
-#   pageBreak / columnBreak         — the export writes `w:br` as \n, and a
-#       para_text holding \n matches no API paragraph at all (zero candidates);
+#   columnBreak                     — the export writes it as a `w:br` of a
+#       kind M20 never measured, which makes the paragraph unclean, so an
+#       anchor in it is refused on the export side before placement (#27 used
+#       to reach the same conclusion through «\n matches nothing», which
+#       stopped being true when the two sides started spelling breaks alike);
 #   horizontalRule                  — such a paragraph shows no text, so any
 #       anchor in it is empty and refused earlier.
+# `pageBreak` is deliberately NOT here any more: it is spelled `\f` on both
+# sides now, so such a paragraph is READ, not guessed at — it is an ordinary
+# candidate. A pageBreak whose width is not one unit does not reach this set
+# either: it arrives as «pageBreak/width», which stays a possible host.
 # Everything else — person, richLink, autoText and any kind Google adds
 # tomorrow — is treated as a possible host. A blocklist, not a whitelist: an
 # unknown kind must fail towards protection, not away from it (r9 review).
 _QUIET_ELEMENTS = frozenset((
     "textRun", "inlineObjectElement", "equation", "footnoteReference",
-    "pageBreak", "columnBreak", "horizontalRule"))
+    "columnBreak", "horizontalRule"))
 
 # Element kinds that contribute NO text to the export, so a paragraph holding
 # them still compares by its text runs alone. Used only by the segment proof:
 # a picture in a paragraph is ordinary in an editorial document, and refusing
 # the whole tab over it would leave the live case of #31 unfixed (opus, final
-# round). `pageBreak` and `columnBreak` are NOT here — the export writes them
-# as \n, so such a paragraph really does read differently on the two sides.
+# round). Breaks are NOT here and must never be: they DO contribute a
+# character to both sides now (`\v`, `\f`), and a break kind that cannot be
+# spelled makes the paragraph unreadable instead — dropping it silently would
+# make two different paragraphs read the same.
 _TEXTLESS_ELEMENTS = frozenset((
     "inlineObjectElement", "equation", "footnoteReference", "horizontalRule"))
+
+
+def _api_para_read(para, *, textless_ok=False):
+    """Spell one API paragraph the way the export writes it.
+
+    Returns (text, pieces, opaque): `text` is None when the paragraph holds
+    an element this cannot spell, `pieces` are its textRun fragments in order
+    (what `_pieces_fit` matches against), and `opaque` names the element kinds
+    that made it unreadable.
+
+    One reader for all three consumers — the anchor lattice, a table cell and
+    the tab outline — because three copies of «how a paragraph reads» is how
+    the two sides end up disagreeing about the same paragraph.
+
+    A break element is spelled only when BOTH hold: its kind was measured
+    (M20), and its own extent is exactly one index unit — the single unit the
+    export counts for `w:br`. A kind nobody measured (columnBreak) or a width
+    that is not one leaves the paragraph unreadable: guessing there would
+    shift every offset after the break, and an anchor placed on shifted
+    offsets protects the wrong characters.
+
+    `textless_ok` is for comparing TEXT alone, where an element that
+    contributes no characters to either side (a picture) can be skipped. The
+    lattice must not use it: it needs offsets, and a picture occupies index
+    space the export does not spell.
+    """
+    parts, pieces, opaque = [], [], set()
+    for e in para.get("elements", []) or []:
+        kinds = [k for k in e if k not in ("startIndex", "endIndex")
+                 and not k.startswith("suggested")]
+        if kinds == ["textRun"]:
+            # `kinds ==`, not `"textRun" in e`: an element carrying a textRun
+            # AND something else would have been read as its text alone, and
+            # whatever the neighbour is, it occupies index space the text does
+            # not account for — every offset after it would shift (codex code
+            # r2). The API documents a paragraph element as a union of one
+            # kind; this is what happens if that ever stops being true.
+            content = e["textRun"].get("content", "")
+            if _PAGE_BREAK in content:
+                # `\v` here IS the soft break — that is how the API spells it.
+                # `\f` is different: as ordinary text it would let this
+                # paragraph read exactly like an exported page break. XML
+                # forbids it in the export, JSON does not here (codex plan r2).
+                opaque.add("textRun(break)")
+                continue
+            parts.append(content)
+            pieces.append(content)
+            continue
+        if not kinds:
+            # An element that names no kind at all — every key of it is one
+            # this reader does not know. It still occupies index space, so
+            # skipping it would shift every offset after it. The old reader
+            # refused any element without a `textRun` and was right to
+            # (codex code r1).
+            opaque.add("unknown")
+            continue
+        if len(kinds) == 1 and kinds[0] in _API_BREAK_TEXT:
+            st, en = e.get("startIndex"), e.get("endIndex")
+            if isinstance(st, int) and isinstance(en, int) and en - st == 1:
+                parts.append(_API_BREAK_TEXT[kinds[0]])
+                continue
+            # a break of the right kind and the wrong width: unreadable, and
+            # NOT quiet — «cannot spell it» must not read as «cannot hold an
+            # anchor» (codex plan r2)
+            opaque.add(f"{kinds[0]}/width")
+            continue
+        # A break sharing its element with anything else is not spelled
+        # either: what the neighbour contributes is unknown, and the break's
+        # one unit no longer accounts for the element's width.
+        if textless_ok and not (set(kinds) - _TEXTLESS_ELEMENTS):
+            continue
+        opaque.update(kinds)
+    text = "".join(parts)
+    if text.endswith("\n"):
+        text = text[:-1]
+    if pieces and pieces[-1].endswith("\n"):
+        pieces[-1] = pieces[-1][:-1]
+    return (None if opaque else text), pieces, opaque
 
 
 def _api_cell_text(cell):
@@ -2057,11 +2239,10 @@ def _api_cell_text(cell):
         para = el.get("paragraph")
         if not para:
             return None  # a nested table: not compared, not guessed
-        elements = para.get("elements", [])
-        if any("textRun" not in e for e in elements):
+        text, _pieces, _opaque = _api_para_read(para)
+        if text is None:
             return None
-        text = "".join(e["textRun"].get("content", "") for e in elements)
-        parts.append(text[:-1] if text.endswith("\n") else text)
+        parts.append(text)
     return "\n".join(parts)
 
 
@@ -2082,38 +2263,29 @@ def _api_outline(doc_tab):
                     cells[(j, k)] = _api_cell_text(cell)
             out.append({"kind": "tbl", "rows": len(rows), "cells": cells})
         elif "paragraph" in el:
-            elements = el["paragraph"].get("elements", [])
-            kinds = {k for e in elements for k in e
-                     if k not in ("startIndex", "endIndex")
-                     and not k.startswith("suggested")}
-            if kinds - {"textRun"} - _TEXTLESS_ELEMENTS:
-                out.append({"kind": "p", "text": None})
-                continue
-            text = "".join(e["textRun"].get("content", "") for e in elements
-                           if "textRun" in e)
-            out.append({"kind": "p",
-                        "text": text[:-1] if text.endswith("\n") else text})
+            text, _pieces, _opaque = _api_para_read(el["paragraph"],
+                                                    textless_ok=True)
+            out.append({"kind": "p", "text": text})
     return out
 
 
 def _same_body_text(api_text, docx_text):
-    """Equality for the SEGMENT PROOF only — never for placing an anchor.
+    """Do the two sides read this body element the same way?
 
-    A soft line break is `\v` on the API side and `w:br` (read as `\n`) in
-    the export (#27). The two are in bijection here: `\v` appears in API text
-    only as a soft break, and `\n` cannot appear inside an API paragraph at
-    all, since it is what ends one. `_resolve_cell` and `_pieces_fit` already
-    compare this way — proving which tab an element belongs to is the same
-    class of proof and uses the same relation.
+    Plain equality, and that is the point of #27: both sides now spell an
+    in-paragraph break the same character (`_DOCX_BREAK_TEXT`,
+    `_API_BREAK_TEXT`), so the normalization this used to carry — `\v` read
+    as `\n` — is not just unnecessary but was the shape of a measured
+    fail-open (M20-4). Two paragraphs with the same visible text, one holding
+    a soft break and one a page break, are IDENTICAL under it.
 
-    Placement keeps comparing raw text: case 3 of the fence proof in
-    `_map_anchors_to_doc` leans on a soft break matching NOTHING, and that
-    stays true. The gain is only that one Shift+Enter no longer costs the
-    whole document its tab identity.
+    Kept as a named comparison rather than inlined: what it means for the two
+    sides to «read an element the same way» is the whole load-bearing
+    assumption of the tab proof, and it deserves a place to be argued.
     """
     if api_text is None or docx_text is None:
         return False
-    return api_text.replace("\v", "\n") == docx_text
+    return api_text == docx_text
 
 
 def _prove_target_segment(outline, tabs, tid, canary_text=None):
@@ -2386,20 +2558,14 @@ def _pieces_fit(pieces, text):
     Piecewise, not as one substring: a paragraph «До ИТОГО После» with a chip
     in the middle arrives as fragments split around the part we cannot read.
 
-    A soft line break is spelled `\\v` by the API and `\\n` by the export
-    (#27), so a fragment carrying one would otherwise fit nothing and an
-    unreadable paragraph holding a soft break would stop counting as a
-    possible home for an anchor. That is not a fail-open — a readable twin
-    would have to match a text containing `\\n`, and no API paragraph ever
-    does, so the document is refused either way — but it made the refusal name
-    the wrong reason. Normalizing here does NOT touch the exact-match proof in
-    `_map_anchors_to_doc`: that one runs on `by_text`, over readable
-    paragraphs, and still sees zero matches for a soft break. Whoever fixes
-    #27 has to re-read both.
+    Both sides spell an in-paragraph break the same character now (#27), so
+    the fragments are compared as they come. This used to normalize `\\v` to
+    `\\n` — a soft break was spelled differently on the two sides, and a
+    fragment carrying one fitted nothing, which made an unreadable paragraph
+    holding a soft break stop counting as a possible home for an anchor.
     """
     pos = 0
     for piece in pieces:
-        piece = piece.replace("\v", "\n")
         if not piece:
             continue
         at = text.find(piece, pos)
@@ -2467,22 +2633,15 @@ def _api_lattice(doc_tab):
                     f"paragraph with unusable indices {start!r}..{end!r} — the "
                     f"anchor map cannot be trusted (fail closed)")
                 continue
-            elements = para.get("elements", [])
             bucket = out["paras"].setdefault(path, [])
-            if any("textRun" not in e for e in elements):
-                pieces = [e["textRun"].get("content", "") for e in elements
-                          if "textRun" in e]
-                if pieces and pieces[-1].endswith("\n"):
-                    pieces[-1] = pieces[-1][:-1]
-                kinds = {k for e in elements for k in e
-                         if k not in ("startIndex", "endIndex")
-                         and not k.startswith("suggested")}
+            text, pieces, opaque = _api_para_read(para)
+            if text is None:
+                # `could_host` asks whether an anchor could HIDE in here, and
+                # only the kinds proven unable to hide one are subtracted. A
+                # break we could not spell is not one of them.
                 bucket.append((start, end, None, pieces,
-                               bool(kinds - _QUIET_ELEMENTS)))
+                               bool(opaque - _QUIET_ELEMENTS)))
                 continue
-            text = "".join(e["textRun"].get("content", "") for e in elements)
-            if text.endswith("\n"):
-                text = text[:-1]
             bucket.append((start, end, text, (), False))
         out["n_tables"][path] = t_ord
 
@@ -2549,14 +2708,10 @@ def _resolve_cell(path, lattice, docx_lattice):
         # looks right — and then a fence would sit on the wrong cell while the
         # real anchor stayed editable. So the contents are compared too.
         #
-        # `\v` -> `\n` is the known soft-break mismatch (#27): the export
-        # writes `w:br` as \n where the API returns \v. Normalizing HERE does
-        # not touch the exact-match proof in the caller, which runs on
-        # `by_text` over raw API text and still sees no match for a soft break
-        # — such an anchor is fenced, not placed. A paragraph the API cannot
-        # read at all (a smart chip) matches anything: nothing can be compared
-        # against it, and an anchor near one is fenced by the opaque-neighbour
-        # rule anyway.
+        # Compared as they come: since #27 both sides spell an in-paragraph
+        # break the same character, so a cell whose paragraph holds a soft
+        # break is provable like any other — and a cell holding a PAGE break
+        # is no longer confused with it.
         paras_api = lattice["paras"].get(prefix, ())
         paras_docx = (docx_lattice or {}).get("paras", {}).get(prefix)
         if paras_docx is None or len(paras_docx) != len(paras_api):
@@ -2577,7 +2732,7 @@ def _resolve_cell(path, lattice, docx_lattice):
                     f"grid column {col} of row {row} in table {t_ord} holds a "
                     f"paragraph skrepka cannot read, so it cannot be told "
                     f"apart from a cell of the same shape")
-            if a_text.replace("\v", "\n") != d_text:
+            if a_text != d_text:
                 return None, (
                     f"the export and the API read grid column {col} of row "
                     f"{row} in table {t_ord} differently ({d_text[:30]!r} "
@@ -2642,6 +2797,44 @@ def _common_container(a, b, lattice, docx_lattice):
         "the enclosing cell is not readable from the API")
 
 
+# Control pictures: the refusal has to SHOW the difference, not hint at it.
+# A refusal that printed «matched 0 times» next to a paragraph whose only
+# oddity was invisible sent a live session looking for ghost threads that were
+# never there — two rounds and one false accusation of the version
+# (postmortem 2026-08-20, ask 2).
+_CONTROL_PICTURES = {"\v": "␋", "\f": "␌", "\t": "␉", "\n": "␊", "\r": "␍",
+                     "\x00": "␀"}
+
+
+def _visible_controls(text):
+    """Text with its control characters shown, for a refusal a person reads."""
+    if text is None:
+        return ""
+    for raw, shown in _CONTROL_PICTURES.items():
+        text = text.replace(raw, shown)
+    return text
+
+
+def _closest_para(ptext, by_text_here):
+    """The document paragraph that differs from this one only in a break.
+
+    Deliberately not a fuzzy match. A «closest» paragraph found by similarity
+    is a guess, and on the documents this tool is for — CRM deliverables, a
+    quarter of whose paragraphs repeat word for word — the guess would often
+    name somebody else's twin and print it in the refusal (codex code r1).
+    «The same characters apart from how a break is spelled» is not a guess:
+    it is the diagnosis itself, and the only case worth showing.
+    """
+    if not by_text_here:
+        return None
+    flat = re.sub(f"[{_BREAK_CHARS}]", "\uffff", ptext)
+    for candidate in by_text_here:
+        if (candidate != ptext
+                and re.sub(f"[{_BREAK_CHARS}]", "\uffff", candidate) == flat):
+            return candidate
+    return None
+
+
 def _map_anchors_to_doc(doc_tab, spans):
     """Map docx anchor spans to absolute doc index ranges.
 
@@ -2675,11 +2868,28 @@ def _map_anchors_to_doc(doc_tab, spans):
     right there, one per end.
 
     3. the API reports text that differs from `para_text` — then NOTHING
-       matches and the whole document fails closed. Today this is reachable
-       only through a soft line break (the parser writes `w:br` as \\n, the
-       API returns \\v), and an API paragraph can never contain \\n, since \\n
-       ends a paragraph. **The proof leans on this**, not on `has_unknown`:
-       whoever fixes the `w:br` mismatch has to revisit this branch.
+       matches and the whole document fails closed.
+
+    Case 3 is what #27 changed, so here is what is left in it. It used to be
+    reachable through an ordinary soft line break: the parser wrote every
+    `w:br` as \\n, and an API paragraph can never hold \\n, so one Shift+Enter
+    in a commented paragraph closed the document to replaces — measured live,
+    twice. Both sides now spell an in-paragraph break the same character, so
+    a soft break and a page break both MATCH instead. What still reaches case
+    3: a break kind nobody measured (a column break, `w:cr`), a break element
+    whose width is not one unit, an element the export cannot read at all —
+    and, as ever, the two sides genuinely describing different text.
+
+    Cases 1 and 2 are unchanged, but the fence proof needs one addition,
+    because case 3 no longer covers what it used to. A paragraph carrying a
+    break used to match NOTHING; now it can match exactly one readable
+    paragraph while an unreadable one (a smart chip) could be its real home.
+    At exactly one match this function otherwise trusts the match without
+    looking at opaque paragraphs — hole #30, older than #26 and left open
+    because closing it would freeze documents that work today. Documents with
+    a break in a commented paragraph do NOT work today: they are refused. So
+    for those, and only those, the opaque check runs at one match too — the
+    same argument the cross-paragraph branch (#45) makes about being new.
     """
     lattice = _api_lattice(doc_tab)
     problems = list(lattice["problems"])
@@ -2838,7 +3048,9 @@ def _map_anchors_to_doc(doc_tab, spans):
                 problems.append(
                     f"anchor {s['docx_id']} spans paragraphs and one of its "
                     f"ends matched 0 times in the doc (need exactly 1): "
-                    f"{(ptext if not exact else etext)[:50]!r}")
+                    f"{_visible_controls(ptext if not exact else etext)[:50]!r}"
+                    f" — the two sides read that paragraph differently, and "
+                    f"that is not a ghost thread")
                 continue
             if len(exact) > 1 or len(end_exact) > 1:
                 # Fencing the pairs of candidates is combinatorial and buys
@@ -2874,17 +3086,31 @@ def _map_anchors_to_doc(doc_tab, spans):
             continue
         if not exact:
             if in_cell:
-                # A cell paragraph the API reports with different text. The
-                # one known way to get here is a soft line break — the export
-                # writes `w:br` as \n where the API returns \v (#27) — and it
-                # behaves inside a cell exactly as it does in the body (M16).
-                # In the body that costs the whole document; here it costs the
-                # cell.
+                # A cell paragraph the API reports with different text. Since
+                # #27 a soft break is no longer one of the ways to get here —
+                # both sides spell it the same. What is left is a break kind
+                # nobody measured, or the two sides genuinely reading the cell
+                # differently. In the body that costs the whole document; here
+                # it costs the cell.
                 _fence_at(s, cell_extent, "its paragraph matches nothing in that cell")
                 continue
+            # The refusal has one job beyond saying no: name the true reason.
+            # This one used to read «matched 0 times» and hand out advice
+            # about ghost threads, so a live session spent two rounds looking
+            # for ghosts that were not there while the difference — one
+            # invisible character — was printed on the screen the whole time
+            # (postmortem 2026-08-20, ask 2).
+            near = _closest_para(ptext, by_text_here)
             problems.append(
-                f"anchor {s['docx_id']} paragraph matched 0 times in the doc "
-                f"(need at least 1): {ptext[:50]!r}")
+                f"anchor {s['docx_id']} sits in a paragraph the document and "
+                f"the export read differently, so it cannot be located "
+                f"(fail closed). The export reads "
+                f"{_visible_controls(ptext)[:70]!r}"
+                + (f", the closest the document has is "
+                   f"{_visible_controls(near)[:70]!r}" if near else
+                   ", and no paragraph of the document is close to it")
+                + ". This is not a ghost thread — the thread is in the "
+                  "export; the two READINGS of one paragraph disagree.")
             continue
         if len(exact) > 1:
             # The fence is only honest while the anchor is PROVABLY among the
@@ -2911,7 +3137,8 @@ def _map_anchors_to_doc(doc_tab, spans):
                     f"anchor {s['docx_id']} matches {len(exact)} paragraphs, "
                     f"and a paragraph whose text skrepka cannot read (a smart "
                     f"chip or a rich link at {hosts[:3]}) could be its home "
-                    f"too — undecidable (fail closed): {ptext[:50]!r}")
+                    f"too — undecidable (fail closed): "
+                    f"{_visible_controls(ptext)[:50]!r}")
                 continue
             ambiguous.append({
                 "docx_id": s["docx_id"], "para_text": ptext,
@@ -2925,6 +3152,25 @@ def _map_anchors_to_doc(doc_tab, spans):
         # holding a paragraph the API will not spell out cannot be told apart
         # from any other cell of the same shape, so `_resolve_cell` refuses it
         # before a candidate is ever looked at.
+        #
+        # With ONE exception, and it is the surface #27 opened. A paragraph
+        # carrying an in-paragraph break matched nothing before this release —
+        # such a document was refused outright — so nothing that works today
+        # passes through here, and the strict check the several-candidates
+        # branch makes can be made here too: an opaque paragraph whose known
+        # fragments fit this text could be the anchor's real home, and placing
+        # it on the readable twin would leave the live thread unprotected.
+        if any(c in ptext for c in _BREAK_CHARS):
+            hosts = [st for st, _en, pieces in hosts_here
+                     if _pieces_fit(pieces, ptext)]
+            if hosts:
+                problems.append(
+                    f"anchor {s['docx_id']} sits in a paragraph with a line "
+                    f"break, and a paragraph skrepka cannot read (a smart "
+                    f"chip or a rich link at {hosts[:3]}) could be its home "
+                    f"too — undecidable (fail closed): "
+                    f"{_visible_controls(ptext)[:50]!r}")
+                continue
         base = exact[0][0]
         ranges.append((base + s["start_off"], base + s["end_off"],
                        s.get("anchor_text", ""), s["docx_id"]))
@@ -4513,7 +4759,17 @@ def _style_refusal(doc_tab, start, end, source):
 # Control characters — a newline among them, it starts a new paragraph —
 # and the Private Use Area, which Docs is known to strip. Any of these
 # and the text that lands is not what the positions were computed for.
-_REWRITE_FORBIDDEN = re.compile("[\x00-\x1f\x7f-\x9f\ue000-\uf8ff]")
+#
+# U+000B is the exception, and it is cut out of the range by hand rather than
+# by widening it: the soft line break is an ordinary character to Google in
+# all three write operations (M20-5, M20-6, M20-7 — matched by
+# `replaceAllText`, accepted in its replacement, accepted by `insertText`),
+# and it is the character an editorial preview is BUILT of — heading and
+# subheading in one paragraph. Forbidding it here did not protect anything:
+# it sent the operator to the Docs API by hand, past every check skrepka
+# makes, and that hand-written batch cut a space out of a live anchor
+# (postmortem 2026-08-19). #40.
+_REWRITE_FORBIDDEN = re.compile("[\x00-\x0a\x0c-\x1f\x7f-\x9f\ue000-\uf8ff]")
 
 
 def _distinct_anchor_ranges(spans):
@@ -4713,6 +4969,22 @@ def _why_no_rewrite(doc_tab, search_text, new_text, start, end, anchors,
         return ("Этот фрагмент занимает несколько абзацев, а переписать "
                 "целиком skrepka умеет только фрагмент внутри одного. "
                 "Правьте абзацы по отдельности.")
+    bad = _REWRITE_FORBIDDEN.search(new_text or "")
+    if bad:
+        # The two layers допускают разное, и это не небрежность: обычная
+        # правка живёт по `_OP_TEXT_FORBIDDEN` (таб, `\n`, `\v`), а перезапись
+        # прокомментированного фрагмента считает точные позиции тремя
+        # запросами, и `\n` внутри неё создал бы абзац посреди этой
+        # арифметики. Мягкий перенос разрешён в обеих (#40). Разница названа
+        # вслух, потому что иначе одна и та же операция «проходит здесь и не
+        # проходит там» без объяснения (codex, круг 3 по коду).
+        what = {"\n": "перевод строки", "\t": "табуляция"}.get(
+            bad.group(), f"символ U+{ord(bad.group()):04X}")
+        return (f"В новом тексте есть {what}, а переписать прокомментированный "
+                f"фрагмент целиком можно только текстом внутри одного абзаца: "
+                f"перезапись считает позиции по трём запросам, и новый абзац "
+                f"посреди неё ломает счёт. Мягкий перенос (shift+enter) в этом "
+                f"тексте разрешён — остальное разбейте на отдельные операции.")
     if any("tableOfContents" in el for el in
            (doc_tab.get("body", {}) or {}).get("content", [])):
         return ("В документе есть оглавление, а его текст skrepka не читает — "
@@ -6287,6 +6559,16 @@ def _md_inline_spans(inline_token):
             # a \n inside one element would become a SECOND Docs paragraph
             # on insertText — structurally unsupported (codex sync-r1 #9)
             return None, "soft line break inside a paragraph — use separate paragraphs"
+        elif t == "hardbreak":
+            # Two spaces at the end of a line: a REAL soft break in the
+            # document (\v), which `upload` and `download` carry both ways
+            # since #27. `sync` still treats the paragraph as one indivisible
+            # atom — its merge works on whole paragraphs and would have to
+            # rebuild the break to touch anything inside — so the note names
+            # the path that exists instead of calling it unsupported.
+            return None, ("мягкий перенос строки в абзаце — целиком такой "
+                          "абзац sync не правит, для правки внутри него "
+                          "используйте patch")
         elif t == "strong_open":
             active.append("bold")
         elif t == "strong_close":

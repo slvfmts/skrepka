@@ -3338,3 +3338,86 @@ def test_the_refusal_names_the_real_reason_the_rewrite_did_not_fire(engine):
     # nothing structural in the way: the original sentence, which is the one
     # that is true then
     assert "ИСХОДНЫЙ символ якоря" in engine._why_no_rewrite(**base)
+
+
+# ---------------------------------------------------------------------------
+# r13: мягкий перенос через весь путь patch (#27, #40)
+# ---------------------------------------------------------------------------
+
+def _softbreak_export(docs_stub, paras, comments):
+    """Сборщик выгрузки, пишущий `\\v` настоящим `w:br`.
+
+    `make_docx_full` кладёт текст в `w:t`, а XML управляющих символов в
+    содержимом не допускает вовсе — мягкий перенос там представим только
+    тегом, ровно как его пишет Google (M20-1).
+    """
+    def build():
+        p = list(paras)
+        if docs_stub.canary_text is not None:
+            p.append((docs_stub.canary_text, None))
+        body = []
+        for text, cid in p:
+            runs = []
+            if cid is not None:
+                runs.append(f'<w:commentRangeStart w:id="{cid}"/>')
+            for i, piece in enumerate(text.split("\v")):
+                if i:
+                    runs.append("<w:r><w:br/></w:r>")
+                runs.append(
+                    f'<w:r><w:t xml:space="preserve">{piece}</w:t></w:r>')
+            if cid is not None:
+                runs.append(f'<w:commentRangeEnd w:id="{cid}"/>')
+                runs.append(f'<w:commentReference w:id="{cid}"/>')
+            body.append(f"<w:p>{''.join(runs)}</w:p>")
+        document = (f'<?xml version="1.0"?><w:document xmlns:w="{WORDML}">'
+                    f"<w:body>{''.join(body)}</w:body></w:document>")
+        centries = "".join(
+            f'<w:comment w:id="{cid}" w:author="{author}" w:date="{date}">'
+            f"<w:p><w:r><w:t>c</w:t></w:r></w:p></w:comment>"
+            for cid, author, date in comments)
+        comments_xml = (f'<?xml version="1.0"?><w:comments xmlns:w="{WORDML}">'
+                        f"{centries}</w:comments>")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("word/document.xml", document)
+            z.writestr("word/comments.xml", comments_xml)
+        return buf.getvalue()
+    return build
+
+
+PREVIEW = "Пальто и ботинки\vОсенний ассортимент"
+
+
+def test_patch_works_beside_a_commented_soft_break(engine, monkeypatch):
+    """Живой инцидент 20 августа целиком: комментарий висит на абзаце превью,
+    где стоит shift+enter, а правка нужна в СОСЕДНЕМ абзаце. До 0.15 таких
+    замен отказывали все до единой — 50 абзацев, правки в 30, обхода нет."""
+    docs = DocsStub(make_doc(["Alpha", PREVIEW, "Charlie"]),
+                    merged_doc=make_doc(["Zulu", PREVIEW, "Charlie"]))
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        _softbreak_export(docs, [("Alpha", None), (PREVIEW, "0"),
+                                 ("Charlie", None)],
+                          [("0", "A", CREATED_SEC)]))
+    monkeypatch.setattr(engine.time, "sleep", lambda s: None)
+    op = {"op": "replace_quote", "quote": "Alpha", "with": "Zulu"}
+    engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
+    main = next(b for b in docs.batches if any("replaceAllText" in r
+                                               for r in b))
+    assert main[-1]["replaceAllText"]["containsText"]["text"] == "Alpha"
+
+
+def test_patch_writes_a_soft_break_into_a_commented_paragraph(engine,
+                                                              monkeypatch):
+    """#40 через весь путь: перезапись прокомментированного фрагмента,
+    которая ДОБАВЛЯЕТ мягкий перенос. Раньше запрет управляющих символов
+    отправлял оператора ставить его руками через Docs API — мимо канарейки,
+    отпечатка и всех проверок, — и там он резал пробел внутри якоря."""
+    docs, drive = _covered_anchor_doc(engine, monkeypatch)
+    op = {"op": "replace_quote", "quote": "Bravo", "with": "Заголовок\vНиз"}
+    note = engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
+    assert note["applied_as"] == "rewritten"
+    main = next(b for b in docs.batches if any("replaceAllText" in r
+                                               for r in b))
+    assert main[1]["insertText"]["text"] == "Заголовок\vНиз"
+    assert main[2]["replaceAllText"]["replaceText"] == "Заголовок\vНиз"

@@ -170,24 +170,45 @@ def test_identical_paragraphs_inside_one_cell_fence_that_cell(engine,
     assert "2 identical copies" in str(mproblems[0])
 
 
-def test_a_soft_break_in_a_cell_fences_only_that_cell(engine, make_docx):
-    """The one shape that reaches «matches nothing in that cell»: a soft line
-    break, which the export writes as \\n and the API returns as \\v (#27).
+def test_a_soft_break_in_a_cell_is_placed_exactly(engine, make_docx):
+    """A soft line break used to make its paragraph match nothing (#27): the
+    export wrote every `w:br` as \\n, which no API paragraph can hold. In a
+    cell that cost the cell, in the body the whole document.
 
-    The cell is still PROVEN — the contents agree once that known mismatch is
-    normalized — so the anchor is confined to it instead of freezing the
-    document, which is what the same paragraph in the body still costs."""
+    Both sides spell it \\v now, so the anchor is PLACED — coordinates, not a
+    fence — and the cell around it stays editable."""
     body = ('<w:tbl><w:tr><w:tc><w:p>'
             '<w:commentRangeStart w:id="3"/><w:r><w:t>первая</w:t></w:r>'
             '<w:r><w:br/></w:r><w:r><w:t>вторая</w:t></w:r>'
             '<w:commentRangeEnd w:id="3"/></w:p></w:tc></w:tr></w:tbl>')
     spans, _p2, _c = engine._parse_docx_anchor_spans(make_docx(body))
-    assert spans[0]["para_text"] == "первая\nвторая"
+    assert spans[0]["para_text"] == "первая\vвторая"
+    ranges, mproblems, _amb = engine._map_anchors_to_doc(
+        _tab_with_one_cell("первая\vвторая"), spans)
+    assert mproblems == []
+    assert [(s, e) for s, e, _t, _i in ranges] == [(4, 17)]
+
+
+def test_a_break_kind_nobody_measured_still_fences_its_cell(engine, make_docx):
+    """A break the measurement never saw: `w:cr` is a line break by the WordML
+    spec, and Google wrote none in M20 (0 of 8). It is refused rather than
+    guessed — a guessed character would shift every offset after it.
+
+    The cell itself stops being provable, because the paragraph that cannot be
+    read is IN it, so the fence goes around every table and the body stays
+    editable. Narrower than that is not honest: the old code fenced the cell,
+    but only because normalizing `\\v` to `\\n` made the two sides agree — the
+    very agreement M20-4 showed to be unsafe."""
+    body = ('<w:tbl><w:tr><w:tc><w:p>'
+            '<w:commentRangeStart w:id="3"/><w:r><w:t>первая</w:t></w:r>'
+            '<w:r><w:cr/></w:r><w:r><w:t>вторая</w:t></w:r>'
+            '<w:commentRangeEnd w:id="3"/></w:p></w:tc></w:tr></w:tbl>')
+    spans, _p2, _c = engine._parse_docx_anchor_spans(make_docx(body))
     ranges, mproblems, _amb = engine._map_anchors_to_doc(
         _tab_with_one_cell("первая\vвторая"), spans)
     assert ranges == []
     assert len(mproblems) == 1
-    assert mproblems[0].ranges == ((3, 18),)  # the cell, not the table
+    assert mproblems[0].ranges == ((1, 20),)  # every table, body untouched
     assert mproblems[0].docx_id == "3"
 
 
@@ -831,7 +852,9 @@ def test_no_match_at_all_still_freezes_the_document(engine, make_docx):
     ranges, problems, ambiguous = engine._map_anchors_to_doc(
         _tab([["совсем другой"]]), spans)
     assert (ranges, ambiguous) == ([], [])
-    assert any("matched 0 times" in p for p in problems)
+    assert any("read differently" in p for p in problems)
+    # and it must not send the reader looking for ghosts (postmortem 20.08)
+    assert any("not a ghost" in p for p in problems)
 
 
 def test_single_match_maps_exactly_as_before(engine, make_docx):
@@ -1167,12 +1190,10 @@ def test_a_soft_break_does_not_hide_an_opaque_paragraph(engine, make_docx):
     a possible home for the anchor. Raised in review as the concrete path
     where matching known fragments could miss a real opaque end.
 
-    It cannot be a fail-open even without this: a readable twin would have to
-    match a text containing `\\n`, and no API paragraph ever does — `\\n` is
-    what ends a paragraph. So the document is refused either way and what the
-    normalization buys is the refusal saying the true reason instead of
-    «matched 0 times». Whoever fixes #27 has to re-read this."""
-    assert engine._pieces_fit(["До\vПосле"], "До\nПосле") is True
+    Since #27 both sides spell the break `\\v`, so the fragments are compared
+    as they come — and the check matters MORE than it did: back then such a
+    document was refused anyway, now the readable twin would be placed on."""
+    assert engine._pieces_fit(["До\vПосле"], "До\vПосле") is True
 
     body = ('<w:p><w:commentRangeStart w:id="5"/>'
             '<w:r><w:t>од</w:t><w:br/><w:t>ин</w:t></w:r></w:p>'
@@ -1180,7 +1201,7 @@ def test_a_soft_break_does_not_hide_an_opaque_paragraph(engine, make_docx):
             '<w:commentRangeEnd w:id="5"/></w:p>')
     spans, problems, _c = engine._parse_docx_anchor_spans(make_docx(body))
     assert problems == []
-    assert spans[0]["para_text"] == "од\nин"
+    assert spans[0]["para_text"] == "од\vин"
     # the only paragraph that could hold the anchor's start is unreadable, and
     # its readable half carries the soft break
     tab = _tab([["од\vин", {"person": {}}], ["два"]])
