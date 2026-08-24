@@ -4060,10 +4060,13 @@ def _find_protected_overlap(flat, protected):
                 # duplicate is not — its quote is not unique either). Advising
                 # both at once was how this refusal started contradicting
                 # itself (found in review).
+                # The label goes LAST: it carries the remedy, sometimes
+                # several sentences of it, and a protected-range aside
+                # wedged into the middle buried the part the person acts on.
                 return (
-                    f"a sync edit would rewrite text carrying {label} "
-                    f"(protected range [{ps}, {pe})) — that would destroy "
-                    f"it (C1). Leave that paragraph unchanged locally.")
+                    f"a sync edit would remove or rewrite protected text at "
+                    f"[{ps}, {pe}) — that would destroy it (C1). Nothing was "
+                    f"applied. Это {label}")
     return None
 
 
@@ -6258,7 +6261,7 @@ def list_suggestions(file_id, output=None):
 # sync: three-way merge of local markdown into a Google Doc (PLAN.md W4/W5)
 # ---------------------------------------------------------------------------
 
-SIDECAR_SCHEMA_VERSION = 2
+SIDECAR_SCHEMA_VERSION = 3
 SIDECAR_SUFFIX = config.SIDECAR_SUFFIX  # single source of truth (shared w/ forget)
 
 # Heading namedStyleType <-> markdown level
@@ -6322,6 +6325,46 @@ def _visible_run_styles(raw_runs):
     return [{"len": _utf16_len(c), "style": s} for c, s in raw_runs if c]
 
 
+def _para_state_fingerprint(el):
+    """Full-state fingerprint of a paragraph, blind to run FRAGMENTATION.
+
+    Remote-change detection has to see a collaborator's underline/colour/font
+    edit, so the whole paragraph state goes in. But Docs re-splits and
+    re-merges runs on its own initiative, with no styling change at all:
+    inserting and deleting the export canary at the END of the body is enough
+    to redraw the run boundaries of the last paragraph. Hashing the element
+    verbatim then reads that as somebody else's edit, and the NEXT sync of the
+    same document dies on a conflict nobody made — which is exactly the
+    situation a refused sync leaves behind, right when the refusal has just
+    told the person to fix the file and run it again (found in acceptance).
+
+    So adjacent runs that agree on style are merged before hashing: the same
+    look always hashes the same, and any real style change still lands.
+    """
+    para = el.get("paragraph") or {}
+    runs, others = [], []
+    for e in para.get("elements", []) or []:
+        tr = e.get("textRun")
+        if tr is None:
+            others.append(_strip_indices(e))
+            continue
+        if not tr.get("content"):
+            # a zero-length run carries no look and no text; leaving it in
+            # would make A|""|B hash differently from AB (codex code-r2 #1)
+            continue
+        style = json.dumps(tr.get("textStyle") or {}, sort_keys=True)
+        if runs and runs[-1][1] == style:
+            runs[-1][0] += tr.get("content", "")
+        else:
+            runs.append([tr.get("content", ""), style])
+    return _sha256_str(json.dumps({
+        "paragraphStyle": para.get("paragraphStyle") or {},
+        "bullet": para.get("bullet") or {},
+        "runs": runs,
+        "other": others,
+    }, sort_keys=True))
+
+
 def _doc_elements(doc_tab):
     """Extract the comparable element sequence from a documentTab.
 
@@ -6371,11 +6414,12 @@ def _doc_elements(doc_tab):
                 continue
             out.append({"type": _para_kind(para), "text": text,
                         "sig": _marks_signature(spans),
-                        # full-state fingerprint: the ENTIRE paragraph element
-                        # (all textStyle fields, paragraphStyle, bullet) with
-                        # indices stripped — remote-change detection must see
-                        # underline/color/font edits too (codex sync-r2 #2)
-                        "doc_fp": _opaque_hash(el),
+                        # full-state fingerprint: all textStyle fields,
+                        # paragraphStyle and bullet — remote-change detection
+                        # must see underline/color/font edits too (codex
+                        # sync-r2 #2) — but blind to run fragmentation, which
+                        # Docs redraws on its own (see _para_state_fingerprint)
+                        "doc_fp": _para_state_fingerprint(el),
                         # raw styles for preservation across rewrites; NOT
                         # persisted to the sidecar (live-doc-only data).
                         # The paragraph mark is never rewritten, so the
@@ -6700,10 +6744,18 @@ def _export_html_snapshot(drive_service, docs_service, file_id):
     """
     for _ in range(3):
         r1 = docs_service.documents().get(
-            documentId=file_id, fields="revisionId").execute()["revisionId"]
+            documentId=file_id, fields="revisionId").execute().get("revisionId")
         data = drive_service.files().export(
             fileId=file_id, mimeType="text/html").execute()
         doc = _safe_get_doc(docs_service, file_id)
+        if r1 is None:
+            # Google omits revisionId entirely for a doc the account cannot
+            # edit (measured M21: canEdit=False => no field at all). Reading
+            # such a doc is the most harmless thing a person can ask for, so
+            # the export proceeds unproven; the sidecar records that there is
+            # no merge base, and every write path already fails closed on a
+            # missing revision (_write_control).
+            return data, doc
         if doc.get("revisionId") == r1:
             return data, doc
     raise RuntimeError("doc is being edited concurrently (export snapshot "
@@ -6747,6 +6799,18 @@ def _sidecar_payload(file_id, md_output_path, md_text, doc):
     if len(tabs) > 1:
         payload["sync_supported"] = False
         payload["reason"] = "multi-tab document (sync v1 is single-tab only)"
+        return payload
+    if doc.get("revisionId") is None:
+        # No revision means no provable merge base — and no write either:
+        # Google withholds the field on docs the account cannot edit. The
+        # markdown is still handed over; only sync is closed, and it says why
+        # instead of dying on a missing revision at write time.
+        payload["sync_supported"] = False
+        payload["reason"] = (
+            "Google did not return a revision id for this doc — that happens "
+            "when the account has no edit right on it (view/comment access). "
+            "The markdown is fine to read and edit locally; syncing it back "
+            "needs edit access")
         return payload
 
     doc_els = _doc_elements(tabs[0][2])
@@ -6909,6 +6973,55 @@ def _capture_preserve(rel, with_text):
         return preserve, False
     preserve["text_style"] = {}
     return preserve, True
+
+
+def _pair_moved_blocks(deleted, inserted, base_els, local_els):
+    """Pair a delete with an insert of the SAME paragraph — a reorder.
+
+    difflib has no notion of a move: every reordering arrives as a delete at
+    the old place and an insert at the new one, both carrying an identical
+    key (measured M21). Pairing them is what lets a moved block keep its own
+    styling instead of arriving as a fresh markdown block.
+
+    Returns {(type, normalized text): base_index}.
+
+    The pair must also agree in UTF-16 LENGTH, because the captured runs are
+    reapplied by length at the new address. Today that follows from the key
+    alone (_norm_ws only swaps NBSP for space, and both are one unit), which
+    is exactly why the check is written down: the day _norm_ws starts folding
+    anything wider, run boundaries would silently land off by a character.
+
+    A key occurring more than once on either side is never a move — which of
+    the twins carries the thread is not provable. Twins are counted over the
+    WHOLE sequences, not just the changed zone: a paragraph whose twin sits
+    quietly in an untouched part of the document is still a paragraph nobody
+    can tell apart. `_dup_guard` already refuses such a sync upstream; this is
+    the second line of the same fence, kept because a fence must not depend on
+    another check staying as it is.
+    """
+    from collections import Counter
+
+    def key_of(el, opaque):
+        return (None if el["type"] == opaque
+                else (el["type"], _norm_ws(el["text"])))
+
+    d_keys = [key_of(base_els[i], "opaque") for i in deleted]
+    i_keys = [key_of(lel, "opaque-md") for _g, lel in inserted]
+    d_count = Counter(k for k in (key_of(e, "opaque") for e in base_els)
+                      if k is not None)
+    i_count = Counter(k for k in (key_of(e, "opaque-md") for e in local_els)
+                      if k is not None)
+    widths = {}
+    for k, (_g, lel) in zip(i_keys, inserted):
+        if k is not None:
+            widths[k] = _utf16_len(lel["text"])
+    return {k: i for k, i in zip(d_keys, deleted)
+            # unique in BOTH whole sequences, and actually inserted (a key
+            # counted once in local may well be an untouched paragraph —
+            # `k in widths` is what says the plan really inserts this one)
+            if k is not None and d_count[k] == 1 and i_count.get(k) == 1
+            and k in widths
+            and widths[k] == _utf16_len(base_els[i]["text"])}
 
 
 # inserted blocks: nothing to preserve, but the full-mask clear must still
@@ -7142,7 +7255,8 @@ def sync_doc(file_id, md_path, tab_id=None):
         base = json.load(f)
     # identity validation (codex sync-r1 #10)
     for field in ("schema_version", "doc_id", "revision_id", "tab_count",
-                  "elements", "md_path", "md_sha256"):  # schema v2 adds doc_fp
+                  "elements", "md_path", "md_sha256"):  # v2 added doc_fp, v3
+                  # changed how it is computed
         if field not in base:
             _error(f"sidecar is missing field {field!r} — re-download the doc")
     if base["schema_version"] != SIDECAR_SCHEMA_VERSION:
@@ -7395,13 +7509,33 @@ def sync_doc(file_id, md_path, tab_id=None):
 
     # --- expected merged sequence + style slots (codex sync-r1 #2) ---
     expected, style_slots, styles_dropped = [], [], []
+    moved_src = _pair_moved_blocks(deleted, inserted, base_els, local_els)
 
     def _entry_para(text):
         return ("para", _norm_ws(text))
 
+    def _insert_preserve(lel):
+        """Style data for a block being inserted.
+
+        A MOVED block is a style-only change at a new address: its text is
+        byte-identical to the old paragraph's, so the captured runs tile the
+        new one exactly and every preserved field lands where it was. The
+        rewrite branch would not do — it keeps inline styling only when the
+        whole paragraph agrees on it, so a single coloured word (the ordinary
+        case, and the one M21 measured) would still be lost.
+        """
+        if lel["type"] == "opaque-md":
+            return _FRESH_BLOCK_PRESERVE
+        src = moved_src.get((lel["type"], _norm_ws(lel["text"])))
+        if src is None or src not in r_map:
+            return _FRESH_BLOCK_PRESERVE
+        preserve, _dropped = _capture_preserve(remote_els[r_map[src]],
+                                               with_text=False)
+        return preserve
+
     for j, rel in enumerate(remote_els):
         for lel in insert_before.get(j, []):
-            style_slots.append((len(expected), lel, _FRESH_BLOCK_PRESERVE))
+            style_slots.append((len(expected), lel, _insert_preserve(lel)))
             expected.append(_entry_para(lel["text"]))
         a = action.get(j)
         if a and a[0] == "delete":
@@ -7429,7 +7563,7 @@ def sync_doc(file_id, md_path, tab_id=None):
                 style_slots.append((len(expected), so_remote[j], preserve))
             expected.append(_entry_para(rel["text"]))
     for lel in end_inserts:
-        style_slots.append((len(expected), lel, _FRESH_BLOCK_PRESERVE))
+        style_slots.append((len(expected), lel, _insert_preserve(lel)))
         expected.append(_entry_para(lel["text"]))
 
     # --- text requests ---
@@ -7474,7 +7608,20 @@ def sync_doc(file_id, md_path, tab_id=None):
             {"insertText": {"location": {"index": pos}, "text": joined}},
         ]))
     if end_inserts:
-        joined = "\n" + "".join(lel["text"] + "\n" for lel in end_inserts)[:-1]
+        # The doc's last paragraph is terminated by the newline at
+        # body_end - 1, so a leading newline is what starts a fresh paragraph
+        # after it — right when that paragraph holds text, wrong when the doc
+        # already ends with an EMPTY one (anyone who pressed Enter at the
+        # end). Then the extra newline strands that empty paragraph between
+        # the old tail and the appended block: a blank line the person never
+        # typed, and a fresh one on every sync that appends (measured M21).
+        tail_para = (body_content[-1].get("paragraph") or {}) if body_content \
+            else {}
+        tail_empty = "".join(
+            (e.get("textRun") or {}).get("content", "")
+            for e in tail_para.get("elements", []) or []) == "\n"
+        joined = ("" if tail_empty else "\n") + \
+            "".join(lel["text"] + "\n" for lel in end_inserts)[:-1]
         text_requests.append((body_end - 1, [
             {"insertText": {"location": {"index": body_end - 1},
                             "text": joined}},
@@ -7482,17 +7629,26 @@ def sync_doc(file_id, md_path, tab_id=None):
 
     # --- journal skeleton (codex sync-r1 #8) ---
     revision_id = doc.get("revisionId")
+    moved_dst = set(moved_src.values())
     journal = {
         "doc_id": file_id,
         "revision_before": revision_id,
         "plan": {
             "replaced": [{"base_index": i, "text": lel["text"][:80]}
                          for i, lel in replaced],
+            # moved blocks are listed once, under "moved" — leaving them in
+            # here as well is how the report used to read a single reorder
+            # as three separate events
             "deleted": [{"base_index": i,
                          "text": (base_els[i].get("text") or "")[:80]}
-                        for i in deleted],
+                        for i in deleted if i not in moved_dst],
             "inserted": [{"gap": g, "text": lel["text"][:80]}
-                         for g, lel in inserted],
+                         for g, lel in inserted
+                         if (lel["type"], _norm_ws(lel["text"]))
+                         not in moved_src],
+            "moved": [{"base_index": i, "type": kind, "text": text[:80]}
+                      for (kind, text), i in sorted(moved_src.items(),
+                                                    key=lambda kv: kv[1])],
             "style_only": [{"base_index": i} for i, _ in style_only],
         },
         "phases": [],
@@ -7532,12 +7688,46 @@ def sync_doc(file_id, md_path, tab_id=None):
     # --- protected-interval check on the FINAL request list ---
     protected = list(named_intervals)
     if snap is not None:
-        protected += [
-            (as_, ae,
-             f"the anchor of a live comment (docx id {aid}, «{atext[:40]}») "
-             f"— точечную правку такого абзаца делает `patch`, он сохраняет "
-             f"тред; либо правьте его в интерфейсе Google Docs")
-            for as_, ae, atext, aid in snap["anchors"]]
+        # A move and a rewrite need DIFFERENT advice. `patch` rewrites a
+        # commented paragraph in place and keeps the thread, so it is the
+        # right answer for an edit — and the wrong one for a reorder: it has
+        # no move operation, and the person did not change the paragraph, they
+        # dragged it somewhere else. Naming the ranges the plan moves is what
+        # lets the refusal tell the two apart (M21).
+        moved_ranges = [(remote_els[r_map[i]]["start"],
+                         remote_els[r_map[i]]["end"])
+                        for i in moved_src.values() if i in r_map]
+
+        def _anchor_note(as_, ae, atext, aid):
+            head = (f"the anchor of a live comment (docx id {aid}, "
+                    f"«{atext[:40]}»)")
+            if any(as_ < me and ms < ae for ms, me in moved_ranges) and not \
+                    any(ms <= as_ and ae <= me for ms, me in moved_ranges):
+                # a selection dragged across a paragraph break (#45), only
+                # part of which moves: `patch` is no more able to help here
+                # than it is with a whole moved block, so the advice must not
+                # promise it
+                return (
+                    f"{head} — это выделение захватывает несколько абзацев, и "
+                    f"часть из них в файле переставлена. Переезд рвёт "
+                    f"привязку треда, а собрать её заново программа не может. "
+                    f"Верните переставленные абзацы на прежние места в файле — "
+                    f"остальные правки пройдут")
+            if any(ms <= as_ and ae <= me for ms, me in moved_ranges):
+                return (
+                    f"{head} — этот абзац в файле не переписан, а переставлен. "
+                    f"Переезд в Google Docs выполняется только удалением на "
+                    f"старом месте и вставкой на новом, удаление уносит "
+                    f"привязку треда, а заново привязать комментарий к тексту "
+                    f"программа не может. Верните этот блок на прежнее место в "
+                    f"файле — остальные правки пройдут, — а саму перестановку "
+                    f"сделайте руками в документе")
+            return (f"{head} — точечную правку такого абзаца делает `patch`, "
+                    f"он сохраняет тред; либо правьте его в интерфейсе "
+                    f"Google Docs")
+
+        protected += [(as_, ae, _anchor_note(as_, ae, atext, aid))
+                      for as_, ae, atext, aid in snap["anchors"]]
         # anchors the accounting could not vouch for but could still place —
         # they narrow the refusal to the paragraphs they sit in (issue #10)
         protected += snap["blocked"]
@@ -7776,7 +7966,18 @@ def sync_doc(file_id, md_path, tab_id=None):
                           "writeControl": _write_control(rev2)},
                 ).execute()
             except Exception as e:
-                _fail_partial(f"style batch failed: {e}")
+                # the text batch already landed: the document is reordered
+                # and rewritten, only the look is missing. Saying «nothing
+                # was applied» here would be a lie, and a moved block whose
+                # styling never arrived looks exactly like a block that
+                # silently lost it — name the boundary (codex code-r2 #2).
+                _fail_partial(
+                    f"style batch failed: {e} — ТЕКСТ УЖЕ ПРИМЕНЁН "
+                    f"(переехало блоков: {len(moved_src)}, изменено: "
+                    f"{len(replaced)}), а оформление к нему не применилось: "
+                    f"переехавшие блоки могли остаться без цвета, подсветки и "
+                    f"кегля. Документ цел, скачайте его заново и сверьте "
+                    f"оформление изменённых мест")
             journal["phases"].append({"phase": "style-batch",
                                       "status": "ok", "blocks": styled})
 
@@ -7840,8 +8041,11 @@ def sync_doc(file_id, md_path, tab_id=None):
         "action": "synced",
         "doc_id": file_id,
         "replaced": len(replaced),
-        "inserted": len(inserted),
-        "deleted": len(deleted),
+        # a moved block is one event, not a delete plus an insert — counting
+        # it three times is how the old report read
+        "moved": len(moved_src),
+        "inserted": len(inserted) - len(moved_src),
+        "deleted": len(deleted) - len(moved_src),
         "style_only": len(style_only),
         "styled_blocks": styled,
         "comments_on_doc": len(all_comments),
