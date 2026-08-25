@@ -27,6 +27,7 @@ Setup:
 Comments & edits:
   comments     List comments on a doc
   reply        Post a reply to a comment
+  unreply      Delete one ordinary reply posted by this account
   resolve      Resolve a comment thread (the person's decision, not an agent's)
   comment      Create a document-level comment
   patch        Apply anchor-safe text edits (keeps comment threads alive —
