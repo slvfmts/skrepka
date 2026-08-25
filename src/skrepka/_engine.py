@@ -350,9 +350,9 @@ def _scan_suggestions(node):
 _COMMENT_FIELDS = (
     # `content` on replies costs nothing extra here and is what makes the
     # archive of a closed thread a real record of the conversation (r8).
-    "nextPageToken,comments(id,content,author/displayName,createdTime,"
+    "nextPageToken,comments(id,content,author/displayName,author/me,createdTime,"
     "quotedFileContent,resolved,deleted,anchor,"
-    "replies(id,content,createdTime,author/displayName,deleted,action))"
+    "replies(id,content,createdTime,author/displayName,author/me,deleted,action))"
 )
 
 
@@ -1282,45 +1282,358 @@ def upload_md(file_path, folder_id=None, title=None, no_highlights=False):
     }))
 
 
+def _comment_tab_catalog(doc):
+    """Flatten root/child tabs and name any identity defect honestly."""
+    tabs = _collect_tabs(doc)
+    if not doc.get("tabs"):
+        # A legacy-shaped response has a body but no stable tab identity.
+        # Its text remains useful as a candidate, never as exact attribution.
+        return tabs, "tab_ids_not_returned"
+    tab_ids = [tab_id for tab_id, _title, _doc_tab in tabs]
+    if any(not tab_id for tab_id in tab_ids):
+        return tabs, "missing_tab_id"
+    if len(set(tab_ids)) != len(tab_ids):
+        return tabs, "duplicate_tab_id"
+    return tabs, None
+
+
+def _docs_snapshot_fingerprint(doc):
+    """Canonical fallback identity for view-only Docs reads without revision."""
+    return _sha256_str(json.dumps(
+        doc, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+
+
+def _read_comment_evidence(drive_service, docs_service, file_id,
+                           initial_comments):
+    """Read a bounded, stable comments/Docs/export snapshot for ``comments``.
+
+    Drive comments and the Docs resource are separate APIs, and DOCX export is
+    a third read.  A single pass can therefore combine states that never
+    coexisted.  Bracket the export with both a complete paginated comment
+    census and a Docs revision, retrying the whole bracket once.  Evidence is
+    usable only when both boundaries agree.  The helper performs reads only.
+    """
+    before_comments = initial_comments
+    last_problem = "snapshot_changed_during_read"
+    for attempt in range(2):
+        try:
+            doc_before = _safe_get_doc(docs_service, file_id)
+        except Exception as e:
+            _warn(f"tab attribution unavailable: {getattr(e, 'reason', e)}")
+            return (before_comments, None, None,
+                    "document_tabs_unavailable", [], None)
+
+        records, export_problem = [], None
+        try:
+            docx_bytes = drive_service.files().export(
+                fileId=file_id,
+                mimeType="application/vnd.openxmlformats-officedocument"
+                         ".wordprocessingml.document",
+            ).execute()
+            records, record_problems = _docx_comment_records(docx_bytes)
+            if record_problems:
+                export_problem = "export_comments_unreadable"
+                _warn("anchor export status unavailable: "
+                      f"{record_problems[0]}")
+            elif any(
+                    not isinstance(record.get("author"), str)
+                    or not record["author"].strip()
+                    or _rfc3339_epoch(record.get("date_sec")) is None
+                    for record in records):
+                # An opaque record can be the missing target.  Ignoring it
+                # would let another, later record turn uncertainty into a
+                # false absence/ghost verdict.
+                export_problem = "export_comment_identity_unreadable"
+                _warn("anchor export status unavailable: a comments.xml "
+                      "entry has no readable author/date identity")
+        except Exception as e:
+            export_problem = "document_export_unavailable"
+            _warn("anchor export status unavailable: "
+                  f"{getattr(e, 'reason', e)}")
+
+        try:
+            after_comments = _list_comments_raw(drive_service, file_id)
+        except Exception as e:
+            _warn("comment snapshot verification unavailable: "
+                  f"{getattr(e, 'reason', e)}")
+            return (before_comments, None, None,
+                    "comment_snapshot_unavailable", records,
+                    "comment_snapshot_unavailable")
+        try:
+            doc_after = _safe_get_doc(docs_service, file_id)
+        except Exception as e:
+            _warn(f"tab attribution unavailable: {getattr(e, 'reason', e)}")
+            return (after_comments, None, None,
+                    "document_tabs_unavailable", records,
+                    "document_tabs_unavailable")
+
+        before_revision = doc_before.get("revisionId")
+        after_revision = doc_after.get("revisionId")
+        comments_stable = (
+            _fingerprint_from_census(before_comments)
+            == _fingerprint_from_census(after_comments))
+        if before_revision and after_revision:
+            document_stable = before_revision == after_revision
+            revision_shape_problem = False
+        elif not before_revision and not after_revision:
+            # View-only Docs responses commonly omit revisionId.  Comparing
+            # the complete canonical resource still detects every body/tab
+            # change relevant to both #37 and #44 without inventing a
+            # revision or regressing all view-only reads to unknown.
+            document_stable = (
+                _docs_snapshot_fingerprint(doc_before)
+                == _docs_snapshot_fingerprint(doc_after))
+            revision_shape_problem = False
+        else:
+            document_stable = False
+            revision_shape_problem = True
+        if comments_stable and document_stable:
+            tabs, catalog_problem = _comment_tab_catalog(doc_after)
+            return (after_comments, tabs, catalog_problem, None, records,
+                    export_problem)
+
+        last_problem = (
+            "document_revision_unavailable" if revision_shape_problem
+            else "snapshot_changed_during_read")
+        before_comments = after_comments
+        if attempt == 0:
+            continue
+
+    _warn("comment attribution unavailable: the comments/Docs snapshot "
+          "did not stay stable during two read attempts")
+    return (before_comments, None, None, last_problem, records, last_problem)
+
+
+def _comment_tab_attribution(comment, tabs=None, catalog_problem=None,
+                             read_problem=None):
+    """Return display-only tab evidence for one Drive comment.
+
+    Drive does not expose a tab id on a comment (M19).  ``quotedFileContent``
+    is a stale snapshot and cannot prove the current anchor position, but it
+    can still support one deliberately narrow read-only statement: its exact
+    text occurs in the body of exactly one tab in this Docs snapshot.  This
+    helper never upgrades that hint into write authorization; reply/resolve
+    keep using the DOCX marker proof in ``_reply_tab_preflight``.
+    """
+    quote = (comment.get("quotedFileContent") or {}).get("value") or ""
+    if not quote:
+        if comment.get("anchor"):
+            return {
+                "tab_id": None,
+                "tab_title": None,
+                "tab_attribution": {
+                    "status": "unknown",
+                    "candidates": [],
+                    "reason": "anchor_without_quote",
+                },
+            }
+        return {
+            "tab_id": None,
+            "tab_title": None,
+            "tab_attribution": {
+                "status": "document",
+                "candidates": [],
+                "reason": "unanchored_document_comment",
+            },
+        }
+
+    if read_problem:
+        return {
+            "tab_id": None,
+            "tab_title": None,
+            "tab_attribution": {
+                "status": "unknown",
+                "candidates": [],
+                "reason": read_problem,
+            },
+        }
+
+    candidates = []
+    for tab_id, title, doc_tab in tabs or []:
+        occurrences = _count_quote_occurrences(doc_tab, quote)
+        if occurrences:
+            candidates.append({
+                "tab_id": tab_id,
+                "tab_title": title or None,
+                "quote_occurrences": occurrences,
+            })
+
+    # A malformed/partial tab catalogue invalidates even a unique-looking
+    # match.  In particular, a missing sibling id must not make the one tab
+    # which happened to have an id look authoritative.
+    if catalog_problem:
+        reason = catalog_problem
+    elif len(candidates) > 1:
+        reason = "quote_matches_multiple_tabs"
+    elif not candidates:
+        reason = "quote_not_found_in_tabs"
+    else:
+        candidate = candidates[0]
+        return {
+            "tab_id": candidate["tab_id"],
+            "tab_title": candidate["tab_title"],
+            "tab_attribution": {
+                "status": "exact",
+                "candidates": candidates,
+                "reason": "quote_matches_exactly_one_tab",
+            },
+        }
+
+    return {
+        "tab_id": None,
+        "tab_title": None,
+        "tab_attribution": {
+            "status": "unknown",
+            "candidates": candidates,
+            "reason": reason,
+        },
+    }
+
+
+def _comment_anchor_export_status(comment, *, records, universe, tabs,
+                                  file_id=None, export_problem=None,
+                                  read_problem=None):
+    """Describe read-only export evidence without claiming live freshness.
+
+    A plain Drive export has no canary and may be stale.  A matching record
+    therefore means only ``record_present`` in THAT export, never "the anchor
+    is live now".  Absence becomes ``ghost`` only under the stricter #34
+    witness: the thread has a unique author/time identity, the export contains
+    a later record, and the stale quote is absent from every current Docs tab.
+    Every inconclusive shape stays ``unknown``.
+    """
+    base = {"export_freshness": "unproven"}
+    if not (comment.get("quotedFileContent") or comment.get("anchor")):
+        return {**base, "status": "not_applicable",
+                "reason": "document_level_comment"}
+    if comment.get("resolved"):
+        # Resolved threads are deliberately omitted from DOCX exports (C11c).
+        return {**base, "status": "not_applicable",
+                "reason": "resolved_threads_omitted_from_export"}
+    if export_problem:
+        return {**base, "status": "unknown", "reason": export_problem}
+
+    cid = comment.get("id")
+    keys = set()
+    for entry in [comment] + [
+            r for r in (comment.get("replies") or [])
+            if not r.get("deleted")]:
+        author = (entry.get("author") or {}).get("displayName")
+        created = entry.get("createdTime")
+        if author and created:
+            keys.add((author, _trunc_seconds(created)))
+    witnesses = {key for key in keys if universe.get(key) == {cid}}
+    if not witnesses:
+        return {**base, "status": "unknown",
+                "reason": ("shared_or_missing_export_identity")}
+
+    present = [
+        record for record in records
+        if (record.get("author"), record.get("date_sec")) in witnesses
+    ]
+    if present:
+        return {**base, "status": "record_present",
+                "reason": "unique_thread_record_found_in_export",
+                "record_count": len(present)}
+    if any((record.get("author"), record.get("date_sec")) in keys
+           for record in records):
+        # A shared key may be this thread's reply. It cannot prove presence,
+        # but it is enough to make declaring the thread absent unsafe.
+        return {**base, "status": "unknown",
+                "reason": "ambiguous_record_may_belong_to_thread"}
+
+    quote = (comment.get("quotedFileContent") or {}).get("value") or ""
+    if not quote:
+        return {**base, "status": "unknown",
+                "reason": "anchor_without_quote_missing_from_export"}
+    if read_problem or not tabs:
+        return {**base, "status": "unknown",
+                "reason": read_problem or "document_tabs_unavailable"}
+    if any(_replace_all_match_count(doc_tab, quote)
+           for _tab_id, _title, doc_tab in tabs):
+        return {**base, "status": "unknown",
+                "reason": "record_missing_but_quote_still_present"}
+
+    # A whole but stale export can legitimately omit a thread while it is
+    # resolved.  Seeing a record newer than the PARENT's creation is not
+    # enough after the thread has since been reopened: that record may still
+    # belong to the resolved interval.  Require evidence newer than every
+    # current entry, including the resolve/reopen action replies.  Ordinary
+    # replies are included too; the extra false-negative is the honest price
+    # of not knowing which cached comment-store snapshot Drive exported.
+    activity = []
+    for entry in [comment] + [
+            reply for reply in (comment.get("replies") or [])
+            if not reply.get("deleted")]:
+        stamp = _rfc3339_epoch(entry.get("createdTime"))
+        if stamp is None:
+            return {**base, "status": "unknown",
+                    "reason": "thread_activity_time_unreadable"}
+        activity.append(stamp)
+    if not activity:
+        return {**base, "status": "unknown",
+                "reason": "thread_activity_time_unreadable"}
+
+    doc_tabs = [doc_tab for _tab_id, _title, doc_tab in tabs]
+    verdict = _ghost_verdict(
+        comment, records, doc_tabs[0], file_id=file_id,
+        other_tabs=doc_tabs[1:], freshness_floor=max(activity))
+    if verdict is not None and not verdict.get("fenced"):
+        return {**base, "status": "ghost",
+                "reason": ("record_missing_after_newer_export_record_and_"
+                           "quote_absent_from_document")}
+    return {**base, "status": "unknown",
+            "reason": "record_missing_export_freshness_unproven"}
+
+
 def list_comments(file_id, output=None):
-    """List comments on a Google Doc."""
+    """List comments and attach conservative, read-only tab attribution."""
     try:
         creds = get_creds()
         drive_service = get_drive_service(creds)
     except Exception as e:
         _error(f"auth failed: {e}")
 
-    comments = []
-    page_token = None
     try:
-        while True:
-            results = drive_service.comments().list(
-                fileId=file_id,
-                # createdTime and reply ids are not decoration: when the anchor
-                # accounting refuses on colliding keys it names threads by the
-                # second they were created in, and without these fields there
-                # is nowhere for a person to look that up (#16). Reply ids are
-                # what makes the surplus reply deletable (#18).
-                # author/me says whether the entry is the authorized account's
-                # own. Without it «ответь только на мои комментарии» is not
-                # expressible: the agent has to guess by display name, and a
-                # wrong guess means talking to the customer in their document
-                # instead of to the person who asked (живой случай 2026-08-09).
-                fields="nextPageToken,comments(id,content,"
-                       "author/displayName,author/me,"
-                       "createdTime,quotedFileContent,resolved,"
-                       "replies(id,content,author/displayName,author/me,"
-                       "createdTime))",
-                includeDeleted=False,
-                pageSize=100,
-                pageToken=page_token,
-            ).execute()
-            comments.extend(results.get("comments", []))
-            page_token = results.get("nextPageToken")
-            if not page_token:
-                break
+        raw_comments = _list_comments_raw(drive_service, file_id)
     except HttpError as e:
         _error(f"failed to fetch comments: {e.reason if hasattr(e, 'reason') else e}")
+
+    tabs, catalog_problem, read_problem = None, None, None
+    records, export_problem = [], None
+    if any(c.get("quotedFileContent") or c.get("anchor")
+           for c in raw_comments if not c.get("deleted")):
+        try:
+            docs_service = get_docs_service(creds)
+            (raw_comments, tabs, catalog_problem, read_problem, records,
+             export_problem) = _read_comment_evidence(
+                 drive_service, docs_service, file_id, raw_comments)
+        except Exception as e:
+            # Service construction can fail before the bounded reader gets a
+            # chance to turn the failure into per-thread uncertainty.
+            read_problem = "document_tabs_unavailable"
+            _warn(f"tab attribution unavailable: {getattr(e, 'reason', e)}")
+
+    universe = _key_owners_universe(raw_comments)
+    # Deleted entries are needed only to keep export identity collisions
+    # honest. Preserve the public `comments` view: no deleted threads/replies.
+    comments = []
+    for raw in raw_comments:
+        if raw.get("deleted"):
+            continue
+        comment = copy.deepcopy(raw)
+        comment["replies"] = [
+            reply for reply in (comment.get("replies") or [])
+            if not reply.get("deleted")
+        ]
+        comment.pop("deleted", None)
+        for reply in comment["replies"]:
+            # Accounting-only fields were not part of the public `comments`
+            # payload before this command started requesting deleted entries.
+            reply.pop("deleted", None)
+            # `action` is kept internally until anchor classification: a
+            # resolve/reopen entry is part of the export freshness floor.
+        comments.append(comment)
 
     # Drive omits a boolean holding its default value, so `resolved` is
     # present on one listing and gone from the next — measured live 2026-08-09,
@@ -1348,6 +1661,32 @@ def list_comments(file_id, output=None):
         if link:
             c["link"] = link
 
+    attribution_counts = {"exact": 0, "unknown": 0, "document": 0}
+    anchor_counts = {"record_present": 0, "ghost": 0, "unknown": 0,
+                     "not_applicable": 0}
+    for c in comments:
+        attribution = _comment_tab_attribution(
+            c, tabs=tabs, catalog_problem=catalog_problem,
+            read_problem=read_problem)
+        c.update(attribution)
+        attribution_counts[attribution["tab_attribution"]["status"]] += 1
+        anchor_export = _comment_anchor_export_status(
+            c, records=records, universe=universe, tabs=tabs,
+            file_id=file_id, export_problem=export_problem,
+            read_problem=read_problem)
+        c["anchor_export"] = anchor_export
+        anchor_counts[anchor_export["status"]] += 1
+        for reply in c.get("replies") or []:
+            # The Drive action is needed only for the internal freshness
+            # floor.  Keep the historical public comments schema unchanged.
+            reply.pop("action", None)
+        # Same rule for the raw Drive `anchor`: it is requested so that a
+        # thread with no quote can be classified as document-level, and it is
+        # an opaque `kix.…` blob that skrepka cannot decode into coordinates.
+        # Emitting it would turn an internal discriminator into a public field
+        # somebody starts parsing (codex P2).
+        c.pop("anchor", None)
+
     summary = {"comments": len(comments),
                "unresolved": sum(1 for c in comments
                                  if not c.get("resolved")),
@@ -1355,7 +1694,13 @@ def list_comments(file_id, output=None):
                # checked against a number, not against a display name the
                # agent had to guess
                "mine": sum(1 for c in comments
-                           if (c.get("author") or {}).get("me"))}
+                           if (c.get("author") or {}).get("me")),
+               "tab_exact": attribution_counts["exact"],
+               "tab_unknown": attribution_counts["unknown"],
+               "document_level": attribution_counts["document"],
+               "anchor_record_present": anchor_counts["record_present"],
+               "anchor_ghost": anchor_counts["ghost"],
+               "anchor_unknown": anchor_counts["unknown"]}
     if unspecified:
         summary["authorship_unspecified"] = unspecified
     _emit_json(comments, output=output, summary=summary)
@@ -3303,7 +3648,8 @@ def _rfc3339_epoch(ts):
     return parsed.timestamp()
 
 
-def _ghost_verdict(c, records, doc_tab, file_id=None, other_tabs=()):
+def _ghost_verdict(c, records, doc_tab, file_id=None, other_tabs=(),
+                   freshness_floor=None):
     """Is this witness-less thread provably a ghost? None when it is not.
 
     A thread the API calls live whose records are absent from the export is
@@ -3341,7 +3687,8 @@ def _ghost_verdict(c, records, doc_tab, file_id=None, other_tabs=()):
     """
     if doc_tab is None:
         return None  # nothing to check sign 2 against — fail closed
-    created = _rfc3339_epoch(c.get("createdTime"))
+    created = (freshness_floor if freshness_floor is not None
+               else _rfc3339_epoch(c.get("createdTime")))
     if created is None:
         return None
     later = []
@@ -6187,6 +6534,61 @@ def _extract_full_text_inner(content):
     return "".join(parts)
 
 
+def _suggestion_tabs_by_id(doc, view_name):
+    """Return ordered tabs plus an id map, refusing ambiguous responses."""
+    tabs = _collect_tabs(doc)
+    seen = {}
+    real_tabs = bool(doc.get("tabs"))
+    for tab_id, title, doc_tab in tabs:
+        if real_tabs and tab_id is None:
+            _error(
+                f"suggestion {view_name} view returned a tab without a tab "
+                f"ID — retry; the document may be changing")
+        if tab_id in seen:
+            _error(
+                f"suggestion {view_name} view returned duplicate tab ID "
+                f"{tab_id!r} — retry; nothing was inferred")
+        seen[tab_id] = (title, doc_tab)
+    return tabs, seen
+
+
+def _suggestion_tab_diff(original_text, accepted_text, tab_id, title,
+                         legacy=False):
+    """Build one tab's unified and structured suggestion diff."""
+    if original_text == accepted_text:
+        return [], ""
+    if legacy:
+        fromfile, tofile = "original", "with_suggestions"
+    else:
+        label = f"tab {tab_id} {title}".rstrip()
+        fromfile, tofile = f"original — {label}", f"accepted — {label}"
+    diff_lines = list(difflib.unified_diff(
+        original_text.splitlines(keepends=True),
+        accepted_text.splitlines(keepends=True),
+        fromfile=fromfile, tofile=tofile, n=2))
+    changes = []
+    current = None
+    for line in diff_lines:
+        if line.startswith("@@"):
+            if current:
+                changes.append(current)
+            current = {
+                "tab_id": tab_id,
+                "tab_title": title,
+                "deleted": [],
+                "inserted": [],
+                "context": line.strip(),
+            }
+        elif current is not None:
+            if line.startswith("-") and not line.startswith("---"):
+                current["deleted"].append(line[1:].rstrip("\n"))
+            elif line.startswith("+") and not line.startswith("+++"):
+                current["inserted"].append(line[1:].rstrip("\n"))
+    if current:
+        changes.append(current)
+    return changes, "".join(diff_lines)
+
+
 def list_suggestions(file_id, output=None):
     """Compare original vs accepted suggestions, output as structured diff."""
     file_id = _extract_doc_id(file_id)
@@ -6200,61 +6602,75 @@ def list_suggestions(file_id, output=None):
     try:
         doc_original = docs_service.documents().get(
             documentId=file_id,
-            suggestionsViewMode="PREVIEW_WITHOUT_SUGGESTIONS"
+            suggestionsViewMode="PREVIEW_WITHOUT_SUGGESTIONS",
+            includeTabsContent=True,
         ).execute()
         doc_accepted = docs_service.documents().get(
             documentId=file_id,
-            suggestionsViewMode="PREVIEW_SUGGESTIONS_ACCEPTED"
+            suggestionsViewMode="PREVIEW_SUGGESTIONS_ACCEPTED",
+            includeTabsContent=True,
         ).execute()
     except HttpError as e:
         _error(f"failed to read document: {e.reason if hasattr(e, 'reason') else e}")
 
     title = doc_original.get("title", "")
-    original_text = _extract_full_text(doc_original.get("body", {}))
-    accepted_text = _extract_full_text(doc_accepted.get("body", {}))
+    ordered, original_tabs = _suggestion_tabs_by_id(doc_original, "without")
+    _accepted_ordered, accepted_tabs = _suggestion_tabs_by_id(
+        doc_accepted, "accepted")
+    original_ids, accepted_ids = set(original_tabs), set(accepted_tabs)
+    if original_ids != accepted_ids:
+        missing = sorted((original_ids - accepted_ids), key=str)
+        extra = sorted((accepted_ids - original_ids), key=str)
+        details = []
+        if missing:
+            details.append(f"missing from accepted view: {missing}")
+        if extra:
+            details.append(f"missing from original view: {extra}")
+        _error(
+            "suggestion tab sets differ between preview views (" +
+            "; ".join(details) +
+            ") — retry; the document may have changed between reads")
 
-    if original_text == accepted_text:
-        _emit_json({
-            "title": title,
-            "has_suggestions": False,
-            "changes": [],
-            "diff": "",
-        }, output=output, summary={"has_suggestions": False,
-                                   "change_count": 0})
-        return
+    legacy = not bool(doc_original.get("tabs"))
+    changes, diff_parts, tab_results = [], [], []
+    for tab_id, tab_title, original_tab in ordered:
+        accepted_title, accepted_tab = accepted_tabs[tab_id]
+        # The original title is the stable attribution displayed to callers.
+        # A title-only race cannot make a suggestion disappear, while ID set
+        # changes above do fail closed.
+        display_title = tab_title or accepted_title or title
+        original_text = _extract_full_text(original_tab.get("body", {}))
+        accepted_text = _extract_full_text(accepted_tab.get("body", {}))
+        tab_changes, tab_diff = _suggestion_tab_diff(
+            original_text, accepted_text, tab_id, display_title,
+            legacy=legacy)
+        changes.extend(tab_changes)
+        if tab_diff:
+            diff_parts.append(tab_diff)
+        tab_results.append({
+            "id": tab_id,
+            "title": display_title,
+            "has_suggestions": bool(tab_changes),
+            "change_count": len(tab_changes),
+        })
 
-    orig_lines = original_text.splitlines(keepends=True)
-    acc_lines = accepted_text.splitlines(keepends=True)
-
-    diff_lines = list(difflib.unified_diff(
-        orig_lines, acc_lines,
-        fromfile="original", tofile="with_suggestions", n=2
-    ))
-
-    # Build structured changes
-    changes = []
-    current = None
-    for line in diff_lines:
-        if line.startswith("@@"):
-            if current:
-                changes.append(current)
-            current = {"deleted": [], "inserted": [], "context": line.strip()}
-        elif current is not None:
-            if line.startswith("-") and not line.startswith("---"):
-                current["deleted"].append(line[1:].rstrip("\n"))
-            elif line.startswith("+") and not line.startswith("+++"):
-                current["inserted"].append(line[1:].rstrip("\n"))
-    if current:
-        changes.append(current)
-
-    _emit_json({
+    tabs_with = sum(1 for tab in tab_results if tab["has_suggestions"])
+    payload = {
         "title": title,
-        "has_suggestions": True,
+        "has_suggestions": bool(changes),
         "change_count": len(changes),
+        "tab_count": len(tab_results),
+        "tabs_with_suggestions": tabs_with,
+        "tabs": tab_results,
         "changes": changes,
-        "diff": "".join(diff_lines),
-    }, output=output, summary={"has_suggestions": True,
-                               "change_count": len(changes)})
+        "diff": "".join(diff_parts),
+    }
+    _emit_json(payload, output=output, summary={
+        "has_suggestions": bool(changes),
+        "change_count": len(changes),
+        "tab_count": len(tab_results),
+        "tabs_with_suggestions": tabs_with,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -6485,6 +6901,67 @@ def _closed_threads_in_edited_ranges(doc_tab, closed, edited):
     return suspects
 
 
+def _archived_reply_key(reply):
+    """Stable reply identity available in both old and fresh archives.
+
+    Reply ids were not stored in the archive before #28, so the only common
+    identity is the exact author/created pair.  An incomplete pair is not an
+    identity: collapsing two such records would lose words silently.
+    """
+    author = reply.get("author")
+    created = reply.get("created")
+    if not author or not created:
+        return None
+    return author, created
+
+
+def _merge_archived_replies(old, fresh):
+    """Merge reply snapshots without deleting anything from the archive.
+
+    Old order is retained.  A fresh record replaces an old one only when its
+    exact (author, created) identity occurs once on BOTH sides; this makes an
+    edited reply fresh while a reply absent after deletion remains archived.
+    Colliding or incomplete identities are kept as a union instead of being
+    guessed — duplicates cost space, whereas a wrong merge loses the archive's
+    only copy of somebody's words.
+    """
+    from collections import Counter
+
+    if not isinstance(old, list):
+        raise ValueError("archived thread replies is not a list")
+    if not isinstance(fresh, list):
+        raise ValueError("fresh thread replies is not a list")
+    if any(not isinstance(reply, dict) for reply in old + fresh):
+        raise ValueError("thread replies contains a non-object entry")
+
+    old_counts = Counter(
+        key for reply in old if (key := _archived_reply_key(reply)) is not None)
+    fresh_counts = Counter(
+        key for reply in fresh
+        if (key := _archived_reply_key(reply)) is not None)
+    fresh_by_key = {}
+    for reply in fresh:
+        key = _archived_reply_key(reply)
+        if (key is not None and old_counts[key] == 1
+                and fresh_counts[key] == 1):
+            fresh_by_key[key] = reply
+
+    merged, replaced = [], set()
+    for reply in old:
+        key = _archived_reply_key(reply)
+        if key in fresh_by_key:
+            merged.append(dict(fresh_by_key[key]))
+            replaced.add(key)
+        else:
+            merged.append(dict(reply))
+    for reply in fresh:
+        key = _archived_reply_key(reply)
+        if key in replaced or reply in merged:
+            continue
+        merged.append(dict(reply))
+    return merged
+
+
 def _archive_closed_threads(md_path, file_id, closed, doc_tab=None,
                             edited=()):
     """Write the conversation of every closed thread next to the markdown.
@@ -6546,14 +7023,33 @@ def _archive_closed_threads(md_path, file_id, closed, doc_tab=None,
             old = previous["threads"]
             if not isinstance(old, list):
                 raise ValueError("threads is not a list")
+            old_by_id = {}
+            for thread in old:
+                if not isinstance(thread, dict):
+                    raise ValueError("threads contains a non-object entry")
+                thread_id = thread.get("id")
+                if thread_id in old_by_id:
+                    raise ValueError(
+                        f"duplicate thread id {thread_id!r} in archive")
+                if not isinstance(thread.get("replies", []), list):
+                    raise ValueError(
+                        f"thread {thread_id!r} replies is not a list")
+                old_by_id[thread_id] = thread
+
+            for entry in entries:
+                prior = old_by_id.pop(entry["id"], None)
+                if prior is not None:
+                    entry["replies"] = _merge_archived_replies(
+                        prior.get("replies", []), entry["replies"])
+            # Dict insertion order is the previous archive order, so threads
+            # absent from this snapshot keep their stable place after fresh
+            # entries exactly as they did before #28.
+            kept = list(old_by_id.values())
         except Exception as e:
             raise RuntimeError(
                 f"не удалось прочитать прежний архив закрытых тредов {path}: "
                 f"{e}. Перезаписать его нельзя — это единственная копия тех "
                 f"разговоров. Уберите файл в сторону и повторите.")
-        fresh_ids = {e["id"] for e in entries}
-        kept = [t for t in old
-                if isinstance(t, dict) and t.get("id") not in fresh_ids]
 
     payload = {
         "doc_id": file_id,
@@ -6561,8 +7057,8 @@ def _archive_closed_threads(md_path, file_id, closed, doc_tab=None,
                  "skrepka не знает, где стояли их якоря, и правка через "
                  "удаление могла превратить их в призраков: в интерфейсе "
                  "такой тред не появится даже после переоткрытия. Текст "
-                 "разговора сохранён здесь. Файл накапливается: треды из "
-                 "прошлых прогонов остаются."),
+                 "разговора сохранён здесь. Файл накапливается: треды и "
+                 "ответы из прошлых прогонов остаются."),
         "threads": entries + kept,
     }
     return safeio.atomic_write(
