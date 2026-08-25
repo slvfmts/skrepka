@@ -795,8 +795,8 @@ def test_census_asks_for_the_fields_the_fingerprint_needs(engine):
     assert seen["includeDeleted"] is True
     # the reply sub-selection is asserted whole: checking for bare "deleted"
     # or "createdTime" would be satisfied by the parent comment's own fields
-    assert "replies(id,content,createdTime,author/displayName,deleted,action)" \
-        in seen["fields"]
+    assert ("replies(id,content,createdTime,author/displayName,author/me,"
+            "deleted,action)") in seen["fields"]
     for f in ("resolved", "quotedFileContent", "anchor"):
         assert f in seen["fields"]
 
