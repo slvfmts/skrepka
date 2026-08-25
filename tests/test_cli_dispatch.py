@@ -74,3 +74,20 @@ def test_overview_names_the_cost_of_update_and_the_path_that_keeps_threads():
     assert "DESTROYS" in lines["update"]
     assert "keeps comment threads alive" in lines["patch"]
     assert "keeping OPEN comment" in lines["sync"]
+
+
+def test_every_registered_subcommand_is_listed_in_the_overview():
+    """`unreply` shipped registered but invisible: it was in the skill and in
+    the changelog, and absent from `skrepka --help`, where a person looks for
+    it. A command a person cannot find is a command that does not exist, so
+    the overview is checked against the parser itself rather than by hand."""
+    import pathlib
+    import re
+
+    source = (pathlib.Path(__file__).resolve().parents[1]
+              / "src" / "skrepka" / "_engine.py").read_text(encoding="utf-8")
+    registered = set(re.findall(r'add_parser\(\s*"([a-z][a-z-]*)"', source))
+    assert registered, "no subcommands found — the probe itself is broken"
+    listed = {ln.split()[0] for ln in cli._TOP_HELP.splitlines()
+              if ln.startswith("  ") and ln.strip()}
+    assert registered - listed == set()

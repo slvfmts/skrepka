@@ -3421,3 +3421,100 @@ def test_patch_writes_a_soft_break_into_a_commented_paragraph(engine,
                                                for r in b))
     assert main[1]["insertText"]["text"] == "Заголовок\vНиз"
     assert main[2]["replaceAllText"]["replaceText"] == "Заголовок\vНиз"
+
+
+def _archived_replies(engine, tmp_path, first, second):
+    md = tmp_path / "doc.md"
+    md.write_text("x", encoding="utf-8")
+    engine._archive_closed_threads(str(md), "doc1", [first])
+    path = engine._archive_closed_threads(str(md), "doc1", [second])
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)["threads"][0]["replies"]
+
+
+def _archive_reply(author, created, content, deleted=False):
+    return {"author": {"displayName": author}, "createdTime": created,
+            "content": content, "deleted": deleted}
+
+
+def test_closed_thread_archive_keeps_a_reply_deleted_between_runs(
+        engine, tmp_path):
+    """#28: the old thread entry is the deleted reply's only remaining copy.
+
+    The fresh thread must update the conversation, not replace it whole.
+    """
+    first = api_comment("c1", "A", CREATED, resolved=True, replies=[
+        _archive_reply("B", "2026-08-01T00:00:01Z", "первый"),
+        _archive_reply("C", "2026-08-01T00:00:02Z", "второй"),
+    ])
+    second = api_comment("c1", "A", CREATED, resolved=True, replies=[
+        _archive_reply("B", "2026-08-01T00:00:01Z", "первый",
+                       deleted=True),
+        _archive_reply("C", "2026-08-01T00:00:02Z", "второй"),
+    ])
+
+    replies = _archived_replies(engine, tmp_path, first, second)
+
+    assert [r["content"] for r in replies] == ["первый", "второй"]
+
+
+def test_closed_thread_archive_updates_a_known_reply_and_appends_a_new_one(
+        engine, tmp_path):
+    first = api_comment("c1", "A", CREATED, resolved=True, replies=[
+        _archive_reply("B", "2026-08-01T00:00:01Z", "старое"),
+    ])
+    second = api_comment("c1", "A", CREATED, resolved=True, replies=[
+        _archive_reply("B", "2026-08-01T00:00:01Z", "уточнённое"),
+        _archive_reply("C", "2026-08-01T00:00:02Z", "новое"),
+    ])
+
+    replies = _archived_replies(engine, tmp_path, first, second)
+
+    assert [(r["author"], r["created"], r["content"]) for r in replies] == [
+        ("B", "2026-08-01T00:00:01Z", "уточнённое"),
+        ("C", "2026-08-01T00:00:02Z", "новое"),
+    ]
+
+
+def test_closed_thread_reply_identity_needs_both_author_and_created(
+        engine, tmp_path):
+    old_specs = [
+        ("A", "2026-08-01T00:00:01Z", "a1"),
+        ("A", "2026-08-01T00:00:02Z", "a2"),
+        ("B", "2026-08-01T00:00:01Z", "b1"),
+    ]
+    first = api_comment("c1", "A", CREATED, resolved=True, replies=[
+        _archive_reply(author, created, content)
+        for author, created, content in old_specs
+    ])
+    second = api_comment("c1", "A", CREATED, resolved=True, replies=[
+        _archive_reply(author, created, content + "-fresh")
+        for author, created, content in old_specs
+    ])
+
+    replies = _archived_replies(engine, tmp_path, first, second)
+
+    assert [(r["author"], r["created"], r["content"]) for r in replies] == [
+        (author, created, content + "-fresh")
+        for author, created, content in old_specs
+    ]
+
+
+def test_closed_thread_archive_refuses_malformed_old_replies(
+        engine, tmp_path):
+    md = tmp_path / "doc.md"
+    md.write_text("x", encoding="utf-8")
+    path = tmp_path / "doc.md.skrepka-closed-threads.json"
+    original = json.dumps({
+        "doc_id": "doc1",
+        "threads": [{"id": "c1", "replies": "not-a-list"}],
+    })
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(RuntimeError) as exc:
+        engine._archive_closed_threads(
+            str(md), "doc1",
+            [api_comment("c1", "A", CREATED, resolved=True)])
+
+    assert "единственная копия" in str(exc.value)
+    assert path.read_text(encoding="utf-8") == original

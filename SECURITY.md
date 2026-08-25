@@ -69,4 +69,4 @@ skrepka считает текст документов и комментарие
 
 ## Гигиена репозитория
 
-Секреты (`credentials.json`, `client_secret_*.json`, `token.json`, `*.token.json`, `.env`) перечислены в `.gitignore` и не должны попадать в коммиты. gitleaks прогоняется по всей истории в CI на каждый push и в release-workflow перед публикацией. Артефакты рантайма (`*.gdocs-base.json`, журналы синка) тоже в `.gitignore`: sidecar содержит полный текст документа.
+Секреты (`credentials.json`, `client_secret_*.json`, `token.json`, `*.token.json`, `.env`) перечислены в `.gitignore` и не должны попадать в коммиты. gitleaks прогоняется по всей истории в CI на каждый push и в release-workflow перед публикацией; его архив сверяется с опубликованным SHA-256 до распаковки. Все внешние GitHub Actions закреплены на точных commit SHA с версией в комментарии. Артефакты рантайма (`*.gdocs-base.json`, журналы синка) тоже в `.gitignore`: sidecar содержит полный текст документа.

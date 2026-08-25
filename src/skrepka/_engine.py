@@ -6485,6 +6485,67 @@ def _closed_threads_in_edited_ranges(doc_tab, closed, edited):
     return suspects
 
 
+def _archived_reply_key(reply):
+    """Stable reply identity available in both old and fresh archives.
+
+    Reply ids were not stored in the archive before #28, so the only common
+    identity is the exact author/created pair.  An incomplete pair is not an
+    identity: collapsing two such records would lose words silently.
+    """
+    author = reply.get("author")
+    created = reply.get("created")
+    if not author or not created:
+        return None
+    return author, created
+
+
+def _merge_archived_replies(old, fresh):
+    """Merge reply snapshots without deleting anything from the archive.
+
+    Old order is retained.  A fresh record replaces an old one only when its
+    exact (author, created) identity occurs once on BOTH sides; this makes an
+    edited reply fresh while a reply absent after deletion remains archived.
+    Colliding or incomplete identities are kept as a union instead of being
+    guessed — duplicates cost space, whereas a wrong merge loses the archive's
+    only copy of somebody's words.
+    """
+    from collections import Counter
+
+    if not isinstance(old, list):
+        raise ValueError("archived thread replies is not a list")
+    if not isinstance(fresh, list):
+        raise ValueError("fresh thread replies is not a list")
+    if any(not isinstance(reply, dict) for reply in old + fresh):
+        raise ValueError("thread replies contains a non-object entry")
+
+    old_counts = Counter(
+        key for reply in old if (key := _archived_reply_key(reply)) is not None)
+    fresh_counts = Counter(
+        key for reply in fresh
+        if (key := _archived_reply_key(reply)) is not None)
+    fresh_by_key = {}
+    for reply in fresh:
+        key = _archived_reply_key(reply)
+        if (key is not None and old_counts[key] == 1
+                and fresh_counts[key] == 1):
+            fresh_by_key[key] = reply
+
+    merged, replaced = [], set()
+    for reply in old:
+        key = _archived_reply_key(reply)
+        if key in fresh_by_key:
+            merged.append(dict(fresh_by_key[key]))
+            replaced.add(key)
+        else:
+            merged.append(dict(reply))
+    for reply in fresh:
+        key = _archived_reply_key(reply)
+        if key in replaced or reply in merged:
+            continue
+        merged.append(dict(reply))
+    return merged
+
+
 def _archive_closed_threads(md_path, file_id, closed, doc_tab=None,
                             edited=()):
     """Write the conversation of every closed thread next to the markdown.
@@ -6546,14 +6607,33 @@ def _archive_closed_threads(md_path, file_id, closed, doc_tab=None,
             old = previous["threads"]
             if not isinstance(old, list):
                 raise ValueError("threads is not a list")
+            old_by_id = {}
+            for thread in old:
+                if not isinstance(thread, dict):
+                    raise ValueError("threads contains a non-object entry")
+                thread_id = thread.get("id")
+                if thread_id in old_by_id:
+                    raise ValueError(
+                        f"duplicate thread id {thread_id!r} in archive")
+                if not isinstance(thread.get("replies", []), list):
+                    raise ValueError(
+                        f"thread {thread_id!r} replies is not a list")
+                old_by_id[thread_id] = thread
+
+            for entry in entries:
+                prior = old_by_id.pop(entry["id"], None)
+                if prior is not None:
+                    entry["replies"] = _merge_archived_replies(
+                        prior.get("replies", []), entry["replies"])
+            # Dict insertion order is the previous archive order, so threads
+            # absent from this snapshot keep their stable place after fresh
+            # entries exactly as they did before #28.
+            kept = list(old_by_id.values())
         except Exception as e:
             raise RuntimeError(
                 f"не удалось прочитать прежний архив закрытых тредов {path}: "
                 f"{e}. Перезаписать его нельзя — это единственная копия тех "
                 f"разговоров. Уберите файл в сторону и повторите.")
-        fresh_ids = {e["id"] for e in entries}
-        kept = [t for t in old
-                if isinstance(t, dict) and t.get("id") not in fresh_ids]
 
     payload = {
         "doc_id": file_id,
@@ -6561,8 +6641,8 @@ def _archive_closed_threads(md_path, file_id, closed, doc_tab=None,
                  "skrepka не знает, где стояли их якоря, и правка через "
                  "удаление могла превратить их в призраков: в интерфейсе "
                  "такой тред не появится даже после переоткрытия. Текст "
-                 "разговора сохранён здесь. Файл накапливается: треды из "
-                 "прошлых прогонов остаются."),
+                 "разговора сохранён здесь. Файл накапливается: треды и "
+                 "ответы из прошлых прогонов остаются."),
         "threads": entries + kept,
     }
     return safeio.atomic_write(
