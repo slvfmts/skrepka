@@ -795,8 +795,8 @@ def test_census_asks_for_the_fields_the_fingerprint_needs(engine):
     assert seen["includeDeleted"] is True
     # the reply sub-selection is asserted whole: checking for bare "deleted"
     # or "createdTime" would be satisfied by the parent comment's own fields
-    assert "replies(id,content,createdTime,author/displayName,deleted,action)" \
-        in seen["fields"]
+    assert ("replies(id,content,createdTime,author/displayName,author/me,"
+            "deleted,action)") in seen["fields"]
     for f in ("resolved", "quotedFileContent", "anchor"):
         assert f in seen["fields"]
 
@@ -1273,7 +1273,7 @@ def test_a_cell_fence_stops_a_sync_rewrite_of_its_table(engine):
 
 def test_named_range_intervals(engine):
     doc = make_doc(["Alpha"], named_ranges={
-        "mark1": {"namedRanges": [{"ranges": [
+        "mark1": {"namedRanges": [{"namedRangeId": "nr-mark1", "ranges": [
             {"startIndex": 1, "endIndex": 4},
             {"startIndex": 10, "endIndex": 12}]}]}})
     out = engine._named_range_intervals(doc)
@@ -1499,8 +1499,7 @@ def test_e2e_matched_no_overlap_applies(engine, monkeypatch, tmp_path,
 
 
 def test_e2e_matched_overlap_blocks(engine, monkeypatch, tmp_path, capsys):
-    """(3) anchored comment on Bravo, local edit on Bravo → refused
-    before the batch, canary cleaned up."""
+    """(3) anchored edit is deferred before the batch; canary is cleaned."""
     doc = make_doc(BASE_TEXTS)
     docs = DocsStub(doc)
     drive = DriveStub(
@@ -1514,8 +1513,11 @@ def test_e2e_matched_overlap_blocks(engine, monkeypatch, tmp_path, capsys):
                       "Alpha\n\nBravo edited\n\nCharlie")
     with pytest.raises(SystemExit):
         engine.sync_doc("doc1", md)
-    err = json.loads(capsys.readouterr().out)["error"]
-    assert "anchor of a live comment" in err
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "partial-noop"
+    assert out["deferred"]["reason"] == "protected-fence"
+    assert "live comment anchor" in json.dumps(
+        out["deferred"], ensure_ascii=False)
     assert _no_content_mutation(docs)
     assert docs.canary_text is None
 
@@ -1523,9 +1525,9 @@ def test_e2e_matched_overlap_blocks(engine, monkeypatch, tmp_path, capsys):
 def test_e2e_named_range_overlap_blocks_without_comments(engine, monkeypatch,
                                                          tmp_path, capsys):
     """(4) comment-free doc, named range on Bravo, local delete of Bravo →
-    refused before ANY write (no canary involved)."""
+    deferred before ANY write (no canary involved)."""
     doc = make_doc(BASE_TEXTS, named_ranges={
-        "mark1": {"namedRanges": [{"ranges": [
+        "mark1": {"namedRanges": [{"namedRangeId": "nr-mark1", "ranges": [
             {"startIndex": 7, "endIndex": 12}]}]}})
     docs = DocsStub(doc)
     drive = DriveStub([], lambda: b"")
@@ -1533,8 +1535,10 @@ def test_e2e_named_range_overlap_blocks_without_comments(engine, monkeypatch,
     md = make_workdir(engine, tmp_path, doc, BASE_MD, "Alpha\n\nCharlie")
     with pytest.raises(SystemExit):
         engine.sync_doc("doc1", md)
-    err = json.loads(capsys.readouterr().out)["error"]
-    assert "named range 'mark1'" in err
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "partial-noop"
+    assert "named range 'mark1'" in json.dumps(
+        out["deferred"], ensure_ascii=False)
     assert docs.batches == []  # nothing at all was written
 
 
@@ -2094,11 +2098,11 @@ def test_rewrite_refuses_when_a_named_range_covers_the_target(engine):
     assert engine._rewrite_anchor_requests(**kw) is None
 
 
-def test_rewrite_refuses_when_a_table_of_contents_is_present(engine):
+def test_rewrite_allows_an_unrelated_table_of_contents(engine):
     kw = _rewrite_case(engine)
     kw["doc_tab"]["body"]["content"].append(
         {"startIndex": 900, "endIndex": 950, "tableOfContents": {}})
-    assert engine._rewrite_anchor_requests(**kw) is None
+    assert engine._rewrite_anchor_requests(**kw) is not None
 
 
 def test_rewrite_refuses_when_the_anchor_is_inside_a_wider_replace(engine):
@@ -2364,7 +2368,7 @@ def test_op_classification_follows_the_same_target_as_resolution(engine):
     against text it does not touch — and a no-op decided on the wrong text
     writes nothing where a replace was due."""
     doc = make_doc(BASE_TEXTS, named_ranges={
-        "mark1": {"namedRanges": [{"ranges": [
+        "mark1": {"namedRanges": [{"namedRangeId": "nr-mark1", "ranges": [
             {"startIndex": 7, "endIndex": 12}]}]}})
     op = {"op": "replace_range", "range": "mark1", "quote": "Charlie",
           "text": "Charlie"}
@@ -2601,16 +2605,14 @@ def test_patch_refuses_one_op_and_applies_the_rest(engine, monkeypatch,
     Alpha and Charlie have nothing to do with it. Before r8 the loop broke on
     the first refusal and the other operations never ran."""
     doc = make_doc(BASE_TEXTS)
-    # a table of contents keeps the rewrite path out of this document (the
-    # text walkers do not read one, so the uniqueness count would miss a match
-    # hiding there), so covering the anchor whole is still a refusal. A closed
-    # thread used to serve that purpose and no longer does — see M13.
-    doc["body"]["content"].append({"startIndex": 100, "endIndex": 101,
-                                   "tableOfContents": {}})
+    # The comment covers only the middle of Bravo. Replacing the wider
+    # paragraph cannot use the exact-anchor rewrite path, so this operation is
+    # still refused while the independent neighbours continue. An unrelated
+    # table of contents is no longer a reason to disable the path (#23).
     docs = DocsStub(doc)
     drive = DriveStub(
         [api_comment("c1", "A", CREATED)],
-        _docx_builder(docs, [("Alpha", []), ("Bravo", [("0", 0, 5)]),
+        _docx_builder(docs, [("Alpha", []), ("Bravo", [("0", 1, 4)]),
                              ("Charlie", [])],
                       [("0", "A", CREATED_SEC)]))
     wire(engine, monkeypatch, docs, drive)
@@ -2765,6 +2767,103 @@ def test_closed_thread_archive_accumulates(engine, tmp_path):
     with open(path, encoding="utf-8") as f:
         archive = json.load(f)
     assert {t["id"] for t in archive["threads"]} == {"old", "new"}
+
+
+def _archived_replies(engine, tmp_path, first, second):
+    md = tmp_path / "doc.md"
+    md.write_text("x", encoding="utf-8")
+    engine._archive_closed_threads(str(md), "doc1", [first])
+    path = engine._archive_closed_threads(str(md), "doc1", [second])
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)["threads"][0]["replies"]
+
+
+def _archive_reply(author, created, content, deleted=False):
+    return {"author": {"displayName": author}, "createdTime": created,
+            "content": content, "deleted": deleted}
+
+
+def test_closed_thread_archive_keeps_a_reply_deleted_between_runs(
+        engine, tmp_path):
+    """#28: the old thread entry is the deleted reply's only remaining copy.
+
+    The fresh thread must update the conversation, not replace it whole.
+    """
+    first = api_comment("c1", "A", CREATED, resolved=True, replies=[
+        _archive_reply("B", "2026-08-01T00:00:01Z", "первый"),
+        _archive_reply("C", "2026-08-01T00:00:02Z", "второй"),
+    ])
+    second = api_comment("c1", "A", CREATED, resolved=True, replies=[
+        _archive_reply("B", "2026-08-01T00:00:01Z", "первый",
+                       deleted=True),
+        _archive_reply("C", "2026-08-01T00:00:02Z", "второй"),
+    ])
+
+    replies = _archived_replies(engine, tmp_path, first, second)
+
+    assert [r["content"] for r in replies] == ["первый", "второй"]
+
+
+def test_closed_thread_archive_updates_a_known_reply_and_appends_a_new_one(
+        engine, tmp_path):
+    first = api_comment("c1", "A", CREATED, resolved=True, replies=[
+        _archive_reply("B", "2026-08-01T00:00:01Z", "старое"),
+    ])
+    second = api_comment("c1", "A", CREATED, resolved=True, replies=[
+        _archive_reply("B", "2026-08-01T00:00:01Z", "уточнённое"),
+        _archive_reply("C", "2026-08-01T00:00:02Z", "новое"),
+    ])
+
+    replies = _archived_replies(engine, tmp_path, first, second)
+
+    assert [(r["author"], r["created"], r["content"]) for r in replies] == [
+        ("B", "2026-08-01T00:00:01Z", "уточнённое"),
+        ("C", "2026-08-01T00:00:02Z", "новое"),
+    ]
+
+
+def test_closed_thread_reply_identity_needs_both_author_and_created(
+        engine, tmp_path):
+    old_specs = [
+        ("A", "2026-08-01T00:00:01Z", "a1"),
+        ("A", "2026-08-01T00:00:02Z", "a2"),
+        ("B", "2026-08-01T00:00:01Z", "b1"),
+    ]
+    first = api_comment("c1", "A", CREATED, resolved=True, replies=[
+        _archive_reply(author, created, content)
+        for author, created, content in old_specs
+    ])
+    second = api_comment("c1", "A", CREATED, resolved=True, replies=[
+        _archive_reply(author, created, content + "-fresh")
+        for author, created, content in old_specs
+    ])
+
+    replies = _archived_replies(engine, tmp_path, first, second)
+
+    assert [(r["author"], r["created"], r["content"]) for r in replies] == [
+        (author, created, content + "-fresh")
+        for author, created, content in old_specs
+    ]
+
+
+def test_closed_thread_archive_refuses_malformed_old_replies(
+        engine, tmp_path):
+    md = tmp_path / "doc.md"
+    md.write_text("x", encoding="utf-8")
+    path = tmp_path / "doc.md.skrepka-closed-threads.json"
+    original = json.dumps({
+        "doc_id": "doc1",
+        "threads": [{"id": "c1", "replies": "not-a-list"}],
+    })
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(RuntimeError) as exc:
+        engine._archive_closed_threads(
+            str(md), "doc1",
+            [api_comment("c1", "A", CREATED, resolved=True)])
+
+    assert "единственная копия" in str(exc.value)
+    assert path.read_text(encoding="utf-8") == original
 
 
 def test_closed_thread_archive_refuses_to_clobber_an_unreadable_one(engine,
@@ -3183,7 +3282,7 @@ def test_sync_refuses_to_rewrite_a_twin_of_an_anchored_paragraph(
     (the type is part of the key), but the anchor map sees one text twice and
     cannot tell which copy the comment is on. The fence covers both, so the
     positional rewrite — `deleteContentRange`, the operation that ghosts an
-    anchor — is refused before any write."""
+    anchor — is deferred before any content write."""
     doc = _make_doc_styled([("Bravo", "HEADING_1"), ("Bravo", "NORMAL_TEXT"),
                             ("Charlie", "NORMAL_TEXT")])
     docs = DocsStub(doc)
@@ -3201,8 +3300,13 @@ def test_sync_refuses_to_rewrite_a_twin_of_an_anchored_paragraph(
                       "# Bravo edited\n\nBravo\n\nCharlie")
     with pytest.raises(SystemExit):
         engine.sync_doc("doc1", md)
-    err = json.loads(capsys.readouterr().out)["error"]
-    assert "одинаковых копий" in err
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "partial-noop"
+    # Public deferred serialization now bounds the long fence explanation;
+    # the full text remains in the journal and the receipt carries its hash.
+    deferred_text = json.dumps(out["deferred"], ensure_ascii=False)
+    assert "sha256:" in deferred_text
+    assert "одинаковых копий" not in deferred_text
     assert _no_content_mutation(docs)
 
 
@@ -3319,8 +3423,12 @@ def test_the_refusal_names_the_real_reason_the_rewrite_did_not_fire(engine):
 
     toc = dict(base)
     toc["doc_tab"] = {"body": {"content": list(
-        kw["doc_tab"]["body"]["content"]) + [{"tableOfContents": {}}]}}
-    assert "оглавление" in engine._why_no_rewrite(**toc)
+        kw["doc_tab"]["body"]["content"]) + [{"tableOfContents": {
+            "content": [{"paragraph": {"elements": [
+                {"textRun": {"content": kw["search_text"] + "\n"}},
+            ]}}],
+        }}]}}
+    assert "оглавлен" in engine._why_no_rewrite(**toc)
 
     named = dict(base)
     named["named_intervals"] = [(kw["start"], kw["end"], "метка mark1")]

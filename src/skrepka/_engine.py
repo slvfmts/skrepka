@@ -5,7 +5,9 @@ import argparse
 import copy
 import datetime
 import difflib
+import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -76,19 +78,35 @@ class PatchOpError(Exception):
     "unknown"     — the write (or part of it) may have landed.
     """
 
-    def __init__(self, msg, state="not_applied"):
+    def __init__(self, msg, state="not_applied", reason=None, details=None):
         super().__init__(msg)
         self.state = state
+        # Optional machine-readable diagnosis.  Keep the legacy string as the
+        # primary exception value: callers and receipts written before #51
+        # continue to work, while structured consumers can opt in.
+        self.reason = reason
+        self.details = details
 
 
 _RAISE_ERRORS = False  # per-op mode: _error raises PatchOpError instead of exiting
 
+# A deferred block may be rebuilt only when the downstream sync planner can
+# address it as a paragraph-like element.  Opaque markdown atoms have no text
+# payload for request generation and therefore never belong to this set.
+_DEFERRED_SUPPORTED_KINDS = frozenset(
+    ("p", "li", "h1", "h2", "h3", "h4", "h5", "h6"))
 
-def _error(msg):
+
+def _error(msg, *, reason=None, details=None):
     """Print JSON error to stdout and exit (or raise in per-op mode)."""
     if _RAISE_ERRORS:
-        raise PatchOpError(msg)
-    print(json.dumps({"error": msg}))
+        raise PatchOpError(msg, reason=reason, details=details)
+    payload = {"error": msg}
+    if reason is not None:
+        payload["reason"] = reason
+    if details is not None:
+        payload["details"] = details
+    print(json.dumps(payload, ensure_ascii=False))
     sys.exit(1)
 
 
@@ -350,9 +368,9 @@ def _scan_suggestions(node):
 _COMMENT_FIELDS = (
     # `content` on replies costs nothing extra here and is what makes the
     # archive of a closed thread a real record of the conversation (r8).
-    "nextPageToken,comments(id,content,author/displayName,createdTime,"
+    "nextPageToken,comments(id,content,author/displayName,author/me,createdTime,"
     "quotedFileContent,resolved,deleted,anchor,"
-    "replies(id,content,createdTime,author/displayName,deleted,action))"
+    "replies(id,content,createdTime,author/displayName,author/me,deleted,action))"
 )
 
 
@@ -733,6 +751,30 @@ def _count_quote_occurrences(doc_tab, quote):
     return _count_in_buffer(buf, quote)
 
 
+def _resolve_mark_occurrence(requested, total):
+    """Resolve and validate ``mark --occurrence`` before any write.
+
+    ``None`` means the CLI flag was omitted.  It is safe to infer the only
+    occurrence, but never safe to guess among duplicates.  An explicit 1 is
+    intentionally distinct from omission: it is a valid request for the first
+    copy even when the quote occurs more than once.
+    """
+    if total < 1:
+        raise ValueError("quote has no occurrences")
+    if requested is None:
+        if total > 1:
+            raise ValueError(
+                f"quote is non-unique ({total} matches). "
+                f"Pass --occurrence N (1..{total}) to choose one."
+            )
+        return 1
+    if requested < 1 or requested > total:
+        raise ValueError(
+            f"occurrence {requested} out of range (must be 1..{total})"
+        )
+    return requested
+
+
 def _count_text_outside_body(doc_tab, text):
     """Occurrences of `text` in the tab's headers, footers and footnotes.
 
@@ -755,10 +797,32 @@ def _count_text_outside_body(doc_tab, text):
     return total
 
 
+def _count_text_in_table_of_contents(doc_tab, text):
+    """Count possible ``replaceAllText`` matches in generated TOC content.
+
+    Whether Google rewrites a table of contents has not been measured (#23),
+    so TOC text is deliberately NOT added to the indexed body walker: doing
+    that would make generated text a target for ``patch``.  It is counted as
+    a possible match instead.  This is conservative in both live outcomes:
+    if Google rewrites it, a duplicate is caught before the write; if Google
+    does not, the only cost is refusing a target whose text is repeated there.
+    """
+    if not text or "\x00" in text:
+        return 0
+    total = 0
+    for element in (doc_tab.get("body", {}) or {}).get("content", []):
+        toc = element.get("tableOfContents")
+        if not isinstance(toc, dict):
+            continue
+        total += _plain_text(toc.get("content", [])).count(text)
+    return total
+
+
 def _replace_all_match_count(doc_tab, text):
     """How many matches `replaceAllText` would find in this tab."""
     return (_count_quote_occurrences(doc_tab, text)
-            + _count_text_outside_body(doc_tab, text))
+            + _count_text_outside_body(doc_tab, text)
+            + _count_text_in_table_of_contents(doc_tab, text))
 
 
 def _write_control(revision_id):
@@ -1282,45 +1346,358 @@ def upload_md(file_path, folder_id=None, title=None, no_highlights=False):
     }))
 
 
+def _comment_tab_attribution(comment, tabs=None, catalog_problem=None,
+                             read_problem=None):
+    """Return display-only tab evidence for one Drive comment.
+
+    Drive does not expose a tab id on a comment (M19).  ``quotedFileContent``
+    is a stale snapshot and cannot prove the current anchor position, but it
+    can still support one deliberately narrow read-only statement: its exact
+    text occurs in the body of exactly one tab in this Docs snapshot.  This
+    helper never upgrades that hint into write authorization; reply/resolve
+    keep using the DOCX marker proof in ``_reply_tab_preflight``.
+    """
+    quote = (comment.get("quotedFileContent") or {}).get("value") or ""
+    if not quote:
+        if comment.get("anchor"):
+            return {
+                "tab_id": None,
+                "tab_title": None,
+                "tab_attribution": {
+                    "status": "unknown",
+                    "candidates": [],
+                    "reason": "anchor_without_quote",
+                },
+            }
+        return {
+            "tab_id": None,
+            "tab_title": None,
+            "tab_attribution": {
+                "status": "document",
+                "candidates": [],
+                "reason": "unanchored_document_comment",
+            },
+        }
+
+    if read_problem:
+        return {
+            "tab_id": None,
+            "tab_title": None,
+            "tab_attribution": {
+                "status": "unknown",
+                "candidates": [],
+                "reason": read_problem,
+            },
+        }
+
+    candidates = []
+    for tab_id, title, doc_tab in tabs or []:
+        occurrences = _count_quote_occurrences(doc_tab, quote)
+        if occurrences:
+            candidates.append({
+                "tab_id": tab_id,
+                "tab_title": title or None,
+                "quote_occurrences": occurrences,
+            })
+
+    # A malformed/partial tab catalogue invalidates even a unique-looking
+    # match.  In particular, a missing sibling id must not make the one tab
+    # which happened to have an id look authoritative.
+    if catalog_problem:
+        reason = catalog_problem
+    elif len(candidates) > 1:
+        reason = "quote_matches_multiple_tabs"
+    elif not candidates:
+        reason = "quote_not_found_in_tabs"
+    else:
+        candidate = candidates[0]
+        return {
+            "tab_id": candidate["tab_id"],
+            "tab_title": candidate["tab_title"],
+            "tab_attribution": {
+                "status": "exact",
+                "candidates": candidates,
+                "reason": "quote_matches_exactly_one_tab",
+            },
+        }
+
+    return {
+        "tab_id": None,
+        "tab_title": None,
+        "tab_attribution": {
+            "status": "unknown",
+            "candidates": candidates,
+            "reason": reason,
+        },
+    }
+
+
+def _comment_tab_catalog(doc):
+    """Flatten root/child tabs and name any identity defect honestly."""
+    tabs = _collect_tabs(doc)
+    if not doc.get("tabs"):
+        # A legacy-shaped response has a body but no stable tab identity.
+        # Its text remains useful as a candidate, never as exact attribution.
+        return tabs, "tab_ids_not_returned"
+    tab_ids = [tab_id for tab_id, _title, _doc_tab in tabs]
+    if any(not tab_id for tab_id in tab_ids):
+        return tabs, "missing_tab_id"
+    if len(set(tab_ids)) != len(tab_ids):
+        return tabs, "duplicate_tab_id"
+    return tabs, None
+
+
+def _comment_anchor_export_status(comment, *, records, universe, tabs,
+                                  file_id=None, export_problem=None,
+                                  read_problem=None):
+    """Describe read-only export evidence without claiming live freshness.
+
+    A plain Drive export has no canary and may be stale.  A matching record
+    therefore means only ``record_present`` in THAT export, never "the anchor
+    is live now".  Absence becomes ``ghost`` only under the stricter #34
+    witness: the thread has a unique author/time identity, the export contains
+    a later record, and the stale quote is absent from every current Docs tab.
+    Every inconclusive shape stays ``unknown``.
+    """
+    base = {"export_freshness": "unproven"}
+    if not (comment.get("quotedFileContent") or comment.get("anchor")):
+        return {**base, "status": "not_applicable",
+                "reason": "document_level_comment"}
+    if comment.get("resolved"):
+        # Resolved threads are deliberately omitted from DOCX exports (C11c).
+        return {**base, "status": "not_applicable",
+                "reason": "resolved_threads_omitted_from_export"}
+    if export_problem:
+        return {**base, "status": "unknown", "reason": export_problem}
+
+    cid = comment.get("id")
+    keys = set()
+    for entry in [comment] + [
+            r for r in (comment.get("replies") or [])
+            if not r.get("deleted")]:
+        author = (entry.get("author") or {}).get("displayName")
+        created = entry.get("createdTime")
+        if author and created:
+            keys.add((author, _trunc_seconds(created)))
+    witnesses = {key for key in keys if universe.get(key) == {cid}}
+    if not witnesses:
+        return {**base, "status": "unknown",
+                "reason": ("shared_or_missing_export_identity")}
+
+    present = [
+        record for record in records
+        if (record.get("author"), record.get("date_sec")) in witnesses
+    ]
+    if present:
+        return {**base, "status": "record_present",
+                "reason": "unique_thread_record_found_in_export",
+                "record_count": len(present)}
+    if any((record.get("author"), record.get("date_sec")) in keys
+           for record in records):
+        # A shared key may be this thread's reply. It cannot prove presence,
+        # but it is enough to make declaring the thread absent unsafe.
+        return {**base, "status": "unknown",
+                "reason": "ambiguous_record_may_belong_to_thread"}
+
+    quote = (comment.get("quotedFileContent") or {}).get("value") or ""
+    if not quote:
+        return {**base, "status": "unknown",
+                "reason": "anchor_without_quote_missing_from_export"}
+    if read_problem or not tabs:
+        return {**base, "status": "unknown",
+                "reason": read_problem or "document_tabs_unavailable"}
+    if any(_replace_all_match_count(doc_tab, quote)
+           for _tab_id, _title, doc_tab in tabs):
+        return {**base, "status": "unknown",
+                "reason": "record_missing_but_quote_still_present"}
+
+    # A whole but stale export can legitimately omit a thread while it is
+    # resolved.  Seeing a record newer than the PARENT's creation is not
+    # enough after the thread has since been reopened: that record may still
+    # belong to the resolved interval.  Require evidence newer than every
+    # current entry, including the resolve/reopen action replies.  Ordinary
+    # replies are included too; the extra false-negative is the honest price
+    # of not knowing which cached comment-store snapshot Drive exported.
+    activity = []
+    for entry in [comment] + [
+            reply for reply in (comment.get("replies") or [])
+            if not reply.get("deleted")]:
+        stamp = _rfc3339_epoch(entry.get("createdTime"))
+        if stamp is None:
+            return {**base, "status": "unknown",
+                    "reason": "thread_activity_time_unreadable"}
+        activity.append(stamp)
+    if not activity:
+        return {**base, "status": "unknown",
+                "reason": "thread_activity_time_unreadable"}
+
+    doc_tabs = [doc_tab for _tab_id, _title, doc_tab in tabs]
+    verdict = _ghost_verdict(
+        comment, records, doc_tabs[0], file_id=file_id,
+        other_tabs=doc_tabs[1:], freshness_floor=max(activity))
+    if verdict is not None and not verdict.get("fenced"):
+        return {**base, "status": "ghost",
+                "reason": ("record_missing_after_newer_export_record_and_"
+                           "quote_absent_from_document")}
+    return {**base, "status": "unknown",
+            "reason": "record_missing_export_freshness_unproven"}
+
+
+def _docs_snapshot_fingerprint(doc):
+    """Canonical fallback identity for view-only Docs reads without revision."""
+    return _sha256_str(json.dumps(
+        doc, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+
+
+def _read_comment_evidence(drive_service, docs_service, file_id,
+                           initial_comments):
+    """Read a bounded, stable comments/Docs/export snapshot for ``comments``.
+
+    Drive comments and the Docs resource are separate APIs, and DOCX export is
+    a third read.  A single pass can therefore combine states that never
+    coexisted.  Bracket the export with both a complete paginated comment
+    census and a Docs revision, retrying the whole bracket once.  Evidence is
+    usable only when both boundaries agree.  The helper performs reads only.
+    """
+    before_comments = initial_comments
+    last_problem = "snapshot_changed_during_read"
+    for attempt in range(2):
+        try:
+            doc_before = _safe_get_doc(docs_service, file_id)
+        except Exception as e:
+            _warn(f"tab attribution unavailable: {getattr(e, 'reason', e)}")
+            return (before_comments, None, None,
+                    "document_tabs_unavailable", [], None)
+
+        records, export_problem = [], None
+        try:
+            docx_bytes = drive_service.files().export(
+                fileId=file_id,
+                mimeType="application/vnd.openxmlformats-officedocument"
+                         ".wordprocessingml.document",
+            ).execute()
+            records, record_problems = _docx_comment_records(docx_bytes)
+            if record_problems:
+                export_problem = "export_comments_unreadable"
+                _warn("anchor export status unavailable: "
+                      f"{record_problems[0]}")
+            elif any(
+                    not isinstance(record.get("author"), str)
+                    or not record["author"].strip()
+                    or _rfc3339_epoch(record.get("date_sec")) is None
+                    for record in records):
+                # An opaque record can be the missing target.  Ignoring it
+                # would let another, later record turn uncertainty into a
+                # false absence/ghost verdict.
+                export_problem = "export_comment_identity_unreadable"
+                _warn("anchor export status unavailable: a comments.xml "
+                      "entry has no readable author/date identity")
+        except Exception as e:
+            export_problem = "document_export_unavailable"
+            _warn("anchor export status unavailable: "
+                  f"{getattr(e, 'reason', e)}")
+
+        try:
+            after_comments = _list_comments_raw(drive_service, file_id)
+        except Exception as e:
+            _warn("comment snapshot verification unavailable: "
+                  f"{getattr(e, 'reason', e)}")
+            return (before_comments, None, None,
+                    "comment_snapshot_unavailable", records,
+                    "comment_snapshot_unavailable")
+        try:
+            doc_after = _safe_get_doc(docs_service, file_id)
+        except Exception as e:
+            _warn(f"tab attribution unavailable: {getattr(e, 'reason', e)}")
+            return (after_comments, None, None,
+                    "document_tabs_unavailable", records,
+                    "document_tabs_unavailable")
+
+        before_revision = doc_before.get("revisionId")
+        after_revision = doc_after.get("revisionId")
+        comments_stable = (
+            _fingerprint_from_census(before_comments)
+            == _fingerprint_from_census(after_comments))
+        if before_revision and after_revision:
+            document_stable = before_revision == after_revision
+            revision_shape_problem = False
+        elif not before_revision and not after_revision:
+            # View-only Docs responses commonly omit revisionId.  Comparing
+            # the complete canonical resource still detects every body/tab
+            # change relevant to both #37 and #44 without inventing a
+            # revision or regressing all view-only reads to unknown.
+            document_stable = (
+                _docs_snapshot_fingerprint(doc_before)
+                == _docs_snapshot_fingerprint(doc_after))
+            revision_shape_problem = False
+        else:
+            document_stable = False
+            revision_shape_problem = True
+        if comments_stable and document_stable:
+            tabs, catalog_problem = _comment_tab_catalog(doc_after)
+            return (after_comments, tabs, catalog_problem, None, records,
+                    export_problem)
+
+        last_problem = (
+            "document_revision_unavailable" if revision_shape_problem
+            else "snapshot_changed_during_read")
+        before_comments = after_comments
+        if attempt == 0:
+            continue
+
+    _warn("comment attribution unavailable: the comments/Docs snapshot "
+          "did not stay stable during two read attempts")
+    return (before_comments, None, None, last_problem, records, last_problem)
+
+
 def list_comments(file_id, output=None):
-    """List comments on a Google Doc."""
+    """List comments and attach conservative, read-only tab attribution."""
     try:
         creds = get_creds()
         drive_service = get_drive_service(creds)
     except Exception as e:
         _error(f"auth failed: {e}")
 
-    comments = []
-    page_token = None
     try:
-        while True:
-            results = drive_service.comments().list(
-                fileId=file_id,
-                # createdTime and reply ids are not decoration: when the anchor
-                # accounting refuses on colliding keys it names threads by the
-                # second they were created in, and without these fields there
-                # is nowhere for a person to look that up (#16). Reply ids are
-                # what makes the surplus reply deletable (#18).
-                # author/me says whether the entry is the authorized account's
-                # own. Without it «ответь только на мои комментарии» is not
-                # expressible: the agent has to guess by display name, and a
-                # wrong guess means talking to the customer in their document
-                # instead of to the person who asked (живой случай 2026-08-09).
-                fields="nextPageToken,comments(id,content,"
-                       "author/displayName,author/me,"
-                       "createdTime,quotedFileContent,resolved,"
-                       "replies(id,content,author/displayName,author/me,"
-                       "createdTime))",
-                includeDeleted=False,
-                pageSize=100,
-                pageToken=page_token,
-            ).execute()
-            comments.extend(results.get("comments", []))
-            page_token = results.get("nextPageToken")
-            if not page_token:
-                break
+        raw_comments = _list_comments_raw(drive_service, file_id)
     except HttpError as e:
         _error(f"failed to fetch comments: {e.reason if hasattr(e, 'reason') else e}")
+
+    tabs, catalog_problem, read_problem = None, None, None
+    records, export_problem = [], None
+    if any(c.get("quotedFileContent") or c.get("anchor")
+           for c in raw_comments if not c.get("deleted")):
+        try:
+            docs_service = get_docs_service(creds)
+            (raw_comments, tabs, catalog_problem, read_problem, records,
+             export_problem) = _read_comment_evidence(
+                 drive_service, docs_service, file_id, raw_comments)
+        except Exception as e:
+            # Service construction can fail before the bounded reader gets a
+            # chance to turn the failure into per-thread uncertainty.
+            read_problem = "document_tabs_unavailable"
+            _warn(f"tab attribution unavailable: {getattr(e, 'reason', e)}")
+
+    universe = _key_owners_universe(raw_comments)
+    # Deleted entries are needed only to keep export identity collisions
+    # honest. Preserve the public `comments` view: no deleted threads/replies.
+    comments = []
+    for raw in raw_comments:
+        if raw.get("deleted"):
+            continue
+        comment = copy.deepcopy(raw)
+        comment["replies"] = [
+            reply for reply in (comment.get("replies") or [])
+            if not reply.get("deleted")
+        ]
+        comment.pop("deleted", None)
+        for reply in comment["replies"]:
+            # Accounting-only fields were not part of the public `comments`
+            # payload before this command started requesting deleted entries.
+            reply.pop("deleted", None)
+            # `action` is kept internally until anchor classification: a
+            # resolve/reopen entry is part of the export freshness floor.
+        comments.append(comment)
 
     # Drive omits a boolean holding its default value, so `resolved` is
     # present on one listing and gone from the next — measured live 2026-08-09,
@@ -1348,6 +1725,26 @@ def list_comments(file_id, output=None):
         if link:
             c["link"] = link
 
+    attribution_counts = {"exact": 0, "unknown": 0, "document": 0}
+    anchor_counts = {"record_present": 0, "ghost": 0, "unknown": 0,
+                     "not_applicable": 0}
+    for c in comments:
+        attribution = _comment_tab_attribution(
+            c, tabs=tabs, catalog_problem=catalog_problem,
+            read_problem=read_problem)
+        c.update(attribution)
+        attribution_counts[attribution["tab_attribution"]["status"]] += 1
+        anchor_export = _comment_anchor_export_status(
+            c, records=records, universe=universe, tabs=tabs,
+            file_id=file_id, export_problem=export_problem,
+            read_problem=read_problem)
+        c["anchor_export"] = anchor_export
+        anchor_counts[anchor_export["status"]] += 1
+        for reply in c.get("replies") or []:
+            # The Drive action is needed only for the internal freshness
+            # floor.  Keep the historical public comments schema unchanged.
+            reply.pop("action", None)
+
     summary = {"comments": len(comments),
                "unresolved": sum(1 for c in comments
                                  if not c.get("resolved")),
@@ -1355,7 +1752,13 @@ def list_comments(file_id, output=None):
                # checked against a number, not against a display name the
                # agent had to guess
                "mine": sum(1 for c in comments
-                           if (c.get("author") or {}).get("me"))}
+                           if (c.get("author") or {}).get("me")),
+               "tab_exact": attribution_counts["exact"],
+               "tab_unknown": attribution_counts["unknown"],
+               "document_level": attribution_counts["document"],
+               "anchor_record_present": anchor_counts["record_present"],
+               "anchor_ghost": anchor_counts["ghost"],
+               "anchor_unknown": anchor_counts["unknown"]}
     if unspecified:
         summary["authorship_unspecified"] = unspecified
     _emit_json(comments, output=output, summary=summary)
@@ -1402,6 +1805,40 @@ def _resolve_named_range(doc_tab, name):
     return sorted_ranges[0][0], sorted_ranges[-1][1]
 
 
+def _resolve_named_range_identity(doc_tab, name):
+    """Resolve a write-addressable named range with stable identity.
+
+    ``name`` is only a display lookup key: Google may return multiple named
+    range objects under it.  An index write must therefore have exactly one
+    object, one non-empty ``namedRangeId`` and one contiguous segment.  This
+    stricter resolver is deliberately separate from the legacy insert/sync
+    resolver, whose multi-segment behaviour is already part of its contract.
+    """
+    entry = (doc_tab.get("namedRanges") or {}).get(name)
+    objects = entry.get("namedRanges") if isinstance(entry, dict) else None
+    if not isinstance(objects, list) or len(objects) != 1:
+        _error(
+            f"named range {name!r} is not uniquely identifiable: expected "
+            "exactly one namedRange object; recreate the mark")
+    obj = objects[0]
+    identity = obj.get("namedRangeId") if isinstance(obj, dict) else None
+    ranges = obj.get("ranges") if isinstance(obj, dict) else None
+    if not isinstance(identity, str) or not identity:
+        _error(
+            f"named range {name!r} has no stable namedRangeId; recreate "
+            "the mark before an index replacement")
+    if not isinstance(ranges, list) or len(ranges) != 1:
+        _error(
+            f"named range {name!r} is fragmented or ambiguous; recreate "
+            "the mark before an index replacement")
+    rng = ranges[0]
+    start, end = (rng.get("startIndex"), rng.get("endIndex")) \
+        if isinstance(rng, dict) else (None, None)
+    if not isinstance(start, int) or not isinstance(end, int) or start >= end:
+        _error(f"named range {name!r} has a malformed segment")
+    return start, end, identity
+
+
 def _list_named_range_names(doc_tab):
     return sorted((doc_tab.get("namedRanges") or {}).keys())
 
@@ -1419,6 +1856,114 @@ def _list_named_range_names(doc_tab):
 # characters: Docs is known to strip it.
 _OP_TEXT_FORBIDDEN = re.compile("[\x00-\x08\x0c-\x1f\x7f-\x9f\ue000-\uf8ff]")
 
+_STYLE_BOOL_FIELDS = ("bold", "italic", "underline", "strikethrough")
+_STYLE_FIELDS = set(_STYLE_BOOL_FIELDS) | {"foreground_color", "background_color", "font_size_pt", "font_family"}
+_STYLE_HEX = re.compile(r"^#[0-9A-Fa-f]{6}$")
+
+
+def _normalize_style(op):
+    style = op.get("style")
+    if style is None:
+        # Accept the concise public shape too: style fields may be placed
+        # beside the target, while the canonical receipt remains normalized.
+        style = {key: op[key] for key in _STYLE_FIELDS if key in op}
+    if not isinstance(style, dict) or not style:
+        _error(f"style operation requires a non-empty 'style' object: {op}")
+    unknown = set(style) - _STYLE_FIELDS
+    if unknown:
+        _error(f"unknown style field(s): {sorted(unknown)}")
+    out, mask = {}, []
+    for field in _STYLE_BOOL_FIELDS:
+        if field in style:
+            if not isinstance(style[field], bool):
+                _error(f"{field} must be boolean: {op}")
+            out[field] = style[field]
+            mask.append(field)
+    for field in ("foreground_color", "background_color"):
+        if field in style:
+            value = style[field]
+            if not isinstance(value, str) or not _STYLE_HEX.fullmatch(value):
+                _error(f"{field} must be a strict #RRGGBB string: {op}")
+            key = "foregroundColor" if field == "foreground_color" else "backgroundColor"
+            out[key] = {"color": {"rgbColor": {
+                "red": int(value[1:3], 16) / 255,
+                "green": int(value[3:5], 16) / 255,
+                "blue": int(value[5:7], 16) / 255}}}
+            mask.append(key)
+    if "font_size_pt" in style:
+        value = style["font_size_pt"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            _error(f"font_size_pt must be a positive finite number: {op}")
+        out["fontSize"] = {"magnitude": value, "unit": "PT"}
+        mask.append("fontSize")
+    if "font_family" in style:
+        value = style["font_family"]
+        if not isinstance(value, str) or not value.strip():
+            _error(f"font_family must be a non-empty string: {op}")
+        out["weightedFontFamily"] = {"fontFamily": value}
+        mask.append("weightedFontFamily")
+    return out, ",".join(mask)
+
+
+def _resolve_style_op(op, doc_tab, tab_id):
+    allowed = {"op", "style", "quote", "range", "occurrence"} | _STYLE_FIELDS
+    unknown_top = set(op) - allowed
+    if unknown_top:
+        _error(f"unknown style operation field(s): {sorted(unknown_top)}")
+    if op.get("op") == "style_range" and "occurrence" in op:
+        _error("'occurrence' is not valid for style_range; address the named range directly")
+    style, fields = _normalize_style(op)
+    if "range" in op:
+        if op["op"] != "style_range":
+            _error(f"style_range requires 'range' target: {op}")
+        found = _resolve_named_range_identity(doc_tab, op["range"])
+        t_start, t_end, named_range_id = found
+        source = f"range={op['range']!r}"
+    elif "quote" in op:
+        if op["op"] != "style_quote":
+            _error(f"style_quote requires 'quote' target: {op}")
+        quote = op["quote"]
+        if not isinstance(quote, str) or not quote or "\x00" in quote:
+            _error(f"quote must be a non-empty string without NUL: {op}")
+        raw_occurrence = op.get("occurrence", 1)
+        if isinstance(raw_occurrence, bool) or not isinstance(raw_occurrence, int):
+            _error(f"occurrence must be a positive integer: {op}")
+        occurrence = raw_occurrence
+        total = _count_quote_occurrences(doc_tab, quote)
+        if total == 0:
+            _error(f"quote not found: {quote!r}")
+        if total > 1 and "occurrence" not in op:
+            _error(f"quote is non-unique ({total} matches): {quote!r}")
+        if occurrence < 1 or occurrence > total:
+            _error(f"occurrence {occurrence} out of range (only {total} matches): {quote!r}")
+        t_start, t_end = _find_quote_in_doctab(doc_tab, quote, occurrence=occurrence)
+        source = f"quote={quote!r} (#{occurrence}/{total})"
+        named_range_id = None
+    else:
+        _error(f"style op must have 'range' or 'quote': {op}")
+    return {"op": op["op"], "start": t_start, "end": t_end, "kind": "style",
+            "affect_start": t_start, "affect_end": t_end, "source": source,
+            "tab_id": tab_id, "text_style": style, "fields": fields,
+            "named_range_id": named_range_id}
+
+
+def _style_request(r):
+    return {"updateTextStyle": {"range": {"startIndex": r["start"], "endIndex": r["end"], "tabId": r["tab_id"]}, "textStyle": r["text_style"], "fields": r["fields"]}}
+
+
+def _utf16_boundary(text, units):
+    """Whether a UTF-16 offset lands between complete Python code points."""
+    pos = 0
+    if units == 0:
+        return True
+    for ch in text:
+        pos += 2 if ord(ch) > 0xFFFF else 1
+        if pos == units:
+            return True
+        if pos > units:
+            return False
+    return False
+
 
 def _resolve_op(op, doc_tab, tab_id):
     """Resolve one op dict to an internal record with absolute indices.
@@ -1426,6 +1971,9 @@ def _resolve_op(op, doc_tab, tab_id):
     Op shapes supported:
       {"op": "replace_range",   "range": "<name>", "text": "..."}
       {"op": "replace_quote",   "quote": "...", "with": "...", "occurrence": N?}
+      {"op": "replace_around_anchor", "comment_id": "...", "quote": "...",
+       "with": "...", "before_utf16": N, "after_utf16": N,
+       "anchor": {"text": "...", "start_utf16": N}}
       {"op": "insert_before_range", "range": "<name>", "text": "..."}
       {"op": "insert_after_range",  "range": "<name>", "text": "..."}
       {"op": "insert_before_quote", "quote": "...", "text": "...", "occurrence": N?}
@@ -1438,6 +1986,84 @@ def _resolve_op(op, doc_tab, tab_id):
     kind_name = op.get("op")
     if not kind_name:
         _error(f"op missing 'op' field: {op}")
+
+    # A thread address is deliberately not resolved from the API's stale
+    # quotedFileContent.  The exact DOCX marker is resolved only after the
+    # freshness canary in ``_apply_op_anchor_safe``.  Returning a coordinate-
+    # free record here lets patch keep its per-operation receipt/partial
+    # application contract without allowing the initial snapshot to invent a
+    # range.
+    if kind_name in ("replace_anchor", "replace_around_anchor"):
+        allowed = {"op", "comment_id", "with"}
+        if kind_name == "replace_around_anchor":
+            allowed |= {"quote", "anchor", "before_utf16", "after_utf16"}
+        unknown = set(op) - allowed
+        if unknown:
+            _error(f"unknown {kind_name} field(s): {sorted(unknown)}")
+        comment_id = op.get("comment_id")
+        if (not isinstance(comment_id, str) or not comment_id.strip()
+                or "\x00" in comment_id):
+            _error(f"{kind_name} comment_id must be a non-empty string")
+        text = op.get("with")
+        if not isinstance(text, str):
+            _error(f"{kind_name} requires string field 'with'")
+        if not text:
+            _error(f"{kind_name} requires a non-empty replacement in 'with'")
+        if kind_name == "replace_around_anchor":
+            bad = _OP_TEXT_FORBIDDEN.search(text)
+            if "\n" in text or bad:
+                _error("replace_around_anchor 'with' must stay in one "
+                       "paragraph and contain no lossy control characters")
+            quote = op.get("quote")
+            if (not isinstance(quote, str) or not quote or "\x00" in quote
+                    or "\n" in quote):
+                _error("replace_around_anchor requires a non-empty one-"
+                       "paragraph string field 'quote'")
+            if ("before_utf16" not in op or "after_utf16" not in op):
+                _error("replace_around_anchor requires before_utf16 and "
+                       "after_utf16 extents")
+            before = op.get("before_utf16")
+            after = op.get("after_utf16")
+            if any(isinstance(value, bool) or not isinstance(value, int)
+                   or value < 0 for value in (before, after)):
+                _error("replace_around_anchor extents must be non-negative "
+                       "UTF-16 integers")
+            if before == 0 and after == 0:
+                _error("replace_around_anchor must strictly contain the "
+                       "anchor (one extent must be positive)")
+            anchor = op.get("anchor")
+            if not isinstance(anchor, dict) or set(anchor) != {
+                    "text", "start_utf16"}:
+                _error("replace_around_anchor requires anchor object with "
+                       "exactly 'text' and 'start_utf16'")
+            anchor_text = anchor.get("text")
+            offset = anchor.get("start_utf16")
+            if (not isinstance(anchor_text, str) or not anchor_text
+                    or "\x00" in anchor_text or "\n" in anchor_text):
+                _error("replace_around_anchor anchor.text must be a non-empty "
+                       "one-paragraph string")
+            if (isinstance(offset, bool) or not isinstance(offset, int)
+                    or offset < 0):
+                _error("replace_around_anchor anchor.start_utf16 must be a "
+                       "non-negative integer")
+            anchor_end = offset + _utf16_len(anchor_text)
+            if (not _utf16_boundary(text, offset)
+                    or not _utf16_boundary(text, anchor_end)
+                    or anchor_end > _utf16_len(text)
+                    or _slice_utf16(text, offset, anchor_end) != anchor_text):
+                _error("replace_around_anchor anchor does not select the "
+                       "declared anchor text in 'with'")
+        return {"op": kind_name, "start": None, "end": None,
+                "text": text, "kind": "replace_anchor",
+                "affect_start": None, "affect_end": None,
+                "source": f"comment_id={comment_id!r}",
+                "comment_id": comment_id, "tab_id": tab_id,
+                **({"quote": quote, "anchor": anchor,
+                    "before_utf16": before, "after_utf16": after}
+                   if kind_name == "replace_around_anchor" else {})}
+
+    if kind_name in ("style_quote", "style_range"):
+        return _resolve_style_op(op, doc_tab, tab_id)
 
     new_text = op.get("text") if "text" in op else op.get("with")
     if isinstance(new_text, str):
@@ -1454,7 +2080,13 @@ def _resolve_op(op, doc_tab, tab_id):
 
     # Resolve target
     if "range" in op:
-        found = _resolve_named_range(doc_tab, op["range"])
+        if kind_name == "replace_range":
+            found = _resolve_named_range_identity(doc_tab, op["range"])
+            named_range_id = found[2]
+            found = found[:2]
+        else:
+            found = _resolve_named_range(doc_tab, op["range"])
+            named_range_id = None
         if not found:
             available = _list_named_range_names(doc_tab)
             _error(
@@ -1467,7 +2099,12 @@ def _resolve_op(op, doc_tab, tab_id):
         quote = op["quote"]
         if "\x00" in quote:
             _error(f"quote must not contain NUL characters: {op}")
-        occurrence = int(op.get("occurrence", 1))
+        raw_occurrence = op.get("occurrence", 1)
+        if (isinstance(raw_occurrence, bool)
+                or not isinstance(raw_occurrence, int)
+                or raw_occurrence < 1):
+            _error("occurrence must be a positive integer")
+        occurrence = raw_occurrence
         total = _count_quote_occurrences(doc_tab, quote)
         if total == 0:
             _error(f"quote not found: {quote!r}")
@@ -1514,6 +2151,7 @@ def _resolve_op(op, doc_tab, tab_id):
             "affect_end": t_end,
             "source": source,
             "tab_id": tab_id,
+            "named_range_id": (named_range_id if "range" in op else None),
         }
     elif kind_name in ("insert_before_range", "insert_before_quote"):
         text = op.get("text", "")
@@ -1726,7 +2364,7 @@ def _parse_docx_anchor_spans(docx_bytes):
     """Parse word/document.xml and extract comment anchor spans.
 
     Returns (spans, problems, census):
-      spans: [{"docx_id", "para_index", "para_text", "start_off",
+              spans: [{"docx_id", "para_index", "top", "para_text", "start_off",
                "end_para_index", "end_para_text", "end_off", "anchor_text",
                "has_objects", "path", "end_path", "docx_lattice"}] — offsets
               are UTF-16 units within their own paragraph's text. The two
@@ -3141,7 +3779,11 @@ def _map_anchors_to_doc(doc_tab, spans):
                     f"{_visible_controls(ptext)[:50]!r}")
                 continue
             ambiguous.append({
-                "docx_id": s["docx_id"], "para_text": ptext,
+                "docx_id": s["docx_id"], "para_index": s["para_index"],
+                "end_para_index": s.get("end_para_index", s["para_index"]),
+                "top": s.get("top"),
+                "end_top": s.get("end_top", s.get("top")),
+                "para_text": ptext,
                 "start_off": s["start_off"], "end_off": s["end_off"],
                 "candidates": exact,
             })
@@ -3303,7 +3945,8 @@ def _rfc3339_epoch(ts):
     return parsed.timestamp()
 
 
-def _ghost_verdict(c, records, doc_tab, file_id=None, other_tabs=()):
+def _ghost_verdict(c, records, doc_tab, file_id=None, other_tabs=(),
+                   freshness_floor=None):
     """Is this witness-less thread provably a ghost? None when it is not.
 
     A thread the API calls live whose records are absent from the export is
@@ -3341,7 +3984,8 @@ def _ghost_verdict(c, records, doc_tab, file_id=None, other_tabs=()):
     """
     if doc_tab is None:
         return None  # nothing to check sign 2 against — fail closed
-    created = _rfc3339_epoch(c.get("createdTime"))
+    created = (freshness_floor if freshness_floor is not None
+               else _rfc3339_epoch(c.get("createdTime")))
     if created is None:
         return None
     later = []
@@ -3874,8 +4518,13 @@ def _anchor_map_remedy(shown):
                 "комментарий оставлен не через интерфейс Google Docs, он к "
                 "тексту не привязан вовсе — тогда его можно удалить, и он "
                 "перестанет мешать.")
-    return ("Разрулите комментарии-призраки в UI (удалить/переоткрыть тред) "
-            "или правьте документ в UI.")
+    return ("Если отказ вызван лишним вашим обычным ответом, возьмите точные "
+            "идентификаторы из `skrepka comments` и удалите только этот ответ: "
+            "`skrepka unreply <doc_id> <comment_id> <reply_id>`. Команда "
+            "откажет для чужого, удалённого или служебного ответа. Иначе "
+            "разберите неоднозначные комментарии или комментарии-призраки в "
+            "интерфейсе Google Docs либо правьте документ там; не закрывайте "
+            "тред ради разблокировки.")
 
 
 def _fence_off_ambiguous(ambiguous, attribution=None, file_id=None):
@@ -3980,7 +4629,7 @@ def _attribute_records_to_threads(anchored, records, universe):
     return out
 
 
-def _named_range_intervals(doc_tab):
+def _named_range_intervals(doc_tab, *, with_identity=False):
     """All named-range segments as protected intervals [(start, end, name)].
 
     Named ranges are the machine-owned anchoring mechanism of `mark`/patch
@@ -4013,7 +4662,10 @@ def _named_range_intervals(doc_tab):
                         f"named range {name!r} has a malformed segment "
                         f"({s!r}..{e!r}) — refusing structural edits "
                         f"(fail closed); release the mark or edit in the UI")
-                out.append((s, e, f"named range {name!r}"))
+                label = f"named range {name!r}"
+                identity = nr.get("namedRangeId") if isinstance(nr, dict) else None
+                out.append((s, e, label, identity) if with_identity
+                            else (s, e, label))
                 segments += 1
         if not segments:
             _error(
@@ -4160,7 +4812,8 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
     """
     # a named range reaching the insertion point could be extended by the
     # canary insert (uncharacterized) — refuse before mutating
-    for ps, pe, label in named_intervals:
+    for interval in named_intervals:
+        ps, pe, label = interval[:3]
         if pe >= body_end - 1:
             _error(
                 f"{label} reaches the end of the document — the sync "
@@ -4273,6 +4926,8 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
             other_tabs=[dt for t, _title, dt in tabs_now if t != tid])
         mapped_spans = spans
         foreign_ids = set()
+        segment_first = 0
+        segment_last = None
         if len(tabs_now) > 1:
             first, last, why = _prove_target_segment(
                 census["outline"], tabs_now, tid, canary_text=canary_text)
@@ -4293,6 +4948,7 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
                 census["docx_lattice"])
             if why:
                 _abort(why)
+            segment_first, segment_last = first, last
         anchors, map_problems, ambiguous = _map_anchors_to_doc(
             doc_tab, mapped_spans)
         attribution = _attribute_records_to_threads(anchored, records,
@@ -4328,6 +4984,29 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
         # text still stands is fenced, in case it is alive and merely missing
         # (#34).
         ghost_blocked = _fence_off_ghosts(metrics.get("ghosts") or ())
+        # Keep provenance alongside merged labels: «и ещё...» is not an
+        # ownership proof when a ghost/table fence shares the same range.
+        blocked_sources = [
+            {"start": s, "end": e, "source": "scope", "owners": set()}
+            for s, e, _label in blocked
+        ]
+        blocked_sources.extend(
+            {"start": s, "end": e, "source": "table", "owners": set()}
+            for s, e, _label in table_blocked)
+        for descriptor in ambiguous:
+            owner = attribution.get(descriptor.get("docx_id"))
+            for s, e in _ambiguous_candidate_ranges(descriptor):
+                blocked_sources.append({
+                    "start": s, "end": e, "source": "ambiguous",
+                    "owners": {owner} if owner else set(),
+                    "docx_id": descriptor.get("docx_id"),
+                })
+        for ghost in metrics.get("ghosts") or ():
+            for s, e in ghost.get("fenced") or ():
+                blocked_sources.append({
+                    "start": s, "end": e, "source": "ghost",
+                    "owners": {ghost.get("id")} if ghost.get("id") else set(),
+                })
         # One interval per range. The same cell can be fenced twice — the
         # parser and the accounting report the same hidden marker separately —
         # and a duplicate costs a second walk in `_blocked_hits` for every
@@ -4376,8 +5055,15 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
             "правит таблицу только целиком, поэтому такая правка отклонена; "
             "точечную правку ячейки делает `patch`"))
             for ts, te, _label in _table_intervals(doc_tab)]
-    return ({"anchors": anchors, "fp1": fp1, "canary": canary,
+    return ({"anchors": anchors, "ambiguous": ambiguous,
+             # Internal mapping witness: unlike ``para_index`` this outline
+             # index counts only top-level body elements. Nested table
+             # paragraphs therefore cannot shift a duplicate's ordinal.
+             "docx_outline": census["outline"],
+             "segment_first": segment_first, "segment_last": segment_last,
+             "fp1": fp1, "canary": canary,
              "r1": canary["r1"], "metrics": metrics, "blocked": blocked,
+             "blocked_sources": blocked_sources,
              "attribution": attribution, "cell_anchor_tables": cell_tables,
              "ghosts": metrics.get("ghosts") or []}, None)
 
@@ -4513,15 +5199,19 @@ def _ops_overlap_conflicts(indexed):
     conflicts = {}
     order = sorted(indexed, key=lambda i: (indexed[i]["affect_start"],
                                            indexed[i]["affect_end"]))
-    for pos in range(len(order) - 1):
-        i, j = order[pos], order[pos + 1]
-        a, b = indexed[i], indexed[j]
-        if _ranges_overlap(a["affect_start"], a["affect_end"],
-                           b["affect_start"], b["affect_end"]):
-            why = (f"ops overlap: {a['source']} and {b['source']} — "
-                   f"split into separate patches")
-            conflicts[i] = why
-            conflicts[j] = why
+    # Do not compare only adjacent sorted ranges: a wide edit can overlap
+    # several later edits while the first adjacent pair happens not to.
+    # Bounded all-pairs is intentional for this MVP; the ops file is already
+    # a small user-supplied batch and correctness beats an incomplete sweep.
+    for pos, i in enumerate(order):
+        for j in order[pos + 1:]:
+            a, b = indexed[i], indexed[j]
+            if _ranges_overlap(a["affect_start"], a["affect_end"],
+                               b["affect_start"], b["affect_end"]):
+                why = (f"ops overlap: {a['source']} and {b['source']} — "
+                       f"split into separate patches")
+                conflicts[i] = why
+                conflicts[j] = why
     return conflicts
 
 
@@ -4539,6 +5229,8 @@ def _op_source_label(op, resolved=None):
             return f"range={op['range']!r}"
         if "quote" in op:
             return f"quote={op['quote']!r}"
+        if op.get("op") == "replace_anchor":
+            return f"comment_id={op.get('comment_id')!r}"
     return json.dumps(op, ensure_ascii=False)[:80]
 
 
@@ -4557,6 +5249,148 @@ def _common_affixes(a, b):
     while s < n - p and a[len(a) - 1 - s] == b[len(b) - 1 - s]:
         s += 1
     return p, s
+
+
+_DIAGNOSTIC_QUOTE_LIMIT = 64
+_DIAGNOSTIC_POSITION_LIMIT = 8
+
+
+def _diagnostic_quote(value, limit=_DIAGNOSTIC_QUOTE_LIMIT):
+    """A short, human-readable witness safe for refusal output.
+
+    Refusals are stdout API, not a document dump.  Keep control characters
+    visible (especially soft/page breaks) and cap both the value and the
+    number of values a caller can include.  The hash in structured evidence is
+    available when an operator needs to distinguish two truncated witnesses.
+    """
+    if value is None:
+        return None
+    value = str(value)
+    shown = []
+    controls = {
+        "\t": "␉", "\n": "␊", "\r": "␍", "\v": "␋", "\f": "␌",
+    }
+    for ch in value[:limit]:
+        if ch in controls:
+            shown.append(controls[ch])
+        elif ord(ch) < 0x20 or 0x7f <= ord(ch) <= 0x9f:
+            shown.append(f"\\u{ord(ch):04x}")
+        else:
+            shown.append(ch)
+    result = "".join(shown)
+    if len(value) > limit:
+        result += "…"
+    return result
+
+
+def _c1_recovery_advice(why, *, comment_id=None, operation=None):
+    """Select only recovery routes applicable to this C1 refusal.
+
+    A generic C1 refusal is not enough evidence for ``replace_around_anchor``:
+    that operation needs caller-supplied outer extents and a new anchor.  Nor
+    can an API anchor rewrite repair a cross-paragraph, TOC, named-range,
+    control-character or grapheme precondition.  Keep these routes explicit so
+    an agent cannot copy a command from a refusal into an inapplicable case.
+    """
+    if operation == "replace_around_anchor" and not any(
+            marker in why for marker in (
+                "несколько абзацев", "новом тексте есть", "оглавлении",
+                "машинную пометку", "ещё один комментарий",
+                "Фрагмент кончается")):
+        return ["replace_around_anchor", "ui"], (
+            "Используйте `replace_around_anchor` только с exact outer quote, "
+            "before/after extents и явным новым anchor; иначе правьте в UI."
+        )
+    if "несколько абзацев" in why:
+        return ["separate_paragraph_edits", "ui"], (
+            "Правьте абзацы по отдельности; API anchor rewrite здесь не "
+            "применим."
+        )
+    if "новом тексте есть" in why:
+        return ["split_operations", "ui"], (
+            "Разбейте текст на отдельные операции или исправьте управляющий "
+            "символ; anchor rewrite здесь не применим."
+        )
+    if "оглавлении" in why:
+        return ["ui"], (
+            "Уточните цитату или правьте этот фрагмент в интерфейсе; "
+            "anchor rewrite здесь не обходит TOC gate."
+        )
+    if "машинную пометку" in why:
+        return ["release_named_range", "ui"], (
+            "Снимите named range или правьте фрагмент в интерфейсе; "
+            "anchor rewrite не может затронуть машинную пометку."
+        )
+    if "ещё один комментарий" in why:
+        return ["separate_surrounding_edits", "ui"], (
+            "Разделите соседние правки так, чтобы не задеть другой комментарий, "
+            "либо правьте фрагмент в интерфейсе."
+        )
+    if "Фрагмент кончается" in why:
+        return ["move_boundary", "ui"], (
+            "Сдвиньте границу выделения на один символ или правьте фрагмент "
+            "в интерфейсе."
+        )
+
+    paths = ["separate_surrounding_edits", "ui"]
+    advice = (
+        "Оставьте окружение якоря дословно неизменным и вынесите правки "
+        "соседних слов в отдельные операции; либо правьте фрагмент в "
+        "интерфейсе Google Docs."
+    )
+    if comment_id:
+        paths.insert(1, "replace_anchor")
+        advice += (
+            f" Для замены самого якоря используйте `replace_anchor` с "
+            f"точным comment_id {comment_id!r}."
+        )
+    # This branch is currently reached only by the ordinary replace path.  If
+    # a future caller supplies the explicit around-anchor schema, advertise it
+    # only there, where quote/extents/new-anchor are actually present.
+    if operation == "replace_around_anchor":
+        paths.insert(1, "replace_around_anchor")
+    return paths, advice
+
+
+def _c1_rewrite_details(search_text, new_text, start, end, anchor_spans,
+                        narrowed=None, *, recovery_paths=None,
+                        recovery=None):
+    """Bounded evidence for a C1 full-anchor refusal.
+
+    The common-affix range is an *attempted* narrowing, not a claim that it
+    passed all uniqueness/style/fence gates.  ``narrowed_range`` is populated
+    only when the real narrowing routine returned a writable range.
+    """
+    prefix, suffix = _common_affixes(search_text or "", new_text or "")
+    prefix_text = (search_text or "")[:prefix]
+    suffix_text = (search_text or "")[len(search_text or "") - suffix:] \
+        if suffix else ""
+    affix_start = start + _utf16_len(prefix_text)
+    affix_end = end - _utf16_len(suffix_text)
+    if affix_end < affix_start:
+        affix_start, affix_end = start, end
+    spans = [
+        [int(s), int(e)]
+        for s, e, _text, _docx_id in (anchor_spans or [])
+    ][: _DIAGNOSTIC_POSITION_LIMIT]
+    details = {
+        "anchor_ranges": spans,
+        "anchor_range": spans[0] if spans else None,
+        "edit_range": [int(start), int(end)],
+        "attempted_edit_range": [int(start), int(end)],
+        "narrowed_range": ([int(narrowed[2]), int(narrowed[3])]
+                           if narrowed else None),
+        "common_affix_candidate_range": [int(affix_start), int(affix_end)],
+        "common_prefix_utf16": _utf16_len(prefix_text),
+        "common_suffix_utf16": _utf16_len(suffix_text),
+        "common_prefix": _diagnostic_quote(prefix_text),
+        "common_suffix": _diagnostic_quote(suffix_text),
+        "replacement_hash": hashlib.sha256(
+            (new_text or "").encode("utf-8")).hexdigest(),
+        "recovery_paths": recovery_paths or ["ui"],
+        "recovery": recovery or "edit this fragment in the Google Docs UI",
+    }
+    return details
 
 
 def _points_for_units(text, units):
@@ -4620,6 +5454,8 @@ def _op_pure_insertion(op, doc_tab, r):
     whose new text merely extends the old removes nothing, so every rule that
     exists to protect text from removal has no business with it.
     """
+    if r.get("kind") == "replace_anchor":
+        return None
     current = _op_current_text(op, doc_tab, r)
     if not current:
         return None
@@ -4634,6 +5470,12 @@ def _op_is_noop(op, doc_tab, r):
     the canary, the anchor gates. Nothing about the document changes, so
     nothing about the document should be written (found in review).
     """
+    if r.get("kind") == "replace_anchor":
+        # The current text is intentionally unknown until the fresh DOCX
+        # marker has been mapped.  Treating it as a no-op from quote text
+        # would reintroduce the stale-anchor authority this operation exists
+        # to remove.
+        return False
     current = _op_current_text(op, doc_tab, r)
     return current is not None and current == r["text"]
 
@@ -4859,12 +5701,6 @@ def _rewrite_anchor_requests(doc_tab, search_text, new_text, start, end,
     # not its words, and that is exactly what happens when a person edits the
     # same text by hand. Everything else in the batch is `replaceAllText`,
     # which is measured not to hurt closed threads even at full coverage.
-    if any("tableOfContents" in el for el in
-           (doc_tab.get("body", {}) or {}).get("content", [])):
-        # The text walkers do not read a table of contents, so the local
-        # uniqueness count would not see a match hiding there while
-        # replaceAllText may well rewrite it (#23).
-        return None
     for ns, ne, _label in named_intervals:
         if _ranges_overlap(start, end, ns, ne):
             return None  # the deletion would cut a machine-owned mark
@@ -4937,7 +5773,8 @@ def _rewrite_anchor_requests(doc_tab, search_text, new_text, start, end,
         return None
     if projected.find(needle) != at:
         return None
-    if _count_text_outside_body(doc_tab, needle):
+    if (_count_text_outside_body(doc_tab, needle)
+            or _count_text_in_table_of_contents(doc_tab, needle)):
         return None
 
     requests = [
@@ -4988,11 +5825,16 @@ def _why_no_rewrite(doc_tab, search_text, new_text, start, end, anchors,
                 f"перезапись считает позиции по трём запросам, и новый абзац "
                 f"посреди неё ломает счёт. Мягкий перенос (shift+enter) в этом "
                 f"тексте разрешён — остальное разбейте на отдельные операции.")
-    if any("tableOfContents" in el for el in
-           (doc_tab.get("body", {}) or {}).get("content", [])):
-        return ("В документе есть оглавление, а его текст skrepka не читает — "
-                "поэтому переписать прокомментированный фрагмент целиком она "
-                "здесь не берётся. Правьте этот фрагмент в интерфейсе.")
+    projected_needle = (search_text[:-1] + new_text
+                        if len(search_text) >= 2 and new_text else "")
+    if (_count_text_in_table_of_contents(doc_tab, search_text)
+            or _count_text_in_table_of_contents(doc_tab,
+                                                 projected_needle)):
+        return ("Тот же текст встречается в оглавлении. Не измерено, меняет "
+                "ли replaceAllText сгенерированный текст оглавления, поэтому "
+                "skrepka консервативно считает его ещё одним совпадением и "
+                "отказывает до записи. Уточните цитату или правьте фрагмент "
+                "в интерфейсе.")
     for ns, ne, label in named_intervals:
         if _ranges_overlap(start, end, ns, ne):
             return (f"На этом фрагменте стоит {label} — перезапись задела бы "
@@ -5017,8 +5859,10 @@ def _why_no_rewrite(doc_tab, search_text, new_text, start, end, anchors,
                 "Правьте фрагмент в интерфейсе или сдвиньте границу "
                 "выделения на один символ.")
     return ("Уцелеть должен ИСХОДНЫЙ символ якоря — повтор того же текста в "
-            "замене не помогает. Оставьте в замене часть исходного якорного "
-            "текста нетронутой или правьте этот фрагмент в интерфейсе.")
+            "замене не помогает. Оставьте окружение якоря дословно неизменным "
+            "и вынесите правки соседних слов в отдельные операции: тогда "
+            "сужение сможет сохранить часть якоря. Иначе правьте фрагмент в "
+            "интерфейсе Google Docs.")
 
 
 def _execute_anchor_rewrite(docs_service, file_id, tid, requests, revision_id,
@@ -5049,6 +5893,555 @@ def _execute_anchor_rewrite(docs_service, file_id, tid, requests, revision_id,
             f"выполняются в любом случае, поэтому документ изменён — "
             f"проверьте его состояние глазами, повторять вслепую нельзя",
             state="unknown")
+
+
+def _exact_anchor_rewrite_requests(search_text, new_text, start, end):
+    """Build a rewrite that is exact to one mapped anchor range.
+
+    ``replaceAllText`` alone cannot address a repeated anchor. Insert a
+    unique ordinary-text sentinel strictly inside the mapped selection and
+    include it in the match; only the selected occurrence can then match.
+    The sentinel and all semantic requests are in one atomic, revision-pinned
+    batch, so it is never observable as document content.
+    """
+    if not isinstance(search_text, str) or not search_text or not new_text:
+        return None
+    if "\n" in search_text or _REWRITE_FORBIDDEN.search(new_text):
+        return None
+    if len(search_text) < 2:
+        return None
+    tail_len = _utf16_len(search_text[-1])
+    sentinel = f"skrepka-anchor-sentinel-{uuid.uuid4().hex}"
+    needle = search_text[:-1] + sentinel
+    return [
+        {"insertText": {"location": {"index": end - tail_len},
+                        "text": sentinel}},
+        {"replaceAllText": {
+            "containsText": {"text": needle, "matchCase": True},
+            "replaceText": new_text}},
+        {"deleteContentRange": {"range": {
+            "startIndex": start + _utf16_len(new_text),
+            "endIndex": start + _utf16_len(new_text) + tail_len}}},
+    ]
+
+
+def _execute_exact_anchor_rewrite(docs_service, file_id, tid, requests,
+                                  revision_id, source,
+                                  extra_requests_before=None):
+    """Execute an exact mapped-anchor rewrite and require one replacement."""
+    body = {"requests": _scope_requests(
+        list(extra_requests_before or []) + list(requests), tid),
+        "writeControl": _write_control(revision_id)}
+    result = docs_service.documents().batchUpdate(
+        documentId=file_id, body=body).execute()
+    occ = next((rep.get("replaceAllText", {}).get("occurrencesChanged")
+                for rep in (result.get("replies") or [])
+                if "replaceAllText" in rep), None)
+    if occ != 1:
+        raise PatchOpError(
+            f"точная перезапись якоря сообщила {occ!r} совпадений вместо "
+            f"одного ({source}); документ изменён — проверьте его состояние, "
+            "повторять вслепую нельзя", state="unknown")
+
+
+def _top_level_marker_ordinal(snapshot, ambiguous):
+    """Return a duplicate ordinal from only the target tab's top-level body.
+
+    ``ambiguous['para_index']`` is intentionally not used: the DOCX parser's
+    flattened index also counts paragraphs inside nested table cells. The
+    segment outline is the same top-level element sequence used by the tab
+    boundary proof, so tables occupy one element regardless of cell count.
+    """
+    marker_top = ambiguous.get("top")
+    para_text = ambiguous.get("para_text")
+    outline = snapshot.get("docx_outline") or []
+    first = snapshot.get("segment_first", 0)
+    last = snapshot.get("segment_last")
+    if (not isinstance(marker_top, int) or not isinstance(para_text, str)
+            or not outline):
+        return -1
+    segment_start = first + 1 if last is not None else 0
+    segment_end = last if last is not None else len(outline) - 1
+    if (segment_start < 0 or segment_end >= len(outline)
+            or marker_top < segment_start or marker_top > segment_end):
+        return -1
+    # DOCX paragraph indexes are flattened through nested tables.  The API
+    # candidates, however, are an outline of readable top-level paragraphs.
+    # Match the marker's exact paragraph text before assigning an ordinal;
+    # titles, tables, and non-twin paragraphs must not shift the mapping.
+    matching = [
+        i for i in range(segment_start, segment_end + 1)
+        if (outline[i].get("kind") == "p"
+            and outline[i].get("text") == para_text)
+    ]
+    candidates = ambiguous.get("candidates") or ()
+    if len(matching) != len(candidates) or matching.count(marker_top) != 1:
+        return -1
+    ordinal = matching.index(marker_top)
+    return ordinal if ordinal < len(candidates) else -1
+
+
+def _utf16_partition(text, start, end):
+    """Partition ``text`` at exact UTF-16 boundaries, or return ``None``.
+
+    Docs indexes count UTF-16 code units while the public JSON payload is a
+    Python/JSON string.  In particular, an offset in the middle of an emoji
+    is not an address: accepting it would make the chosen fragment differ
+    from what the caller actually named.
+    """
+    if (not isinstance(start, int) or isinstance(start, bool)
+            or not isinstance(end, int) or isinstance(end, bool)
+            or start < 0 or end < start):
+        return None
+    total = _utf16_len(text)
+    if end > total:
+        return None
+    left = _slice_utf16(text, 0, start)
+    chosen = _slice_utf16(text, start, end)
+    right = _slice_utf16(text, end, total)
+    if (_utf16_len(left) != start or _utf16_len(chosen) != end - start
+            or _utf16_len(left + chosen + right) != total):
+        return None
+    return left, chosen, right
+
+
+def _replace_around_anchor_plan(doc_tab, op, anchor_start, anchor_end,
+                                anchors, blocked, attribution,
+                                named_intervals):
+    """Build the one-batch plan for ``replace_around_anchor``.
+
+    The mapped marker is the only authority for the old anchor.  The caller's
+    marker-relative extents and exact outer quote witness supply the wider
+    range, while ``anchor`` supplies an
+    exact UTF-16 location in the *new* text.  The anchor rewrite is emitted
+    first; suffix coordinates are adjusted by its length delta, then prefix
+    coordinates are still in the original space.  Thus every request is
+    deterministic in one revision-pinned batch.
+    """
+    quote = op["quote"]
+    new_outer = op["with"]
+    anchor_spec = op["anchor"]
+    old_anchor = _extract_exact_text_range(doc_tab, anchor_start, anchor_end)
+    if not old_anchor:
+        return None, "the fresh DOCX marker has empty or unreadable text"
+    before_units = op["before_utf16"]
+    after_units = op["after_utf16"]
+    outer_start = anchor_start - before_units
+    outer_end = anchor_end + after_units
+    if outer_start < 0 or outer_end <= outer_start:
+        return None, "outer extent falls outside the selected tab"
+    if before_units == 0 and after_units == 0:
+        return None, "outer extent must strictly contain the mapped anchor"
+    old_outer = _extract_exact_text_range(doc_tab, outer_start, outer_end)
+    if old_outer != quote or "\n" in old_outer or "\n" in new_outer:
+        return None, "outer replacement must stay within one paragraph"
+    bad = _OP_TEXT_FORBIDDEN.search(new_outer)
+    if bad:
+        return None, ("outer replacement contains a control character that "
+                      "Docs does not preserve")
+    rel_start = anchor_start - outer_start
+    rel_end = anchor_end - outer_start
+    old_parts = _utf16_partition(old_outer, rel_start, rel_end)
+    if old_parts is None or old_parts[1] != old_anchor:
+        return None, "fresh anchor boundaries are not exact UTF-16 boundaries"
+    new_parts = _utf16_partition(
+        new_outer, anchor_spec["start_utf16"],
+        anchor_spec["start_utf16"] + _utf16_len(anchor_spec["text"]))
+    if new_parts is None or new_parts[1] != anchor_spec["text"]:
+        return None, ("anchor.start_utf16 does not select exactly anchor.text "
+                      "in the replacement")
+    new_before, new_anchor, new_after = new_parts
+    if not new_anchor:
+        return None, "the chosen new anchor must not be empty"
+
+    # The proven anchor rewrite still needs an internal boundary even when
+    # the caller's payload happens to be textually unchanged.  Keep this
+    # refusal before the no-op shortcut: a one-codepoint marker is outside
+    # this operation's proven protocol, and must be handed to the UI rather
+    # than silently accepted as a special case.
+    if len(old_anchor) == 1:
+        return None, ("a one-codepoint old anchor has no proven safe internal "
+                      "rewrite boundary; edit it in the UI")
+
+    # A protected/ambiguous fence is authoritative unless the caller has
+    # structurally proved ownership and removed that exact interval first.
+    # This check deliberately precedes the no-op shortcut: an exact target
+    # fence owned by another thread must never be mistaken for the harmless
+    # same-thread case.
+    for bs, be, label in _blocked_hits(outer_start, outer_end, blocked):
+        return None, f"outer replacement intersects protected fence {label}"
+
+    # Suggestions remain a freshness/safety gate even for a semantic no-op.
+    # The deletion-only fences below do not: when the exact fresh marker,
+    # outer witness, and chosen current anchor all agree, no semantic write
+    # will be sent and there is nothing for those fences to protect.
+    for ss, se, label in _suggestion_intervals(doc_tab):
+        if _ranges_overlap(outer_start, outer_end, ss, se):
+            return None, f"outer replacement intersects suggestion ({label})"
+
+    no_op = quote == new_outer and new_anchor == old_anchor
+    if no_op:
+        # Equal text alone is insufficient: selecting a duplicate occurrence
+        # is an anchor move, which this operation must never silently turn
+        # into a no-op.  The relative offset must identify the fresh marker.
+        if anchor_spec["start_utf16"] != rel_start:
+            return None, ("no-op anchor offset does not match the fresh marker "
+                          "within the witnessed outer range")
+        return ([], {
+            "no_op": True,
+            "outer_start": outer_start, "outer_end": outer_end,
+            "anchor_start": anchor_start, "anchor_end": anchor_end,
+            "anchor_text_before_utf16": _utf16_len(old_anchor),
+            "anchor_text_after_utf16": _utf16_len(new_anchor),
+            "anchor_text_before_preview": old_anchor[:80],
+            "anchor_text_after_preview": new_anchor[:80],
+            "anchor_start_utf16": anchor_spec["start_utf16"],
+            "replacement_length_utf16": _utf16_len(new_outer),
+        }), None
+
+    # The outer range is destructive.  Nothing except this thread's exact
+    # anchor may be inside it; touching a neighbour, an ambiguous fence, a
+    # named range or a suggestion would make the split guessy.
+    for as_, ae, _text, aid in anchors:
+        if not _ranges_overlap(outer_start, outer_end, as_, ae):
+            continue
+        if (as_, ae) != (anchor_start, anchor_end) \
+                or attribution.get(aid) != op["comment_id"]:
+            return None, "outer replacement intersects another live comment anchor"
+    for ns, ne, label in named_intervals:
+        if _ranges_overlap(outer_start, outer_end, ns, ne):
+            return None, f"outer replacement intersects {label}"
+    style_problem = _style_refusal(
+        doc_tab, outer_start, outer_end,
+        f"comment_id={op['comment_id']!r}")
+    if style_problem:
+        return None, style_problem
+
+    rewritten = _rewrite_anchor_requests(
+        doc_tab, old_anchor, new_anchor, anchor_start, anchor_end,
+        anchors, attribution, named_intervals)
+    if not rewritten and not no_op:
+        return None, "the mapped anchor cannot be rewritten safely"
+    anchor_requests, _tail_len = rewritten
+    delta = _utf16_len(new_anchor) - _utf16_len(old_anchor)
+    # Requests are deliberately ordered around the proven rewrite path:
+    # anchor first, then right side (whose coordinates include delta), then
+    # left side (which is still in the original coordinate space).
+    requests = list(anchor_requests)
+    new_after_start = anchor_end + delta
+    new_after_end = outer_end + delta
+    if after_units:
+        requests.append({"deleteContentRange": {"range": {
+            "startIndex": new_after_start, "endIndex": new_after_end}}})
+        if new_after:
+            requests.append({"insertText": {
+                "location": {"index": new_after_start},
+                "text": new_after}})
+    if before_units:
+        requests.append({"deleteContentRange": {"range": {
+            "startIndex": outer_start, "endIndex": anchor_start}}})
+        if new_before:
+            requests.append({"insertText": {
+                "location": {"index": outer_start},
+                "text": new_before}})
+    return (requests, {
+        "outer_start": outer_start, "outer_end": outer_end,
+        "anchor_start": anchor_start, "anchor_end": anchor_end,
+        "anchor_text_before_utf16": _utf16_len(old_anchor),
+        "anchor_text_after_utf16": _utf16_len(new_anchor),
+        "anchor_text_before_preview": old_anchor[:80],
+        "anchor_text_after_preview": new_anchor[:80],
+        "anchor_start_utf16": anchor_spec["start_utf16"],
+        "replacement_length_utf16": _utf16_len(new_outer),
+    }), None
+
+
+def _dedupe_anchor_descriptors(candidates, attribution, comment_id):
+    """Drop byte-identical marker descriptors for one attributed thread."""
+    out, seen = [], set()
+    for candidate in candidates or ():
+        if attribution.get(candidate.get("docx_id")) != comment_id:
+            continue
+        key = (
+            candidate.get("para_text"), candidate.get("top"),
+            candidate.get("end_top"), candidate.get("start_off"),
+            candidate.get("end_off"),
+            tuple(candidate.get("candidates") or ()),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(candidate)
+    return out
+
+
+def _ambiguous_candidate_ranges(descriptor):
+    """Return structurally derived candidate ranges for one DOCX descriptor."""
+    out = []
+    for st, en in descriptor.get("candidates") or ():
+        cs = st + descriptor.get("start_off", 0)
+        ce = st + descriptor.get("end_off", 0)
+        if ce <= cs:
+            cs, ce = st, en
+        limit = en if ce == en else en - 1
+        if st <= cs < ce <= limit:
+            out.append((cs, ce))
+    return out
+
+
+def _apply_replace_anchor(docs_service, drive_service, file_id, op, tab_id,
+                          _attempt=0):
+    """Apply ``replace_anchor`` using exactly one fresh DOCX marker range."""
+    doc = _safe_get_doc(docs_service, file_id)
+    tid, doc_tab = _select_tab(doc, tab_id=tab_id)
+    # Re-validate deferred operations on the live snapshot. This is normally
+    # a no-op, but keeps malformed replace_anchor entries as bounded
+    # per-operation refusals instead of turning a missing key into unknown
+    # document state.
+    _resolve_op(op, doc_tab, tid)
+    comment_id = op["comment_id"]
+    new_text = op["with"]
+    _all, anchored, fp1, universe = _census_comments(drive_service, file_id)
+    matches = [c for c in anchored if c.get("id") == comment_id]
+    if len(matches) != 1:
+        _error(
+            f"replace_anchor requires exactly one accessible active anchored "
+            f"thread; comment_id {comment_id!r} matched {len(matches)}")
+    target_comment = matches[0]
+    if target_comment.get("resolved"):
+        _error(f"comment_id {comment_id!r} is resolved; replace_anchor refused")
+    named_intervals = _named_range_intervals(doc_tab)
+    body_content = (doc_tab.get("body", {}) or {}).get("content", [])
+    body_end = body_content[-1]["endIndex"] if body_content else 2
+    snap, retry_reason = _fresh_anchor_snapshot(
+        docs_service, drive_service, file_id, doc, doc_tab, anchored,
+        named_intervals, body_end, fp1=fp1, universe=universe, tid=tid)
+    if snap is None:
+        if _attempt < 2:
+            return _apply_replace_anchor(
+                docs_service, drive_service, file_id, op, tab_id,
+                _attempt=_attempt + 1)
+        _error(f"replace_anchor freshness preflight failed after 3 attempts: "
+               f"{retry_reason}")
+    canary = snap["canary"]
+
+    def refuse(message):
+        cleaned = _cleanup_canary(docs_service, file_id, canary)
+        if not cleaned:
+            message += (f" ВНИМАНИЕ: в конце документа осталась служебная "
+                        f"строка «{canary['text']}» — удалите её вручную "
+                        "(данные не потеряны).")
+        _error(message)
+
+    attribution = snap.get("attribution") or {}
+    target_anchors = [a for a in snap["anchors"]
+                      if attribution.get(a[3]) == comment_id]
+    distinct = sorted({(a[0], a[1]) for a in target_anchors})
+    # A root plus its replies can expose byte-identical marker descriptors.
+    # Their export-local ids do not make a second range; differing descriptors
+    # remain in the list and therefore fail closed below.
+    target_ambiguous = _dedupe_anchor_descriptors(
+        snap.get("ambiguous") or (), attribution, comment_id)
+    if not target_anchors and len(target_ambiguous) == 1:
+        # The ordinary patch mapper fences duplicate paragraphs because it
+        # must never guess. A thread-addressed operation has an additional
+        # witness: the exact marker's paragraph ordinal in the fresh DOCX.
+        # Convert that ordinal to the corresponding API paragraph candidate;
+        # if the two lattices cannot line up, refuse rather than choose one.
+        amb = target_ambiguous[0]
+        # ``para_index`` is a global flattened count and includes paragraphs
+        # nested in tables. It is not an ordinal in the target tab's body.
+        ordinal = _top_level_marker_ordinal(snap, amb)
+        candidates = amb.get("candidates") or []
+        if 0 <= ordinal < len(candidates):
+            base, para_end = candidates[ordinal]
+            start = base + amb["start_off"]
+            end = base + amb["end_off"]
+            distinct = [(start, end)]
+        else:
+            distinct = []
+    if len(distinct) != 1:
+        refuse(
+            f"comment_id {comment_id!r} has no single exact active DOCX "
+            f"anchor in tab {tid!r} ({len(distinct)} ranges); refusing "
+            "without guessing a range")
+    start, end = distinct[0]
+    blocked_intervals = snap.get("blocked") or []
+    # Keep the mapped ranges as the rewrite proof's witness set.  An
+    # ambiguous marker normally has no placed entry; once the structural
+    # ownership check below proves that every descriptor covering the
+    # selected range belongs to this requested thread, add exactly that own
+    # range back.  Foreign/mixed ownership never reaches this branch.
+    plan_anchors = list(snap["anchors"])
+    if target_ambiguous:
+        # The selected marker itself is no longer ambiguous only when every
+        # descriptor whose candidate fence covers it belongs to this thread.
+        # This is structural ownership, not parsing the human label (which
+        # may be coalesced as «и ещё...» for several threads).
+        owners = set()
+        covering_ranges = set()
+        for descriptor in snap.get("ambiguous") or ():
+            ranges = _ambiguous_candidate_ranges(descriptor)
+            if any(_ranges_overlap(start, end, cs, ce)
+                   for cs, ce in ranges):
+                covering_ranges.update(ranges)
+                owners.add(attribution.get(descriptor.get("docx_id")))
+        sources = snap.get("blocked_sources")
+        covering_sources = [
+            source for source in (sources or ())
+            if _ranges_overlap(start, end, source["start"], source["end"])
+        ]
+        # Only exact ambiguous descriptors owned by this thread may lift the
+        # selected equal-range fence. Ghost/table/scope sources remain hard
+        # fences even when _dedupe_blocked merged their human labels.
+        provenance_proves_target = (
+            bool(covering_sources)
+            and all(source.get("source") == "ambiguous"
+                    and source.get("owners") == {comment_id}
+                    for source in covering_sources))
+        # Synthetic pre-provenance snapshots retain their established seam;
+        # every real fresh snapshot carries structural source records above.
+        if sources is None:
+            provenance_proves_target = owners == {comment_id}
+        if provenance_proves_target:
+            blocked_intervals = [
+                interval for interval in blocked_intervals
+                if not (
+                    (interval[0], interval[1]) == (start, end)
+                    and (interval[0], interval[1]) in covering_ranges)]
+            if not any((a[0], a[1]) == (start, end)
+                       for a in plan_anchors):
+                own_descriptor = next(
+                    (descriptor for descriptor in snap.get("ambiguous") or ()
+                     if attribution.get(descriptor.get("docx_id"))
+                     == comment_id
+                     and (descriptor.get("docx_id") in
+                          {d.get("docx_id") for d in target_ambiguous})),
+                    None)
+                if own_descriptor is None:
+                    refuse("selected anchor ownership witness is missing; "
+                           "exact rewrite refused")
+                plan_anchors.append((
+                    start, end,
+                    _extract_exact_text_range(doc_tab, start, end) or "",
+                    own_descriptor["docx_id"],
+                ))
+    blocked = _blocked_hits(start, end, blocked_intervals)
+    if blocked and op["op"] != "replace_around_anchor":
+        bs, be, label = blocked[0]
+        refuse(
+            f"comment_id {comment_id!r} is inside a protected anchor fence "
+            f"[{bs}, {be}): {label}")
+    if op["op"] != "replace_around_anchor":
+        for as_, ae, _text, aid in snap["anchors"]:
+            if not _ranges_overlap(start, end, as_, ae):
+                continue
+            if attribution.get(aid) != comment_id:
+                refuse(
+                    f"comment_id {comment_id!r} overlaps another live comment "
+                    f"anchor [{as_}, {ae}); exact rewrite refused")
+        for ns, ne, label in named_intervals:
+            if _ranges_overlap(start, end, ns, ne):
+                refuse(f"comment_id {comment_id!r} overlaps {label}; exact "
+                       "anchor rewrite refused")
+    try:
+        _refuse_on_suggestion_range(doc_tab, start, end, op["comment_id"])
+    except PatchOpError as exc:
+        refuse(str(exc))
+    around_receipt = None
+    if op["op"] == "replace_around_anchor":
+        plan, reason = _replace_around_anchor_plan(
+            doc_tab, op, start, end, plan_anchors, blocked_intervals,
+            attribution, named_intervals)
+        if plan is None:
+            refuse(f"comment_id {comment_id!r}: {reason} (no write performed)")
+        requests, around_receipt = plan
+        if around_receipt.get("no_op"):
+            cleaned = _cleanup_canary(docs_service, file_id, canary)
+            if not cleaned:
+                _error(
+                    f"replace_around_anchor no-op could not clean canary "
+                    f"«{canary['text']}»; the semantic edit was not sent. "
+                    "Remove this literal canary manually and verify the "
+                    "document before retrying (canary cleanup state: "
+                    "unknown)")
+            around_receipt = dict(around_receipt)
+            around_receipt.pop("no_op", None)
+            return {"source": f"comment_id={comment_id!r}",
+                    "applied_as": "no-op", "tab_id": tid,
+                    "note": "outer text and chosen anchor are already exact",
+                    **around_receipt}
+    else:
+        search_text = _extract_exact_text_range(doc_tab, start, end)
+        if not search_text:
+            refuse(
+                f"comment_id {comment_id!r} has an empty or unreadable exact "
+                "DOCX anchor; refusing")
+        if new_text == search_text:
+            cleaned = _cleanup_canary(docs_service, file_id, canary)
+            if not cleaned:
+                _error("replace_anchor no-op could not clean its canary")
+            return {"source": op.get("comment_id"), "applied_as": "no-op",
+                    "note": "текст якоря уже такой — смысловой записи не было"}
+        if not new_text:
+            refuse(
+                f"comment_id {comment_id!r}: empty replacement would remove the "
+                "entire anchor and orphan its thread; no write performed")
+        style_problem = _style_refusal(doc_tab, start, end,
+                                       f"comment_id={comment_id!r}")
+        if style_problem:
+            refuse(style_problem)
+        requests = _exact_anchor_rewrite_requests(
+            search_text, new_text, start, end)
+        if not requests:
+            refuse(
+                f"comment_id {comment_id!r} cannot be rewritten safely as one "
+                "exact in-paragraph anchor range (no write performed)")
+    try:
+        if _comments_fingerprint(drive_service, file_id) != snap["fp1"]:
+            if not _cleanup_canary(docs_service, file_id, canary):
+                _error("comments changed during replace_anchor preflight and "
+                       "canary cleanup failed")
+            if _attempt < 2:
+                return _apply_replace_anchor(
+                    docs_service, drive_service, file_id, op, tab_id,
+                    _attempt=_attempt + 1)
+            _error("comments changed during replace_anchor preflight after "
+                   "3 attempts; retry later")
+        _execute_exact_anchor_rewrite(
+            docs_service, file_id, tid, requests, snap["r1"],
+            f"comment_id={comment_id!r}",
+            extra_requests_before=[_canary_delete_request(canary)])
+    except PatchOpError:
+        raise
+    except HttpError as exc:
+        reason = exc.reason if hasattr(exc, "reason") else str(exc)
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        if status is not None and status < 500:
+            cleaned = _cleanup_canary(docs_service, file_id, canary)
+            msg = f"replace_anchor batch rejected: {reason}"
+            if not cleaned:
+                msg += f"; canary remains: {canary['text']}"
+            raise PatchOpError(msg, state="not_applied")
+        raise PatchOpError(*_ambiguous_batch_outcome(
+            docs_service, file_id, canary,
+            f"replace_anchor batch failed: {reason}"))
+    except Exception as exc:
+        raise PatchOpError(*_ambiguous_batch_outcome(
+            docs_service, file_id, canary,
+            f"replace_anchor batch failed (transport): {exc}"))
+    result = {"source": f"comment_id={comment_id!r}",
+              "applied_as": ("around-anchor" if around_receipt
+                             else "exact-anchor"), "tab_id": tid,
+              "replacement_length_utf16": _utf16_len(new_text),
+              "replacement_preview": new_text[:80],
+              "note": "диапазон взят только из свежего DOCX marker после canary"}
+    if around_receipt:
+        result.update(around_receipt)
+        result["note"] = (
+            "outer quote split at exact fresh anchor boundaries; anchor "
+            "rewrite, suffix and prefix were one revision-pinned batch")
+    return result
 
 
 def _resolve_replace_target(op, doc_tab, r, check_style=True):
@@ -5082,8 +6475,17 @@ def _resolve_replace_target(op, doc_tab, r, check_style=True):
     total = _replace_all_match_count(doc_tab, search_text)
     if total != 1:
         outside = _count_text_outside_body(doc_tab, search_text)
-        where = (f" ({outside} of them in a header/footer/footnote, which "
-                 f"replaceAllText also rewrites)" if outside else "")
+        in_toc = _count_text_in_table_of_contents(doc_tab, search_text)
+        locations = []
+        if outside:
+            locations.append(
+                f"{outside} in a header/footer/footnote, which "
+                f"replaceAllText also rewrites")
+        if in_toc:
+            locations.append(
+                f"{in_toc} in a table of contents, conservatively counted "
+                f"because replaceAllText behaviour there is unmeasured")
+        where = f" ({'; '.join(locations)})" if locations else ""
         _error(
             f"replace target must be unique in tab for the anchor-safe "
             f"path, found {total} matches{where} ({r['source']}); provide a "
@@ -5131,6 +6533,28 @@ def _execute_replace_all(docs_service, file_id, tid, search_text, new_text,
         )
 
 
+def _execute_named_range_replace(docs_service, file_id, tid, start, end,
+                                 new_text, revision_id, canary):
+    """Replace one freshly resolved named range by pinned absolute indices.
+
+    The canary delete is first and atomic with the semantic edit.  Its own
+    paragraph sits after the R0 body, so deleting it restores the exact index
+    space in which ``start``/``end`` were resolved.
+    """
+    requests = [_canary_delete_request(canary)]
+    if start < end:
+        requests.append({"deleteContentRange": {"range": {
+            "startIndex": start, "endIndex": end}}})
+    if new_text:
+        requests.append({"insertText": {
+            "location": {"index": start}, "text": new_text}})
+    docs_service.documents().batchUpdate(
+        documentId=file_id,
+        body={"requests": _scope_requests(requests, tid),
+              "writeControl": _write_control(revision_id)},
+    ).execute()
+
+
 def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
                           warnings=None):
     """Apply ONE op on a commented doc.
@@ -5145,6 +6569,26 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
     shrinks to the surviving original characters.
     """
     kind_name = op.get("op", "")
+    if kind_name in ("replace_anchor", "replace_around_anchor"):
+        return _apply_replace_anchor(
+            docs_service, drive_service, file_id, op, tab_id)
+    if kind_name in ("style_quote", "style_range"):
+        doc = _safe_get_doc(docs_service, file_id)
+        tid, doc_tab = _select_tab(doc, tab_id=tab_id)
+        if kind_name == "style_quote" and "occurrence" in op:
+            _error(
+                "'occurrence' targeting is not supported on docs with anchored "
+                "comments; provide a unique quote",
+                reason="occurrence_not_supported_on_commented_doc",
+                details={"code": "commented_style_occurrence"})
+        r = _resolve_op(op, doc_tab, tid)
+        _refuse_on_suggestion_range(doc_tab, r["start"], r["end"], r["source"])
+        docs_service.documents().batchUpdate(
+            documentId=file_id,
+            body={"requests": _scope_requests([_style_request(r)], tid),
+                  "writeControl": _write_control(doc.get("revisionId"))},
+        ).execute()
+        return {"source": r["source"], "applied_as": "style"}
     if not kind_name.startswith("replace"):
         # ---- insert path ----
         doc = _safe_get_doc(docs_service, file_id)
@@ -5209,13 +6653,29 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
 
         _refuse_on_suggestion_range(doc_tab, r["start"], r["end"],
                                     r["source"])
-        search_text = _resolve_replace_target(op, doc_tab, r,
-                                              check_style=False)
+        direct_named = kind_name == "replace_range" and "range" in op
+        search_text = None
+        if not direct_named:
+            search_text = _resolve_replace_target(
+                op, doc_tab, r, check_style=False)
         body_content = (doc_tab.get("body", {}) or {}).get("content", [])
         body_end = body_content[-1]["endIndex"] if body_content else 2
-        named_intervals = _named_range_intervals(doc_tab)
+        named_intervals = _named_range_intervals(
+            doc_tab, with_identity=direct_named)
         _, anchored_now, fp1, universe = _census_comments(
             drive_service, file_id)
+
+        # Resolved anchored threads are deliberately absent from DOCX, so
+        # their coordinates cannot participate in the proof below.  That is
+        # harmless for replaceAllText (measured M13) and unsafe for the new
+        # deleteContentRange path: a closed thread anywhere in the target tab
+        # may still occupy the named range invisibly.
+        if direct_named and any(c.get("resolved") for c in anchored_now):
+            raise PatchOpError(
+                f"named-range index replace is blocked while resolved "
+                f"anchored comments have invisible coordinates "
+                f"({r['source']}); reopen/release them or edit in the UI",
+                state="not_applied")
 
         snap, retry_reason = _fresh_anchor_snapshot(
             docs_service, drive_service, file_id, doc, doc_tab,
@@ -5238,6 +6698,133 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
                         f"строка «{canary['text']}» — удалите её вручную "
                         f"(данные не потеряны).")
             return msg
+
+        if direct_named:
+            # The canary proves the export map and pins R1.  Re-read the full
+            # Docs snapshot at that SAME revision and resolve the named range
+            # again; the planning coordinates above are not authority for an
+            # index write after a network round trip.
+            try:
+                fresh_doc = _safe_get_doc(docs_service, file_id)
+                if fresh_doc.get("revisionId") != snap["r1"]:
+                    if not _cleanup_canary(
+                            docs_service, file_id, canary):
+                        raise PatchOpError(
+                            _canary_msg(
+                                "doc changed before named range could be "
+                                "re-resolved", False),
+                            state="not_applied")
+                    last_reason = "doc changed before named range re-resolve"
+                    continue
+                fresh_tid, fresh_tab = _select_tab(
+                    fresh_doc, tab_id=tab_id)
+                fresh_r = _resolve_op(op, fresh_tab, fresh_tid)
+                _refuse_on_suggestion_range(
+                    fresh_tab, fresh_r["start"], fresh_r["end"],
+                    fresh_r["source"])
+                fresh_named = _named_range_intervals(
+                    fresh_tab, with_identity=True)
+            except PatchOpError as exc:
+                cleaned = _cleanup_canary(docs_service, file_id, canary)
+                raise PatchOpError(
+                    _canary_msg(str(exc), cleaned), state="not_applied")
+            except Exception as exc:
+                cleaned = _cleanup_canary(docs_service, file_id, canary)
+                raise PatchOpError(_canary_msg(
+                    f"fresh named-range re-resolve failed: {exc!r}",
+                    cleaned), state="not_applied")
+
+            start_at, end_at = fresh_r["start"], fresh_r["end"]
+            if (fresh_r.get("named_range_id") != r.get("named_range_id")
+                    or (start_at, end_at) != (r["start"], r["end"])):
+                cleaned = _cleanup_canary(docs_service, file_id, canary)
+                raise PatchOpError(_canary_msg(
+                    "named range identity or range changed during fresh "
+                    "re-resolve; index replacement refused", cleaned),
+                    state="not_applied")
+            target_id = fresh_r["named_range_id"]
+            other_named = [
+                interval for interval in fresh_named
+                if interval[3] != target_id
+            ]
+            protected = (
+                list(snap["blocked"])
+                + list(snap.get("cell_anchor_tables") or [])
+                + other_named
+            )
+            anchor_hit = next((
+                anchor for anchor in snap["anchors"]
+                if _ranges_overlap(start_at, end_at, anchor[0], anchor[1])
+            ), None)
+            protected_hit = next((
+                interval for interval in protected
+                if _ranges_overlap(
+                    start_at, end_at, interval[0], interval[1])
+            ), None)
+            if anchor_hit is not None:
+                cleaned = _cleanup_canary(docs_service, file_id, canary)
+                raise PatchOpError(_canary_msg(
+                    f"named range overlaps live comment anchor (docx id "
+                    f"{anchor_hit[3]}, [{anchor_hit[0]}, {anchor_hit[1]})); "
+                    "index replacement refused",
+                    cleaned), state="not_applied")
+            if protected_hit is not None:
+                cleaned = _cleanup_canary(docs_service, file_id, canary)
+                raise PatchOpError(_canary_msg(
+                    f"named range overlaps {protected_hit[2]} "
+                    f"([{protected_hit[0]}, {protected_hit[1]})); index "
+                    "replacement refused",
+                    cleaned), state="not_applied")
+
+            try:
+                fp2 = _comments_fingerprint(drive_service, file_id)
+            except Exception as exc:
+                cleaned = _cleanup_canary(docs_service, file_id, canary)
+                raise PatchOpError(_canary_msg(
+                    f"W8 final census failed: "
+                    f"{exc.reason if hasattr(exc, 'reason') else exc}",
+                    cleaned), state="not_applied")
+            if fp2 != snap["fp1"]:
+                if not _cleanup_canary(docs_service, file_id, canary):
+                    raise PatchOpError(
+                        f"comments changed before named-range index replace; "
+                        f"ВНИМАНИЕ: в конце документа осталась служебная "
+                        f"строка «{canary['text']}» — удалите её вручную",
+                        state="not_applied")
+                last_reason = "comments changed during named range mapping"
+                continue
+            try:
+                _execute_named_range_replace(
+                    docs_service, file_id, fresh_tid, start_at, end_at,
+                    fresh_r["text"], snap["r1"], canary)
+            except HttpError as exc:
+                reason = exc.reason if hasattr(exc, "reason") else str(exc)
+                status = getattr(getattr(exc, "resp", None), "status", None)
+                if status is not None and status < 500:
+                    cleaned = _cleanup_canary(
+                        docs_service, file_id, canary)
+                    raise PatchOpError(_canary_msg(
+                        f"named-range index batch rejected: {reason}",
+                        cleaned), state="not_applied")
+                raise PatchOpError(*_ambiguous_batch_outcome(
+                    docs_service, file_id, canary,
+                    f"named-range index batch failed: {reason}"))
+            except Exception as exc:
+                raise PatchOpError(*_ambiguous_batch_outcome(
+                    docs_service, file_id, canary,
+                    f"named-range index batch failed (transport): {exc}"))
+            return {
+                "source": fresh_r["source"],
+                "applied_as": "named-range-index",
+                # These are the values used by the successful pinned batch,
+                # not the planning snapshot.  Keep them in the per-op receipt
+                # so a caller cannot mistake a stale tab/range or requested
+                # payload for what was actually authorized.
+                "tab_id": fresh_tid,
+                "final_text": fresh_r["text"],
+                "note": "named range re-resolved on the fresh pinned "
+                        "revision; duplicate text elsewhere was untouched",
+            }
 
         # What this operation would cost as written. Blocked ranges: an anchor
         # the accounting could not vouch for but WHOSE POSITION is known — any
@@ -5300,15 +6887,33 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
             # rewrite's own preconditions, and they need telling apart —
             # «оставьте часть исходного текста» is sound advice for exactly
             # one of them and misleading for the rest (found in review).
-            why = " " + _why_no_rewrite(
+            why_text = _why_no_rewrite(
                 doc_tab, search_text, r["text"], start_at, end_at,
                 snap["anchors"], attribution, named_intervals,
                 closed_present=any(c.get("resolved") for c in anchored_now))
+            recovery_paths, recovery = _c1_recovery_advice(
+                why_text, comment_id=cid, operation=op.get("op"))
+            c1_details = _c1_rewrite_details(
+                search_text, r["text"], start_at, end_at, spans, narrowed,
+                recovery_paths=recovery_paths, recovery=recovery)
+            evidence = (
+                f" Диагностика: якорь {c1_details['anchor_range']}, "
+                f"диапазон правки {c1_details['edit_range']}, "
+                f"попытка сужения {c1_details['common_affix_candidate_range']} "
+                f"(после проверок: {c1_details['narrowed_range'] or 'не прошла'}), "
+                f"общий префикс «{c1_details['common_prefix']}» "
+                f"({c1_details['common_prefix_utf16']} UTF-16), "
+                f"суффикс «{c1_details['common_suffix']}"
+                f"» ({c1_details['common_suffix_utf16']} UTF-16). "
+                f"Восстановление: {c1_details['recovery']}"
+            )
             _error(_canary_msg(
                 f"замена накрывает целиком последний якорь {who} "
-                f"(текст якоря «{atext[:60]}») — тред станет призраком (C1), "
+                f"(текст якоря «{_diagnostic_quote(atext, 60)}») — "
+                f"тред станет призраком (C1), "
                 f"и сузить её не получилось: меняется весь якорный текст."
-                f"{why} ({r['source']})", cleaned))
+                f"{evidence} {why_text} ({r['source']})", cleaned),
+                reason="c1_anchor_rewrite_refused", details=c1_details)
         try:
             fp2 = _comments_fingerprint(drive_service, file_id)
         except Exception as e:
@@ -5405,7 +7010,370 @@ def _ambiguous_batch_outcome(docs_service, file_id, canary, msg):
     return msg + " (doc unreadable — outcome unknown)", "unknown"
 
 
-def patch_doc(file_id, ops_path, tab_id=None):
+def _dry_run_select_tab(doc, tab_id=None):
+    """Select a tab for the read-only planner without calling ``_error``.
+
+    The normal selector is intentionally coupled to the writing CLI (it exits
+    on an invalid selection).  Dry-run needs a value that can become a
+    per-operation refusal while keeping the receipt machine-readable.
+    """
+    tabs = _collect_tabs(doc)
+    if tab_id is not None:
+        matches = [(tid, title, dt) for tid, title, dt in tabs
+                   if tid == tab_id]
+        if len(matches) > 1:
+            # A malformed document can repeat tab IDs.  Selecting the first
+            # one would make a dry-run claim a verdict for an unknowable
+            # index space, so fail closed with bounded identity evidence.
+            candidates = [
+                {"tab_id": tid, "title": title}
+                for tid, title, _dt in matches[:8]
+            ]
+            return None, None, {
+                "error": (f"tab id {tab_id!r} appears {len(matches)} times; "
+                           "explicit tab selection is ambiguous"),
+                "reason": "tab_selection",
+                "details": {
+                    "code": "duplicate_tab_id",
+                    "tab_id": tab_id,
+                    "count": len(matches),
+                    "candidates": candidates,
+                },
+            }
+        if len(matches) == 1:
+            tid, _title, dt = matches[0]
+            return tid, dt, None
+        available = ", ".join(
+            f"{tid}:{title!r}" for tid, title, _ in tabs if tid
+        ) or "(none)"
+        return None, None, (
+            f"tab not found: {tab_id}. Available tabs: {available}")
+    if len(tabs) == 1:
+        return tabs[0][0], tabs[0][2], None
+    listing = "; ".join(f"{tid}={title!r}" for tid, title, _ in tabs)
+    return None, None, (
+        f"document has {len(tabs)} tabs; pass --tab <tabId>. Tabs: {listing}")
+
+
+def _dry_call(fn):
+    """Call a planner helper and capture its structured #51 refusal."""
+    global _RAISE_ERRORS
+    _RAISE_ERRORS = True
+    try:
+        return fn(), None
+    except PatchOpError as exc:
+        return None, {
+            "error": str(exc),
+            **({"reason": exc.reason} if exc.reason else {}),
+            **({"details": exc.details} if exc.details is not None else {}),
+        }
+    except Exception as exc:
+        # Malformed operation fields must remain an advisory refusal, not a
+        # traceback or a path that accidentally reaches execution.
+        return None, {"error": f"invalid operation: {exc}",
+                      "reason": "schema_invalid"}
+    finally:
+        _RAISE_ERRORS = False
+
+
+def prepare_patch(doc, ops, *, tab_id=None, anchored=False):
+    """Prepare a patch snapshot for the advisory dry-run planner.
+
+    This function is deliberately pure with respect to Google services: it
+    receives a document snapshot, never a Docs/Drive service.  In particular
+    it cannot reach ``batchUpdate``, replies/deletes, a canary, or DOCX export.
+    """
+    tid, doc_tab, tab_error = _dry_run_select_tab(doc, tab_id=tab_id)
+    prepared = {
+        "doc": doc,
+        "doc_tab": doc_tab,
+        "tab_id": tid,
+        "anchored": bool(anchored),
+        "items": [],
+    }
+    for i, op in enumerate(ops):
+        item = {"index": i, "op": op, "resolved": None,
+                "insertion": None, "noop": False, "error": None}
+        if tab_error:
+            item["error"] = (tab_error if isinstance(tab_error, dict) else
+                              {"error": tab_error, "reason": "tab_selection"})
+        elif not isinstance(op, dict):
+            item["error"] = {"error": "operation must be an object",
+                              "reason": "schema_invalid"}
+        else:
+            r, error = _dry_call(lambda: _resolve_op(op, doc_tab, tid))
+            if error:
+                item["error"] = {**error, "reason": error.get(
+                    "reason", "schema_invalid")}
+            else:
+                item["resolved"] = r
+                try:
+                    item["insertion"] = _op_pure_insertion(op, doc_tab, r)
+                    item["noop"] = _op_is_noop(op, doc_tab, r)
+                except Exception as exc:
+                    item["resolved"] = None
+                    item["error"] = {"error": f"invalid operation: {exc}",
+                                      "reason": "schema_invalid"}
+        prepared["items"].append(item)
+    return prepared
+
+
+def _dry_target_text(item, doc_tab):
+    op, r = item["op"], item.get("resolved")
+    if not r or r.get("kind") != "replace":
+        return None
+    return _op_current_text(op, doc_tab, r)
+
+
+def _dry_mutation_contains_target(item, target, doc_tab):
+    """Bounded dependency check: a prior write can create another match.
+
+    This is intentionally not a sequential document simulator.  It catches
+    the dangerous deterministic case (N introduces N+1's quote and therefore
+    changes its uniqueness) and otherwise leaves the later verdict alone.
+    """
+    if not target or not item.get("resolved"):
+        return False
+    r = item["resolved"]
+    if r.get("kind") == "style" or item.get("noop"):
+        return False
+    replacement = r.get("text", "")
+    if item.get("insertion"):
+        replacement = item["insertion"][1]
+    return isinstance(replacement, str) and target in replacement
+
+
+def decide_op(item, *, doc_tab, anchored, early_refusal=None):
+    """Decide one operation without consulting a writer or freshness witness."""
+    op, r = item["op"], item.get("resolved")
+    source = _op_source_label(op, r)
+    if item.get("error"):
+        err = item["error"]
+        return {"op": item["index"], "source": source,
+                "status": "would_refuse", "reason": err.get(
+                    "reason", "schema_or_target_refusal"),
+                "error": err.get("error"),
+                **({"details": err["details"]} if "details" in err else {})}
+    if early_refusal:
+        return {"op": item["index"], "source": source,
+                "status": "would_refuse", "reason": "safety_gate",
+                "error": early_refusal}
+    if item.get("noop"):
+        return {"op": item["index"], "source": source, "status": "noop"}
+    if not r or not r.get("text", "") and r.get("kind") == "insert":
+        return {"op": item["index"], "source": source, "status": "noop"}
+
+    # Position-local read-only gates remain useful even when a later freshness
+    # witness is required.  Do them before returning ``unknown`` so a pending
+    # suggestion is not hidden behind the canary reason.
+    if r.get("kind") == "style":
+        if anchored and op.get("op") == "style_quote" and "occurrence" in op:
+            return {
+                "op": item["index"], "source": source,
+                "status": "would_refuse",
+                "reason": "occurrence_not_supported_on_commented_doc",
+                "error": ("'occurrence' targeting is not supported on docs "
+                           "with anchored comments; provide a unique quote"),
+            }
+        suggestion = _dry_call(lambda: _refuse_on_suggestion_range(
+            doc_tab, r["start"], r["end"], source))[1]
+        if suggestion:
+            return {"op": item["index"], "source": source,
+                    "status": "would_refuse", "reason": "suggestion_gate",
+                    "error": suggestion["error"]}
+        return {"op": item["index"], "source": source,
+                "status": "would_apply"}
+
+    insertion = item.get("insertion")
+    if not insertion and r.get("kind") == "insert":
+        insertion = ("point", r.get("text", ""))
+    if insertion:
+        point = r["end"] if insertion[0] == "after" else r["start"]
+        suggestion = _dry_call(lambda: _refuse_on_suggestion_at(
+            doc_tab, point, source))[1]
+        if suggestion:
+            return {"op": item["index"], "source": source,
+                    "status": "would_refuse", "reason": "suggestion_gate",
+                    "error": suggestion["error"]}
+
+    # A comment-addressed operation has no usable coordinate on this phase.
+    # It is not allowed to turn stale quotedFileContent into a positive claim.
+    if anchored and r.get("kind") == "replace_anchor":
+        return {"op": item["index"], "source": source, "status": "unknown",
+                "reason": "fresh_anchor_map_requires_canary"}
+    if not anchored and r.get("kind") == "replace_anchor":
+        return {"op": item["index"], "source": source,
+                "status": "would_refuse", "reason": "anchored_thread_required",
+                "error": "comment-addressed operation requires an anchored thread"}
+
+    if anchored and insertion:
+        if C5_INSERT_NEAR_ANCHOR_SAFE is not True:
+            return {"op": item["index"], "source": source,
+                    "status": "would_refuse", "reason": "c5_unverified"}
+        return {"op": item["index"], "source": source,
+                "status": "would_apply"}
+
+    if anchored:
+        suggestion = _dry_call(lambda: _refuse_on_suggestion_range(
+            doc_tab, r["start"], r["end"], source))[1]
+        if suggestion:
+            return {"op": item["index"], "source": source,
+                    "status": "would_refuse", "reason": "suggestion_gate",
+                    "error": suggestion["error"]}
+        return {"op": item["index"], "source": source, "status": "unknown",
+                "reason": "fresh_anchor_map_requires_canary"}
+
+    # Clean documents use the existing deterministic index compiler.  The
+    # target and suggestion/TOC/style gates are all read-only and decidable.
+    if r.get("kind") == "replace":
+        error = _dry_call(lambda: _resolve_replace_target(
+            op, doc_tab, r, check_style=True))[1]
+        if error:
+            return {"op": item["index"], "source": source,
+                    "status": "would_refuse",
+                    "reason": error.get("reason", "safety_gate"),
+                    "error": error["error"],
+                    **({"details": error["details"]}
+                       if "details" in error else {})}
+        suggestion = _dry_call(lambda: (
+            _refuse_on_suggestion_range(
+                doc_tab, r["start"], r["end"], source)))[1]
+        if suggestion:
+            return {"op": item["index"], "source": source,
+                    "status": "would_refuse", "reason": "suggestion_gate",
+                    "error": suggestion["error"]}
+    elif r.get("kind") == "insert":
+        point = r["start"]
+        suggestion = _dry_call(lambda: _refuse_on_suggestion_at(
+            doc_tab, point, source))[1]
+        if suggestion:
+            return {"op": item["index"], "source": source,
+                    "status": "would_refuse", "reason": "suggestion_gate",
+                    "error": suggestion["error"]}
+    return {"op": item["index"], "source": source,
+            "status": "would_apply"}
+
+
+def compile_index_plan(prepared):
+    """Compile bounded per-op dry-run verdicts from a read-only snapshot."""
+    doc_tab = prepared["doc_tab"] or {}
+    items = prepared["items"]
+    indexed = {i["index"]: i["resolved"] for i in items
+               if i.get("resolved") and not i.get("noop") and
+               i["resolved"].get("affect_start") is not None}
+    conflicts = _ops_overlap_conflicts(indexed)
+    verdicts = []
+    for item in items:
+        verdicts.append(decide_op(
+            item, doc_tab=doc_tab, anchored=prepared["anchored"],
+            early_refusal=conflicts.get(item["index"])))
+
+    # A clean atomic request still cannot promise the verdict of a later
+    # replaceAllText target when an earlier replacement deterministically
+    # creates another copy of its quote.  Preserve that dependency explicitly
+    # instead of pretending to run a sequential simulator.
+    for pos, later in enumerate(items):
+        if verdicts[pos]["status"] not in {"would_apply", "noop"}:
+            continue
+        target = _dry_target_text(later, doc_tab)
+        if not target:
+            continue
+        for earlier_pos in range(pos):
+            prior = items[earlier_pos]
+            if _dry_mutation_contains_target(prior, target, doc_tab):
+                verdicts[pos] = {
+                    "op": later["index"],
+                    "source": verdicts[pos]["source"],
+                    "status": "not_simulated",
+                    "reason": "prior_mutation_may_change_uniqueness",
+                    "depends_on": [prior["index"]],
+                }
+                break
+
+    # Once a destructive commented op is unknown, later operations cannot be
+    # planned against a document state we did not simulate.  This is the key
+    # honesty boundary for mixed commented plans.
+    uncertain = []
+    for i, verdict in enumerate(verdicts):
+        if uncertain and verdict["status"] in {"would_apply", "noop"}:
+            verdicts[i] = {
+                "op": verdict["op"], "source": verdict["source"],
+                "status": "not_simulated", "reason": "prior_unsimulated_mutation",
+                "depends_on": list(uncertain),
+            }
+        if verdict["status"] == "unknown":
+            uncertain.append(verdict["op"])
+    return verdicts
+
+
+def _dry_receipt(doc_id, prepared, verdicts, *, revision_id=None):
+    return {
+        "action": "dry-run",
+        "strategy": "read-only-advisory",
+        "doc_id": doc_id,
+        "tab_id": prepared.get("tab_id"),
+        "revision_id_before": revision_id,
+        "writes_performed": 0,
+        "operations": verdicts,
+    }
+
+
+def dry_run_patch(file_id, ops_path, tab_id=None, output=None):
+    """Read-only advisory patch entrypoint.
+
+    Only read APIs are used to obtain the snapshot.  The writer service and
+    every write/freshness/export helper are intentionally absent from the
+    planner call graph.
+    """
+    file_id = _extract_doc_id(file_id)
+    if not os.path.exists(ops_path):
+        _error(f"ops file not found: {ops_path}")
+    try:
+        with open(ops_path, "r") as f:
+            ops = json.load(f)
+    except Exception as exc:
+        # Keep malformed input in the dry-run receipt (and therefore in the
+        # same advisory exit-code contract) without touching any service.
+        receipt = {"action": "dry-run", "strategy": "read-only-advisory",
+                   "doc_id": file_id, "writes_performed": 0,
+                   "operations": [{"op": None, "source": "ops.json",
+                                   "status": "would_refuse",
+                                   "reason": "schema_invalid",
+                                   "error": f"cannot parse ops json: {exc}"}]}
+        _emit_json(receipt, output=output,
+                   summary={"action": "dry-run", "writes_performed": 0})
+        raise SystemExit(3)
+    if not isinstance(ops, list) or not ops:
+        receipt = {"action": "dry-run", "strategy": "read-only-advisory",
+                   "doc_id": file_id, "writes_performed": 0,
+                   "operations": [{"op": None, "source": "ops.json",
+                                   "status": "would_refuse",
+                                   "reason": "schema_invalid",
+                                   "error": "ops file must contain a non-empty JSON array of operations"}]}
+        _emit_json(receipt, output=output,
+                   summary={"action": "dry-run", "writes_performed": 0})
+        raise SystemExit(3)
+    try:
+        creds = get_creds()
+        docs_service = get_docs_service(creds)
+        drive_service = get_drive_service(creds)
+        doc = _safe_get_doc(docs_service, file_id)
+        _all, anchored, _fp, _universe = _census_comments(
+            drive_service, file_id)
+    except Exception as exc:
+        _error(f"dry-run read failed: {exc}")
+    prepared = prepare_patch(doc, ops, tab_id=tab_id, anchored=bool(anchored))
+    verdicts = compile_index_plan(prepared)
+    receipt = _dry_receipt(file_id, prepared, verdicts,
+                           revision_id=doc.get("revisionId"))
+    _emit_json(receipt, output=output,
+               summary={"action": "dry-run", "writes_performed": 0})
+    if any(v["status"] not in {"would_apply", "noop"} for v in verdicts):
+        raise SystemExit(3)
+    return receipt
+
+
+def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None):
     """Apply structural patch operations to a Google Doc.
 
     Strategy is selected at DOCUMENT level (codex r1 #2 — anchor positions
@@ -5415,6 +7383,8 @@ def patch_doc(file_id, ops_path, tab_id=None):
         replaceAllText, inserts via insertText; each op class is gated by
         its phase-0 characterization result (fail closed while unverified).
     """
+    if dry_run:
+        return dry_run_patch(file_id, ops_path, tab_id=tab_id, output=output)
     file_id = _extract_doc_id(file_id)
 
     if not os.path.exists(ops_path):
@@ -5477,7 +7447,8 @@ def patch_doc(file_id, ops_path, tab_id=None):
     # holding a range (found in review). Both members of an overlapping pair
     # are refused: applying either one moves the other's target.
     early_refusals.update(_ops_overlap_conflicts(
-        {i: r for i, r in enumerate(resolved) if r and not noops[i]}))
+        {i: r for i, r in enumerate(resolved)
+         if r and not noops[i] and r.get("affect_start") is not None}))
 
     # Suggestions are judged by position, not by their existence anywhere in
     # the tab (r8, after the export was measured). An op that removes nothing
@@ -5487,6 +7458,11 @@ def patch_doc(file_id, ops_path, tab_id=None):
         for i, (r, ins, noop) in enumerate(zip(resolved, insertions, noops)):
             if r is None or noop or i in early_refusals:
                 continue  # unresolved, writes nothing at all, or already out
+            if r.get("kind") == "replace_anchor":
+                # The target coordinates are intentionally unavailable until
+                # the post-canary DOCX marker map.  Its suggestion/protected
+                # gates run there, against that exact range.
+                continue
             try:
                 if r["kind"] == "insert" or ins:
                     point = r["start"]
@@ -5519,6 +7495,12 @@ def patch_doc(file_id, ops_path, tab_id=None):
         # rest.
         skipped = dict(deferred)
         skipped.update(early_refusals)
+        for i, op in enumerate(ops):
+            if (i not in skipped and
+                    op.get("op") in ("replace_anchor", "replace_around_anchor")):
+                skipped[i] = (
+                    f"{op.get('op')} requires one accessible active anchored "
+                    "thread; the document has no anchored threads")
         ordered = sorted((i for i in range(len(resolved)) if i not in skipped),
                          key=lambda i: resolved[i]["affect_start"],
                          reverse=True)
@@ -5527,7 +7509,9 @@ def patch_doc(file_id, ops_path, tab_id=None):
             r, ins = resolved[i], insertions[i]
             if noops[i]:
                 continue
-            if ins:
+            if r["kind"] == "style":
+                requests += _scope_requests([_style_request(r)], r["tab_id"])
+            elif ins:
                 # A replace that only extends its target: emit the insert
                 # alone. Rewriting it as delete+insert would remove text that
                 # the caller never asked to remove — and this path was already
@@ -5570,6 +7554,8 @@ def patch_doc(file_id, ops_path, tab_id=None):
             "doc_id": file_id,
             "tab_id": tid,
             "ops_applied": len(resolved) - len(skipped),
+            "applied": [_op_source_label(ops[i], resolved[i])
+                        for i in ordered if i not in skipped],
             "revision_id_before": revision_id,
         }
         if skipped:
@@ -5611,6 +7597,7 @@ def patch_doc(file_id, ops_path, tab_id=None):
                             "source": _op_source_label(op, resolved[i]),
                             "error": early_refusals[i]})
             continue
+        diagnostic = None
         try:
             _RAISE_ERRORS = True  # nested preflight errors must not exit
             try:
@@ -5641,6 +7628,7 @@ def patch_doc(file_id, ops_path, tab_id=None):
             continue
         except PatchOpError as e:
             reason, state = str(e), e.state
+            diagnostic = e
         except HttpError as e:
             reason = e.reason if hasattr(e, "reason") else str(e)
             # 5xx/transport after send: the write may or may not have landed
@@ -5653,9 +7641,15 @@ def patch_doc(file_id, ops_path, tab_id=None):
             # do not overlap (checked above), so the rest are independent of
             # it. Refusing THIS operation must not cost the person the other
             # nine (r8): the refusal is collected and the loop goes on.
-            refused.append({"op": i,
-                            "source": _op_source_label(op, resolved[i]),
-                            "error": reason})
+            refusal = {"op": i,
+                       "source": _op_source_label(op, resolved[i]),
+                       "error": reason}
+            if diagnostic is not None:
+                if diagnostic.reason is not None:
+                    refusal["reason"] = diagnostic.reason
+                if diagnostic.details is not None:
+                    refusal["details"] = diagnostic.details
+            refused.append(refusal)
             continue
         # unknown state: what the document looks like is no longer known,
         # every later operation would be planned against a guess — stop.
@@ -5713,7 +7707,7 @@ def patch_doc(file_id, ops_path, tab_id=None):
 # Named ranges (mark)
 # ---------------------------------------------------------------------------
 
-def mark_range(file_id, name, quote, tab_id=None, occurrence=1):
+def mark_range(file_id, name, quote, tab_id=None, occurrence=None):
     """Create a named range around a text fragment.
 
     Named ranges are the only reliable machine-owned anchoring mechanism:
@@ -5738,17 +7732,12 @@ def mark_range(file_id, name, quote, tab_id=None, occurrence=1):
     total = _count_quote_occurrences(doc_tab, quote)
     if total == 0:
         _error(f"quote not found in tab {tid or '(default)'}: {quote!r}")
-    if occurrence > total:
-        _error(
-            f"occurrence {occurrence} out of range: only {total} matches for {quote!r}"
-        )
-    if total > 1 and occurrence == 1:
-        _error(
-            f"quote is non-unique ({total} matches). "
-            f"Pass --occurrence N to disambiguate."
-        )
+    try:
+        resolved_occurrence = _resolve_mark_occurrence(occurrence, total)
+    except ValueError as e:
+        _error(f"{e}: {quote!r}")
 
-    found = _find_quote_in_doctab(doc_tab, quote, occurrence=occurrence)
+    found = _find_quote_in_doctab(doc_tab, quote, occurrence=resolved_occurrence)
     if not found:
         _error(f"quote not found in tab {tid or '(default)'}: {quote!r}")
     start_idx, end_idx = found
@@ -5784,7 +7773,7 @@ def mark_range(file_id, name, quote, tab_id=None, occurrence=1):
         "start": start_idx,
         "end": end_idx,
         "quote": quote,
-        "occurrence": occurrence,
+        "occurrence": resolved_occurrence,
         "total_matches": total,
     }, ensure_ascii=False))
 
@@ -5793,8 +7782,119 @@ def mark_range(file_id, name, quote, tab_id=None, occurrence=1):
 # Reply / resolve / create comment
 # ---------------------------------------------------------------------------
 
-def reply_comment(file_id, comment_id, text, resolve=False, yes=False):
-    """Post a reply to an existing comment. If resolve=True, also resolves the thread."""
+def _reply_tab_preflight(drive_service, doc, file_id, comment_id, tab_id):
+    """Prove that ``comment_id`` belongs to ``tab_id`` before replying.
+
+    Drive replies are addressed only by document/comment id. The Drive
+    comment anchor does not expose a Docs tab id (M19), so neither ``anchor``
+    nor ``quotedFileContent`` is evidence here. On a multi-tab document the
+    witness is the comments.xml record joined to the thread by author/time,
+    plus that record's exact range marker inside a tab segment proven from
+    the Docs API and the DOCX body (#44).
+
+    Returns the selected tab id. Legacy and one-tab documents need no DOCX
+    attribution: every comment they can contain is necessarily in their only
+    tab.
+    """
+    tabs = _collect_tabs(doc)
+    tab_ids = [tid for tid, _title, _dt in tabs]
+    if (len(tabs) > 1
+            and (any(not tid for tid in tab_ids)
+                 or len(set(tab_ids)) != len(tab_ids))):
+        _error(
+            f"document returned missing or duplicate tab IDs {tab_ids}; "
+            f"comment {comment_id} scope cannot be proven, reply not sent")
+    if len(tabs) == 1:
+        # `_select_tab` still validates an explicit id on one modern tab.
+        selected, _doc_tab = _select_tab(doc, tab_id=tab_id)
+        return selected, None
+
+    comments, anchored, _fingerprint, universe = _census_comments(
+        drive_service, file_id)
+    target = next((c for c in comments if c.get("id") == comment_id), None)
+    if target is None:
+        _error(f"comment {comment_id} was not found; reply not sent")
+    reply_fingerprint = _sha256_str(json.dumps(
+        comments, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    target_anchored = bool(
+        target.get("anchor") or target.get("quotedFileContent"))
+    if not target_anchored:
+        # Document-level comments are deliberately created by `skrepka
+        # comment`; they belong to no tab and remain replyable in a tabbed
+        # document.  Pretending an explicit --tab applies would be as wrong as
+        # refusing the thread entirely.
+        if tab_id is not None:
+            _error(
+                f"comment {comment_id} is document-level and has no tab; "
+                f"--tab {tab_id} cannot be asserted, reply not sent")
+        return None, reply_fingerprint
+
+    # `_select_tab` owns both validation and the actionable multi-tab listing.
+    selected, _doc_tab = _select_tab(doc, tab_id=tab_id)
+
+    try:
+        docx_bytes = drive_service.files().export(
+            fileId=file_id,
+            mimeType="application/vnd.openxmlformats-officedocument"
+                     ".wordprocessingml.document",
+        ).execute()
+    except Exception as e:
+        _error(
+            f"cannot export the document to prove comment {comment_id}'s "
+            f"tab; reply not sent: "
+            f"{e.reason if hasattr(e, 'reason') else e}")
+
+    spans, span_problems, census = _parse_docx_anchor_spans(docx_bytes)
+    records, record_problems = _docx_comment_records(docx_bytes)
+    attribution = _attribute_records_to_threads(anchored, records, universe)
+    target_spans = [
+        span for span in spans
+        if attribution.get(span.get("docx_id")) == comment_id
+    ]
+    tab_listing = ", ".join(tid or "(legacy)" for tid, _title, _dt in tabs)
+
+    def _ambiguous(detail):
+        _error(
+            f"comment {comment_id} tab is ambiguous / not proven among "
+            f"tabs {tab_listing}: {detail}. Reply not sent; open the thread "
+            f"in the Google Docs UI and answer it there")
+
+    if span_problems or record_problems:
+        _ambiguous(str((span_problems + record_problems)[0]))
+    if not target_spans:
+        _ambiguous(
+            "the export has no uniquely attributed range marker for this "
+            "thread")
+
+    homes = set()
+    for tid, _title, _doc_tab in tabs:
+        first, last, why = _prove_target_segment(
+            census["outline"], tabs, tid)
+        if why:
+            _ambiguous(f"cannot prove tab {tid}: {why}")
+        inside, _outside, why = _confine_spans_to_segment(
+            target_spans, first, last)
+        if why:
+            _ambiguous(why)
+        if inside:
+            homes.add(tid)
+
+    if homes != {selected}:
+        if len(homes) == 1:
+            actual = next(iter(homes))
+            _error(
+                f"comment {comment_id} belongs to tab {actual}, not target "
+                f"tab {selected}; reply not sent")
+        found = ", ".join(sorted(t for t in homes if t)) or "none"
+        _ambiguous(
+            f"its attributed marker belongs to {len(homes)} proven tabs "
+            f"({found})")
+    return selected, reply_fingerprint
+
+
+def reply_comment(file_id, comment_id, text, resolve=False, yes=False,
+                  tab_id=None):
+    """Post a reply, proving its tab first when the document has several."""
     if resolve:
         # Resolving a thread is the reviewer's call, never the agent's. --yes
         # is the person's own non-interactive path (their scripts), not a door
@@ -5810,9 +7910,77 @@ def reply_comment(file_id, comment_id, text, resolve=False, yes=False):
     file_id = _extract_doc_id(file_id)
     try:
         creds = get_creds()
+        docs_service = get_docs_service(creds)
         drive_service = get_drive_service(creds)
     except Exception as e:
         _error(f"auth failed: {e}")
+
+    try:
+        doc = _safe_get_doc(docs_service, file_id)
+    except Exception as e:
+        _error(
+            f"cannot read doc to verify the reply tab; reply not sent: "
+            f"{e.reason if hasattr(e, 'reason') else e}")
+    selected_tab, reply_fingerprint = _reply_tab_preflight(
+        drive_service, doc, file_id, comment_id, tab_id)
+
+    # A read-only revision sandwich does NOT make files.export fresh: Drive
+    # can serve the previous anchor marker while Docs already reports the new
+    # revision.  For an anchored multi-tab reply use the same canary proof as
+    # structural edits, then remove the canary before sending the message.
+    # This closes the stale-export window; only the unavoidable last-mile race
+    # between the final reads and replies.create remains (Drive exposes no
+    # conditional write token for replies).
+    revision = doc.get("revisionId")
+    requires_canary_proof = (
+        reply_fingerprint is not None and selected_tab is not None)
+    if requires_canary_proof:
+        if revision is None:
+            _error(
+                f"document returned no revision id while proving anchored "
+                f"comment {comment_id}'s tab; reply not sent")
+        _tid, selected_doc_tab = _select_tab(doc, tab_id=selected_tab)
+        body_content = (selected_doc_tab.get("body", {}) or {}).get(
+            "content", [])
+        body_end = body_content[-1]["endIndex"] if body_content else 2
+        comments_now, anchored_now, fp_now, universe_now = _census_comments(
+            drive_service, file_id)
+        if not any(c.get("id") == comment_id for c in comments_now):
+            _error(
+                f"comment {comment_id} disappeared before the freshness "
+                f"proof; reply not sent")
+        snapshot, retry_reason = _fresh_anchor_snapshot(
+            docs_service, drive_service, file_id, doc, selected_doc_tab,
+            anchored_now, _named_range_intervals(selected_doc_tab), body_end,
+            fp1=fp_now, universe=universe_now, tid=selected_tab)
+        if snapshot is None:
+            _error(
+                f"cannot prove a fresh export for comment {comment_id}: "
+                f"{retry_reason}; reply not sent — retry")
+        target_is_here = any(
+            snapshot["attribution"].get(docx_id) == comment_id
+            for _start, _end, _text, docx_id in snapshot["anchors"])
+        if not _cleanup_canary(
+                docs_service, file_id, snapshot["canary"]):
+            _error(
+                f"freshness was checked, but the service canary "
+                f"«{snapshot['canary']['text']}» could not be removed; "
+                f"reply not sent — remove that line manually")
+        if not target_is_here:
+            _error(
+                f"fresh export does not place comment {comment_id} in tab "
+                f"{selected_tab}; reply not sent — open the thread in the "
+                f"Google Docs UI")
+    if reply_fingerprint is not None:
+        comments_after, _anchored2, _fp2, _universe2 = _census_comments(
+            drive_service, file_id)
+        fingerprint_after = _sha256_str(json.dumps(
+            comments_after, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")))
+        if fingerprint_after != reply_fingerprint:
+            _error(
+                f"comment {comment_id} changed while proving its tab; "
+                f"reply not sent — retry against the fresh thread")
 
     body = {"content": text}
     if resolve:
@@ -5840,17 +8008,99 @@ def reply_comment(file_id, comment_id, text, resolve=False, yes=False):
         "createdTime": reply.get("createdTime"),
         "action": reply.get("action"),
         "resolved": resolve,
+        "tab_id": selected_tab,
     }, ensure_ascii=False))
 
 
-def resolve_comment(file_id, comment_id, text=None, yes=False):
+def unreply_comment(file_id, comment_id, reply_id):
+    """Delete one exact, ordinary reply authored by the current account.
+
+    Drive has no conditional delete token for replies.  The strongest useful
+    preflight is therefore one complete API census immediately before the
+    delete: include tombstones, prove the parent is live, prove the reply id
+    occurs exactly once under that parent, and require the explicit
+    ``author.me`` witness.  Missing authorship is uncertainty, never consent.
+    """
+    file_id = _extract_doc_id(file_id)
+    try:
+        creds = get_creds()
+        drive_service = get_drive_service(creds)
+    except Exception as e:
+        _error(f"auth failed: {e}")
+
+    try:
+        comments = _list_comments_raw(drive_service, file_id)
+    except Exception as e:
+        _error(
+            f"cannot list comments before deleting reply {reply_id} "
+            f"(fail closed, nothing deleted): "
+            f"{e.reason if hasattr(e, 'reason') else e}")
+
+    parents = [c for c in comments if c.get("id") == comment_id]
+    if len(parents) != 1:
+        detail = "was not found" if not parents else "is duplicated in the census"
+        _error(
+            f"comment {comment_id} {detail}; reply {reply_id} was not deleted")
+    parent = parents[0]
+    if parent.get("deleted") or parent.get("resolved"):
+        state = "deleted" if parent.get("deleted") else "resolved"
+        _error(
+            f"comment {comment_id} is {state}, not a live open thread; "
+            f"reply {reply_id} was not deleted")
+
+    matches = [
+        (comment, reply)
+        for comment in comments
+        for reply in (comment.get("replies") or [])
+        if reply.get("id") == reply_id
+    ]
+    if len(matches) != 1:
+        detail = "was not found" if not matches else "is ambiguous in the census"
+        _error(f"reply {reply_id} {detail}; nothing deleted")
+    owner, reply = matches[0]
+    if owner is not parent:
+        _error(
+            f"reply {reply_id} belongs to comment {owner.get('id')}, not "
+            f"comment {comment_id}; nothing deleted")
+    if reply.get("deleted"):
+        _error(f"reply {reply_id} is already deleted; nothing deleted")
+    if (reply.get("author") or {}).get("me") is not True:
+        _error(
+            f"reply {reply_id} is not proven to be authored by the current "
+            f"account (author.me must be true); nothing deleted")
+    if reply.get("action"):
+        _error(
+            f"reply {reply_id} is a thread action ({reply.get('action')!r}), "
+            f"not an ordinary reply; nothing deleted")
+
+    try:
+        drive_service.replies().delete(
+            fileId=file_id,
+            commentId=comment_id,
+            replyId=reply_id,
+        ).execute()
+    except Exception as e:
+        _error(
+            f"reply {reply_id} delete failed; it may still be present: "
+            f"{e.reason if hasattr(e, 'reason') else e}")
+
+    print(json.dumps({
+        "action": "reply-deleted",
+        "deleted": True,
+        "doc_id": file_id,
+        "comment_id": comment_id,
+        "reply_id": reply_id,
+    }, ensure_ascii=False))
+
+
+def resolve_comment(file_id, comment_id, text=None, yes=False, tab_id=None):
     """Resolve a comment by posting a reply with action=resolve.
 
     Per Drive API, 'resolved' is read-only; the only way to resolve is via
     replies.create with action: 'resolve'. Works for unanchored comments too.
     """
     reply_comment(file_id, comment_id, text or "Resolved.", resolve=True,
-                  yes=yes)
+                  yes=yes, tab_id=tab_id)
 
 
 def create_comment(file_id, text):
@@ -6069,6 +8319,35 @@ def _download_images_from_html(html, images_dir, creds):
     return str(soup), count
 
 
+def _markdown_inline_style_warning(doc):
+    """Describe inline styles that the markdown roundtrip cannot preserve."""
+    unsupported = set()
+    def walk(value):
+        if isinstance(value, dict):
+            run = value.get("textRun")
+            if isinstance(run, dict):
+                style = run.get("textStyle") or {}
+                for key, label in (("underline", "underline"),
+                                   ("strikethrough", "strikethrough"),
+                                   ("foregroundColor", "text color"),
+                                   ("backgroundColor", "highlight color"),
+                                   ("fontSize", "font size"),
+                                   ("weightedFontFamily", "font family")):
+                    if style.get(key):
+                        unsupported.add(label)
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+    walk(doc)
+    if not unsupported:
+        return None
+    return ("Markdown does not represent inline "
+            + ", ".join(sorted(unsupported))
+            + "; downloading then syncing may lose this formatting.")
+
+
 def download_doc(file_id, fmt="md", output=None, images_dir=None):
     """Download a Google Doc in the specified format."""
     file_id = _extract_doc_id(file_id)
@@ -6131,6 +8410,9 @@ def download_doc(file_id, fmt="md", output=None, images_dir=None):
         text = text.lstrip('\n').replace(" ", " ")
         safeio.atomic_write(output, text)  # symlink-safe (r3 #9)
         result = {"file": output, "format": "md", "title": doc_name, "images": img_count}
+        style_warning = _markdown_inline_style_warning(doc_snapshot)
+        if style_warning:
+            result["warnings"] = [style_warning]
         if img_count:
             result["images_dir"] = images_dir
 
@@ -6187,6 +8469,61 @@ def _extract_full_text_inner(content):
     return "".join(parts)
 
 
+def _suggestion_tabs_by_id(doc, view_name):
+    """Return ordered tabs plus an id map, refusing ambiguous responses."""
+    tabs = _collect_tabs(doc)
+    seen = {}
+    real_tabs = bool(doc.get("tabs"))
+    for tab_id, title, doc_tab in tabs:
+        if real_tabs and tab_id is None:
+            _error(
+                f"suggestion {view_name} view returned a tab without a tab "
+                f"ID — retry; the document may be changing")
+        if tab_id in seen:
+            _error(
+                f"suggestion {view_name} view returned duplicate tab ID "
+                f"{tab_id!r} — retry; nothing was inferred")
+        seen[tab_id] = (title, doc_tab)
+    return tabs, seen
+
+
+def _suggestion_tab_diff(original_text, accepted_text, tab_id, title,
+                         legacy=False):
+    """Build one tab's unified and structured suggestion diff."""
+    if original_text == accepted_text:
+        return [], ""
+    if legacy:
+        fromfile, tofile = "original", "with_suggestions"
+    else:
+        label = f"tab {tab_id} {title}".rstrip()
+        fromfile, tofile = f"original — {label}", f"accepted — {label}"
+    diff_lines = list(difflib.unified_diff(
+        original_text.splitlines(keepends=True),
+        accepted_text.splitlines(keepends=True),
+        fromfile=fromfile, tofile=tofile, n=2))
+    changes = []
+    current = None
+    for line in diff_lines:
+        if line.startswith("@@"):
+            if current:
+                changes.append(current)
+            current = {
+                "tab_id": tab_id,
+                "tab_title": title,
+                "deleted": [],
+                "inserted": [],
+                "context": line.strip(),
+            }
+        elif current is not None:
+            if line.startswith("-") and not line.startswith("---"):
+                current["deleted"].append(line[1:].rstrip("\n"))
+            elif line.startswith("+") and not line.startswith("+++"):
+                current["inserted"].append(line[1:].rstrip("\n"))
+    if current:
+        changes.append(current)
+    return changes, "".join(diff_lines)
+
+
 def list_suggestions(file_id, output=None):
     """Compare original vs accepted suggestions, output as structured diff."""
     file_id = _extract_doc_id(file_id)
@@ -6200,61 +8537,75 @@ def list_suggestions(file_id, output=None):
     try:
         doc_original = docs_service.documents().get(
             documentId=file_id,
-            suggestionsViewMode="PREVIEW_WITHOUT_SUGGESTIONS"
+            suggestionsViewMode="PREVIEW_WITHOUT_SUGGESTIONS",
+            includeTabsContent=True,
         ).execute()
         doc_accepted = docs_service.documents().get(
             documentId=file_id,
-            suggestionsViewMode="PREVIEW_SUGGESTIONS_ACCEPTED"
+            suggestionsViewMode="PREVIEW_SUGGESTIONS_ACCEPTED",
+            includeTabsContent=True,
         ).execute()
     except HttpError as e:
         _error(f"failed to read document: {e.reason if hasattr(e, 'reason') else e}")
 
     title = doc_original.get("title", "")
-    original_text = _extract_full_text(doc_original.get("body", {}))
-    accepted_text = _extract_full_text(doc_accepted.get("body", {}))
+    ordered, original_tabs = _suggestion_tabs_by_id(doc_original, "without")
+    _accepted_ordered, accepted_tabs = _suggestion_tabs_by_id(
+        doc_accepted, "accepted")
+    original_ids, accepted_ids = set(original_tabs), set(accepted_tabs)
+    if original_ids != accepted_ids:
+        missing = sorted((original_ids - accepted_ids), key=str)
+        extra = sorted((accepted_ids - original_ids), key=str)
+        details = []
+        if missing:
+            details.append(f"missing from accepted view: {missing}")
+        if extra:
+            details.append(f"missing from original view: {extra}")
+        _error(
+            "suggestion tab sets differ between preview views (" +
+            "; ".join(details) +
+            ") — retry; the document may have changed between reads")
 
-    if original_text == accepted_text:
-        _emit_json({
-            "title": title,
-            "has_suggestions": False,
-            "changes": [],
-            "diff": "",
-        }, output=output, summary={"has_suggestions": False,
-                                   "change_count": 0})
-        return
+    legacy = not bool(doc_original.get("tabs"))
+    changes, diff_parts, tab_results = [], [], []
+    for tab_id, tab_title, original_tab in ordered:
+        accepted_title, accepted_tab = accepted_tabs[tab_id]
+        # The original title is the stable attribution displayed to callers.
+        # A title-only race cannot make a suggestion disappear, while ID set
+        # changes above do fail closed.
+        display_title = tab_title or accepted_title or title
+        original_text = _extract_full_text(original_tab.get("body", {}))
+        accepted_text = _extract_full_text(accepted_tab.get("body", {}))
+        tab_changes, tab_diff = _suggestion_tab_diff(
+            original_text, accepted_text, tab_id, display_title,
+            legacy=legacy)
+        changes.extend(tab_changes)
+        if tab_diff:
+            diff_parts.append(tab_diff)
+        tab_results.append({
+            "id": tab_id,
+            "title": display_title,
+            "has_suggestions": bool(tab_changes),
+            "change_count": len(tab_changes),
+        })
 
-    orig_lines = original_text.splitlines(keepends=True)
-    acc_lines = accepted_text.splitlines(keepends=True)
-
-    diff_lines = list(difflib.unified_diff(
-        orig_lines, acc_lines,
-        fromfile="original", tofile="with_suggestions", n=2
-    ))
-
-    # Build structured changes
-    changes = []
-    current = None
-    for line in diff_lines:
-        if line.startswith("@@"):
-            if current:
-                changes.append(current)
-            current = {"deleted": [], "inserted": [], "context": line.strip()}
-        elif current is not None:
-            if line.startswith("-") and not line.startswith("---"):
-                current["deleted"].append(line[1:].rstrip("\n"))
-            elif line.startswith("+") and not line.startswith("+++"):
-                current["inserted"].append(line[1:].rstrip("\n"))
-    if current:
-        changes.append(current)
-
-    _emit_json({
+    tabs_with = sum(1 for tab in tab_results if tab["has_suggestions"])
+    payload = {
         "title": title,
-        "has_suggestions": True,
+        "has_suggestions": bool(changes),
         "change_count": len(changes),
+        "tab_count": len(tab_results),
+        "tabs_with_suggestions": tabs_with,
+        "tabs": tab_results,
         "changes": changes,
-        "diff": "".join(diff_lines),
-    }, output=output, summary={"has_suggestions": True,
-                               "change_count": len(changes)})
+        "diff": "".join(diff_parts),
+    }
+    _emit_json(payload, output=output, summary={
+        "has_suggestions": bool(changes),
+        "change_count": len(changes),
+        "tab_count": len(tab_results),
+        "tabs_with_suggestions": tabs_with,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -6485,6 +8836,67 @@ def _closed_threads_in_edited_ranges(doc_tab, closed, edited):
     return suspects
 
 
+def _archived_reply_key(reply):
+    """Stable reply identity available in both old and fresh archives.
+
+    Reply ids were not stored in the archive before #28, so the only common
+    identity is the exact author/created pair.  An incomplete pair is not an
+    identity: collapsing two such records would lose words silently.
+    """
+    author = reply.get("author")
+    created = reply.get("created")
+    if not author or not created:
+        return None
+    return author, created
+
+
+def _merge_archived_replies(old, fresh):
+    """Merge reply snapshots without deleting anything from the archive.
+
+    Old order is retained.  A fresh record replaces an old one only when its
+    exact (author, created) identity occurs once on BOTH sides; this makes an
+    edited reply fresh while a reply absent after deletion remains archived.
+    Colliding or incomplete identities are kept as a union instead of being
+    guessed — duplicates cost space, whereas a wrong merge loses the archive's
+    only copy of somebody's words.
+    """
+    from collections import Counter
+
+    if not isinstance(old, list):
+        raise ValueError("archived thread replies is not a list")
+    if not isinstance(fresh, list):
+        raise ValueError("fresh thread replies is not a list")
+    if any(not isinstance(reply, dict) for reply in old + fresh):
+        raise ValueError("thread replies contains a non-object entry")
+
+    old_counts = Counter(
+        key for reply in old if (key := _archived_reply_key(reply)) is not None)
+    fresh_counts = Counter(
+        key for reply in fresh
+        if (key := _archived_reply_key(reply)) is not None)
+    fresh_by_key = {}
+    for reply in fresh:
+        key = _archived_reply_key(reply)
+        if (key is not None and old_counts[key] == 1
+                and fresh_counts[key] == 1):
+            fresh_by_key[key] = reply
+
+    merged, replaced = [], set()
+    for reply in old:
+        key = _archived_reply_key(reply)
+        if key in fresh_by_key:
+            merged.append(dict(fresh_by_key[key]))
+            replaced.add(key)
+        else:
+            merged.append(dict(reply))
+    for reply in fresh:
+        key = _archived_reply_key(reply)
+        if key in replaced or reply in merged:
+            continue
+        merged.append(dict(reply))
+    return merged
+
+
 def _archive_closed_threads(md_path, file_id, closed, doc_tab=None,
                             edited=()):
     """Write the conversation of every closed thread next to the markdown.
@@ -6546,14 +8958,33 @@ def _archive_closed_threads(md_path, file_id, closed, doc_tab=None,
             old = previous["threads"]
             if not isinstance(old, list):
                 raise ValueError("threads is not a list")
+            old_by_id = {}
+            for thread in old:
+                if not isinstance(thread, dict):
+                    raise ValueError("threads contains a non-object entry")
+                thread_id = thread.get("id")
+                if thread_id in old_by_id:
+                    raise ValueError(
+                        f"duplicate thread id {thread_id!r} in archive")
+                if not isinstance(thread.get("replies", []), list):
+                    raise ValueError(
+                        f"thread {thread_id!r} replies is not a list")
+                old_by_id[thread_id] = thread
+
+            for entry in entries:
+                prior = old_by_id.pop(entry["id"], None)
+                if prior is not None:
+                    entry["replies"] = _merge_archived_replies(
+                        prior.get("replies", []), entry["replies"])
+            # Dict insertion order is the previous archive order, so threads
+            # absent from this snapshot keep their stable place after fresh
+            # entries exactly as they did before #28.
+            kept = list(old_by_id.values())
         except Exception as e:
             raise RuntimeError(
                 f"не удалось прочитать прежний архив закрытых тредов {path}: "
                 f"{e}. Перезаписать его нельзя — это единственная копия тех "
                 f"разговоров. Уберите файл в сторону и повторите.")
-        fresh_ids = {e["id"] for e in entries}
-        kept = [t for t in old
-                if isinstance(t, dict) and t.get("id") not in fresh_ids]
 
     payload = {
         "doc_id": file_id,
@@ -6561,8 +8992,8 @@ def _archive_closed_threads(md_path, file_id, closed, doc_tab=None,
                  "skrepka не знает, где стояли их якоря, и правка через "
                  "удаление могла превратить их в призраков: в интерфейсе "
                  "такой тред не появится даже после переоткрытия. Текст "
-                 "разговора сохранён здесь. Файл накапливается: треды из "
-                 "прошлых прогонов остаются."),
+                 "разговора сохранён здесь. Файл накапливается: треды и "
+                 "ответы из прошлых прогонов остаются."),
         "threads": entries + kept,
     }
     return safeio.atomic_write(
@@ -6576,6 +9007,127 @@ def _write_journal(md_path, journal):
     path = md_path + ".gdocs-sync-journal.json"
     safeio.atomic_write(path, json.dumps(journal, ensure_ascii=False, indent=1))
     return path
+
+
+_PUBLIC_DEFERRED_SAMPLE = 8
+_PUBLIC_SCALAR_LIMIT = 96
+
+
+def _public_deferred_scalar(value):
+    """Return a bounded public preview without changing deferred identity.
+
+    The full value remains in the journal.  Public receipts may contain
+    document-derived keys and Markdown text, so a sample count alone is not a
+    bound: one sampled 10k-character duplicate key would still leak the whole
+    payload.  Visible controls and a short hash make truncation deterministic
+    and distinguishable while keeping every emitted scalar under the limit.
+    """
+    if not isinstance(value, str):
+        return value
+    visible = _diagnostic_quote(value, _PUBLIC_SCALAR_LIMIT)
+    if len(value) <= _PUBLIC_SCALAR_LIMIT and len(visible) <= _PUBLIC_SCALAR_LIMIT:
+        return visible
+    digest = _sha256_str(value)
+    suffix = f"…sha256:{digest[:16]}"
+    budget = max(0, _PUBLIC_SCALAR_LIMIT - len(suffix))
+    prefix = _diagnostic_quote(value, budget)[:budget]
+    return prefix + suffix
+
+
+def _public_deferred_summary(partial_plan):
+    """Bound stdout while the recovery journal retains the exact plan.
+
+    Lifecycle metadata can legitimately contain one edge per document block.
+    Printing all of it after a successful remote write risks an unusable or
+    truncated receipt, so public lists are sampled and paired with an exact
+    count/hash.  ``safe_origin_order`` is an obsolete internal trace and is
+    suppressed defensively even when reading an older in-memory plan.
+    """
+    def compact_dict(value):
+        out = {}
+        for key, item in value.items():
+            if key == "safe_origin_order":
+                continue
+            public_key = (_public_deferred_scalar(key)
+                          if isinstance(key, str) else key)
+            if isinstance(item, list):
+                out[public_key] = [compact(member)
+                                   for member in item[:_PUBLIC_DEFERRED_SAMPLE]]
+                if len(item) > _PUBLIC_DEFERRED_SAMPLE:
+                    encoded = json.dumps(
+                        item, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"))
+                    out[_public_deferred_scalar(f"{public_key}_count")] = \
+                        len(item)
+                    out[_public_deferred_scalar(f"{public_key}_sha256")] = \
+                        _sha256_str(encoded)
+            else:
+                out[public_key] = compact(item)
+        return out
+
+    def compact(value):
+        if isinstance(value, dict):
+            return compact_dict(value)
+        if isinstance(value, list):
+            return [compact(member)
+                    for member in value[:_PUBLIC_DEFERRED_SAMPLE]]
+        return _public_deferred_scalar(value)
+
+    return compact_dict(partial_plan)
+
+
+def _duplicate_alignment_evidence(base_keys, other_keys, duplicate_keys,
+                                  base_elements, other_elements):
+    """Bounded public evidence for a sync twin/alignment refusal.
+
+    r15 may already defer an ambiguous multiplicity hull.  This helper is only
+    used by the remaining hard guard, and reports the exact evidence that made
+    that guard fire rather than pretending a single base index explains it.
+    Position lists are sampled, while counts and hashes preserve a way to
+    distinguish large/secret-heavy documents without dumping their contents.
+    """
+    def text_of(element):
+        if not isinstance(element, dict):
+            return ""
+        return (element.get("text") or element.get("raw_md")
+                or element.get("raw") or element.get("kind") or "")
+
+    def positions(seq, key):
+        return [i for i, value in enumerate(seq) if value == key]
+
+    keys = sorted(duplicate_keys, key=repr)
+    entries = []
+    for key in keys[:_DIAGNOSTIC_POSITION_LIMIT]:
+        bpos = positions(base_keys, key)
+        opos = positions(other_keys, key)
+        values = [text_of(base_elements[i]) for i in bpos]
+        values += [text_of(other_elements[i]) for i in opos]
+        witness = next((value for value in values if value), repr(key))
+        entries.append({
+            "quote": _diagnostic_quote(witness),
+            "quote_sha256": hashlib.sha256(
+                witness.encode("utf-8")).hexdigest(),
+            "base_positions": bpos[:_DIAGNOSTIC_POSITION_LIMIT],
+            "base_position_count": len(bpos),
+            "base_positions_sha256": hashlib.sha256(
+                json.dumps(bpos, separators=(",", ":")).encode("ascii")
+            ).hexdigest(),
+            "other_positions": opos[:_DIAGNOSTIC_POSITION_LIMIT],
+            "other_position_count": len(opos),
+            "other_positions_sha256": hashlib.sha256(
+                json.dumps(opos, separators=(",", ":")).encode("ascii")
+            ).hexdigest(),
+        })
+    encoded_keys = json.dumps([repr(key) for key in keys],
+                              ensure_ascii=False, separators=(",", ":"))
+    return {
+        "max_quote_chars": _DIAGNOSTIC_QUOTE_LIMIT,
+        "max_positions_per_side": _DIAGNOSTIC_POSITION_LIMIT,
+        "duplicate_key_count": len(keys),
+        "duplicate_keys_sha256": hashlib.sha256(
+            encoded_keys.encode("utf-8")).hexdigest(),
+        "samples": entries,
+    }
 
 
 def _md_inline_spans(inline_token):
@@ -6867,18 +9419,41 @@ def _sidecar_payload(file_id, md_output_path, md_text, doc):
     return payload
 
 
-def _diff_status(base_keys, other_keys):
-    """Three-way building block: align base against one side.
+def _occurrence_ids(keys):
+    """Give every repeated alignment key a deterministic identity.
 
-    Returns (status, inserts, mapping):
-      status:  base index -> "equal" | "changed" | "deleted"
-      inserts: gap g (insert BEFORE base index g; g == len(base) = at end)
-               -> list of other-side indices
-      mapping: base index -> other index (for equal/changed pairs)
+    Plain ``SequenceMatcher`` is free to choose any copy of an equal block.
+    That is harmless for a display diff and unsafe for sync: two equal
+    paragraphs can carry different comments and formatting.  The occurrence
+    number is deliberately derived from order only; style signatures are
+    state, not identity, and must never be used as a tie-breaker.
     """
-    sm = difflib.SequenceMatcher(a=base_keys, b=other_keys, autojunk=False)
+    counts = {}
+    out = []
+    for key in keys:
+        occurrence = counts.get(key, 0)
+        out.append((key, occurrence))
+        counts[key] = occurrence + 1
+    return out
+
+
+def _diff_status_tokens(base_tokens, other_tokens, base_offset=0,
+                        other_offset=0, repeated_keys=frozenset()):
+    """Align one already-qualified interval, returning absolute indices."""
+    # If twins exist, first build the match from their qualified identities.
+    # Unique neighbours are then allowed to extend those matches, but cannot
+    # win a tie by making SequenceMatcher move one indistinguishable twin.
+    # This makes [X, A, X] -> [X, X, A] move A, never either X.
+    isjunk = ((lambda token: token[0] not in repeated_keys)
+              if repeated_keys else None)
+    sm = difflib.SequenceMatcher(isjunk, base_tokens, other_tokens,
+                                 autojunk=False)
     status, inserts, mapping = {}, {}, {}
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        i1 += base_offset
+        i2 += base_offset
+        j1 += other_offset
+        j2 += other_offset
         if tag == "equal":
             for off in range(i2 - i1):
                 status[i1 + off] = "equal"
@@ -6898,6 +9473,251 @@ def _diff_status(base_keys, other_keys):
         elif tag == "insert":
             inserts.setdefault(i1, []).extend(range(j1, j2))
     return status, inserts, mapping
+
+
+def _diff_status_pinned(base_keys, other_keys, forced_pairs=()):
+    """Align occurrence-qualified keys while keeping selected pairs fixed.
+
+    ``forced_pairs`` contains ``(base_index, other_index)`` pairs proven by
+    anchor accounting.  Pairs must be strictly increasing and must name the
+    same occurrence-qualified identity; otherwise no order-preserving plan
+    exists and the caller must defer that component.
+    """
+    base_tokens = _occurrence_ids(base_keys)
+    other_tokens = _occurrence_ids(other_keys)
+    from collections import Counter
+    bcount, ocount = Counter(base_keys), Counter(other_keys)
+    repeated_keys = {
+        key for key in bcount.keys() & ocount.keys()
+        if bcount[key] == ocount[key] and bcount[key] > 1
+    }
+    pins = sorted(forced_pairs)
+    previous = (-1, -1)
+    for bi, oi in pins:
+        if not (0 <= bi < len(base_tokens) and
+                0 <= oi < len(other_tokens)):
+            raise ValueError("pinned alignment index is out of bounds")
+        if bi <= previous[0] or oi <= previous[1]:
+            raise ValueError("pinned alignment pairs cross or repeat")
+        if base_tokens[bi] != other_tokens[oi]:
+            raise ValueError("pinned alignment identities differ")
+        previous = (bi, oi)
+
+    status, inserts, mapping = {}, {}, {}
+    left_b = left_o = 0
+    for bi, oi in [*pins, (len(base_tokens), len(other_tokens))]:
+        st, ins, mp = _diff_status_tokens(
+            base_tokens[left_b:bi], other_tokens[left_o:oi],
+            left_b, left_o, repeated_keys)
+        status.update(st)
+        mapping.update(mp)
+        for gap, indices in ins.items():
+            inserts.setdefault(gap, []).extend(indices)
+        if bi < len(base_tokens):
+            status[bi] = "equal"
+            mapping[bi] = oi
+            left_b, left_o = bi + 1, oi + 1
+    return status, inserts, mapping
+
+
+def _diff_status(base_keys, other_keys):
+    """Three-way building block: align base against one side.
+
+    Returns (status, inserts, mapping):
+      status:  base index -> "equal" | "changed" | "deleted"
+      inserts: gap g (insert BEFORE base index g; g == len(base) = at end)
+               -> list of other-side indices
+      mapping: base index -> other index (for equal/changed pairs)
+    """
+    return _diff_status_pinned(base_keys, other_keys)
+
+
+def _permutation_alignment_from_moved(base_tokens, other_tokens,
+                                      moved_origins):
+    """Spell one occurrence-qualified permutation as explicit origin moves."""
+    moved = set(moved_origins)
+    local_pos = {token: i for i, token in enumerate(other_tokens)}
+    base_pos = {token: i for i, token in enumerate(base_tokens)}
+    status, inserts, mapping = {}, {}, {}
+    for base_i, token in enumerate(base_tokens):
+        if base_i in moved:
+            status[base_i] = "deleted"
+        else:
+            status[base_i] = "equal"
+            mapping[base_i] = local_pos[token]
+    kept_by_local = sorted((local_i, base_i)
+                           for base_i, local_i in mapping.items())
+    for local_i, token in enumerate(other_tokens):
+        base_i = base_pos[token]
+        if base_i not in moved:
+            continue
+        next_base = next((kept_base for kept_local, kept_base in kept_by_local
+                          if kept_local > local_i), len(base_tokens))
+        inserts.setdefault(next_base, []).append(local_i)
+    return status, inserts, mapping
+
+
+def _bounded_pareto_permutation_alignment(base_keys, other_keys, costs,
+                                          forced_origins, caps):
+    """Find the exact small pure-permutation alignment without dropping a pin.
+
+    Each omitted origin is a moved block.  For small ambiguous corridors we
+    enumerate the Pareto candidates by move count, retaining the lowest-unit
+    feasible member instead of considering only the count-optimal and
+    unit-optimal extremes.  If no complete alignment fits the caps, return the
+    exact lexicographically best valid spelling so the component planner can
+    defer its atomic corridors.  Exhaustive search is deliberately bounded.
+    """
+    base_tokens = _occurrence_ids(base_keys)
+    other_tokens = _occurrence_ids(other_keys)
+    if (len(base_tokens) != len(other_tokens)
+            or set(base_tokens) != set(other_tokens)
+            or len(base_tokens) > 20):
+        return None
+    local_pos = {token: i for i, token in enumerate(other_tokens)}
+    forced = set(forced_origins)
+    movable = [i for i in range(len(base_tokens)) if i not in forced]
+    from itertools import combinations
+    best_valid = None
+    for moved_count in range(len(movable) + 1):
+        best_feasible_at_count = None
+        best_valid_at_count = None
+        for moved_tuple in combinations(movable, moved_count):
+            moved = set(moved_tuple)
+            candidate_cost = {
+                name: sum(costs[i][name] for i in moved)
+                for name in ("blocks", "units", "text", "style")
+            }
+            positions = [local_pos[token]
+                         for i, token in enumerate(base_tokens)
+                         if i not in moved]
+            if any(a >= b for a, b in zip(positions, positions[1:])):
+                continue
+            candidate = (
+                candidate_cost["units"], candidate_cost["text"],
+                candidate_cost["style"], moved_tuple)
+            if (best_valid_at_count is None
+                    or candidate < best_valid_at_count):
+                best_valid_at_count = candidate
+            if (all(candidate_cost[name] <= caps[name]
+                    for name in candidate_cost)
+                    and (best_feasible_at_count is None
+                         or candidate < best_feasible_at_count)):
+                best_feasible_at_count = candidate
+        if best_valid is None and best_valid_at_count is not None:
+            # moved_count is the first exact Pareto coordinate.
+            best_valid = best_valid_at_count
+        if best_feasible_at_count is not None:
+            best_valid = best_feasible_at_count
+            break
+        # Once a valid spelling exists beyond the block ceiling, no later
+        # moved-count can become feasible.  The first valid spelling is the
+        # exact fallback needed for componentization.
+        if (best_valid is not None
+                and moved_count >= min(caps["blocks"], len(movable))):
+            break
+    if best_valid is None:
+        return None
+    return _permutation_alignment_from_moved(
+        base_tokens, other_tokens, best_valid[3])
+
+
+def _constrained_permutation_alignment(base_keys, other_keys,
+                                       mandatory_origins):
+    """Return a deterministic valid large-permutation origin alignment.
+
+    Mandatory origins (live anchors and opaque blocks) are never omitted.
+    Between them, a canonical maximum-cardinality increasing subsequence is
+    retained.  This is deliberately not advertised as the four-dimensional
+    Pareto optimum; its purpose is to give the cost componentizer an explicit,
+    valid origin graph in O(n log n), independent of SequenceMatcher opcodes.
+    """
+    from bisect import bisect_left
+
+    base_tokens = _occurrence_ids(base_keys)
+    other_tokens = _occurrence_ids(other_keys)
+    if (len(base_tokens) != len(other_tokens)
+            or set(base_tokens) != set(other_tokens)):
+        return None
+    local_pos = {token: i for i, token in enumerate(other_tokens)}
+    mandatory = sorted(set(mandatory_origins))
+    if any(not 0 <= origin < len(base_tokens) for origin in mandatory):
+        return None
+    mandatory_positions = [local_pos[base_tokens[i]] for i in mandatory]
+    if any(a >= b for a, b in zip(
+            mandatory_positions, mandatory_positions[1:])):
+        return None
+
+    kept = set(mandatory)
+    boundaries = [(-1, -1), *zip(mandatory, mandatory_positions),
+                  (len(base_tokens), len(other_tokens))]
+    for (left_origin, left_local), (right_origin, right_local) in zip(
+            boundaries, boundaries[1:]):
+        candidates = [
+            origin for origin in range(left_origin + 1, right_origin)
+            if left_local < local_pos[base_tokens[origin]] < right_local
+        ]
+        tails_local = []
+        tails_origin = []
+        predecessor = {}
+        for origin in candidates:
+            other_i = local_pos[base_tokens[origin]]
+            slot = bisect_left(tails_local, other_i)
+            predecessor[origin] = (
+                tails_origin[slot - 1] if slot else None)
+            if slot == len(tails_local):
+                tails_local.append(other_i)
+                tails_origin.append(origin)
+            else:
+                # The lower local endpoint is the stable tie-break.  Keeping
+                # this replacement makes [1, 0, 2] retain origin 1, not 0.
+                tails_local[slot] = other_i
+                tails_origin[slot] = origin
+        cursor = tails_origin[-1] if tails_origin else None
+        while cursor is not None:
+            kept.add(cursor)
+            cursor = predecessor[cursor]
+
+    moved = [i for i in range(len(base_tokens)) if i not in kept]
+    return _permutation_alignment_from_moved(
+        base_tokens, other_tokens, moved)
+
+
+def _normalized_permutation_alignment(base_keys, other_keys, costs,
+                                      mandatory_origins, caps):
+    """Normalize a pure permutation into explicit occurrence-origin moves."""
+    base_tokens = _occurrence_ids(base_keys)
+    other_tokens = _occurrence_ids(other_keys)
+    if (len(base_tokens) != len(other_tokens)
+            or set(base_tokens) != set(other_tokens)):
+        return None
+    mandatory = set(mandatory_origins) | {
+        base_i for base_i, key in enumerate(base_keys)
+        if key[0] == "opaque"
+    }
+    if len(base_tokens) <= 20:
+        alignment = _bounded_pareto_permutation_alignment(
+            base_keys, other_keys, costs, mandatory, caps)
+        strategy = "exact-pareto"
+        optimality_proven = True
+    else:
+        alignment = _constrained_permutation_alignment(
+            base_keys, other_keys, mandatory)
+        strategy = "constrained-lis"
+        optimality_proven = False
+    if alignment is None:
+        return None
+    status, inserts, mapping = alignment
+    return {
+        "status": status,
+        "inserts": inserts,
+        "mapping": mapping,
+        "moved_origins": sorted(
+            i for i, state in status.items() if state == "deleted"),
+        "strategy": strategy,
+        "optimality_proven": optimality_proven,
+        "origin_count": len(base_tokens),
+    }
 
 
 def _utf16_len(s):
@@ -6983,7 +9803,10 @@ def _pair_moved_blocks(deleted, inserted, base_els, local_els):
     key (measured M21). Pairing them is what lets a moved block keep its own
     styling instead of arriving as a fresh markdown block.
 
-    Returns {(type, normalized text): base_index}.
+    Returns {occurrence-qualified block id: base_index}.  The same identity
+    used by alignment is essential here: falling back to plain text after the
+    planner distinguished twins would make the inserted twin look fresh and
+    silently clear its non-markdown styling.
 
     The pair must also agree in UTF-16 LENGTH, because the captured runs are
     reapplied by length at the new address. Today that follows from the key
@@ -6991,37 +9814,39 @@ def _pair_moved_blocks(deleted, inserted, base_els, local_els):
     is exactly why the check is written down: the day _norm_ws starts folding
     anything wider, run boundaries would silently land off by a character.
 
-    A key occurring more than once on either side is never a move — which of
-    the twins carries the thread is not provable. Twins are counted over the
-    WHOLE sequences, not just the changed zone: a paragraph whose twin sits
-    quietly in an untouched part of the document is still a paragraph nobody
-    can tell apart. `_dup_guard` already refuses such a sync upstream; this is
-    the second line of the same fence, kept because a fence must not depend on
-    another check staying as it is.
+    Changed duplicate multiplicity is refused/deferred before this helper.
+    With equal multiplicity, ``(key, occurrence_index)`` is the planner's
+    proven origin identity and can safely carry the matching paragraph's runs.
     """
-    from collections import Counter
-
     def key_of(el, opaque):
         return (None if el["type"] == opaque
                 else (el["type"], _norm_ws(el["text"])))
 
-    d_keys = [key_of(base_els[i], "opaque") for i in deleted]
-    i_keys = [key_of(lel, "opaque-md") for _g, lel in inserted]
-    d_count = Counter(k for k in (key_of(e, "opaque") for e in base_els)
-                      if k is not None)
-    i_count = Counter(k for k in (key_of(e, "opaque-md") for e in local_els)
-                      if k is not None)
-    widths = {}
-    for k, (_g, lel) in zip(i_keys, inserted):
-        if k is not None:
-            widths[k] = _utf16_len(lel["text"])
-    return {k: i for k, i in zip(d_keys, deleted)
-            # unique in BOTH whole sequences, and actually inserted (a key
-            # counted once in local may well be an untouched paragraph —
-            # `k in widths` is what says the plan really inserts this one)
-            if k is not None and d_count[k] == 1 and i_count.get(k) == 1
-            and k in widths
-            and widths[k] == _utf16_len(base_els[i]["text"])}
+    base_tokens = _occurrence_ids([
+        key_of(el, "opaque") for el in base_els
+    ])
+    local_tokens = _occurrence_ids([
+        key_of(el, "opaque-md") for el in local_els
+    ])
+    from collections import Counter
+    base_count = Counter(token[0] for token in base_tokens)
+    local_count = Counter(token[0] for token in local_tokens)
+    local_index = {id(el): i for i, el in enumerate(local_els)}
+    inserted_by_token = {}
+    for _gap, lel in inserted:
+        local_i = local_index.get(id(lel))
+        if local_i is not None and local_tokens[local_i][0] is not None:
+            inserted_by_token[local_tokens[local_i]] = lel
+    out = {}
+    for base_i in deleted:
+        token = base_tokens[base_i]
+        lel = inserted_by_token.get(token)
+        if (token[0] is not None and lel is not None
+                and base_count[token[0]] == local_count[token[0]]
+                and _utf16_len(lel["text"]) ==
+                _utf16_len(base_els[base_i]["text"])):
+            out[token] = base_i
+    return out
 
 
 # inserted blocks: nothing to preserve, but the full-mask clear must still
@@ -7029,6 +9854,15 @@ def _pair_moved_blocks(deleted, inserted, base_els, local_els):
 # block would otherwise come out red/10pt/etc. (codex style-r2 #2). No
 # "type" key => same_type is always False => clean named style + clear.
 _FRESH_BLOCK_PRESERVE = {"para_style": {}, "text_style": {}}
+
+# Aggregate ceiling for the extra destructive detours introduced by pinned
+# alignment (M23).  They are intentionally absolute, not percentage based:
+# a short document can still be expensive when its text/run topology is
+# fragmented, while a long document can have a tiny safe detour.
+_MAX_PINNED_MOVE_BLOCKS = 500
+_MAX_PINNED_DESTRUCTIVE_UNITS = 201_000
+_MAX_PINNED_TEXT_REQUESTS = 1_000
+_MAX_PINNED_STYLE_REQUESTS = 2_500
 
 
 def _link_intervals(sig, start_index):
@@ -7279,6 +10113,12 @@ def sync_doc(file_id, md_path, tab_id=None):
 
     local_els, md_errors = _md_elements(md_text)
     base_els = base["elements"]
+    # Held separately from the executable target.  r15 may defer one unsafe
+    # component while applying independent work; lifecycle then rebases this
+    # complete intent onto the fresh remote merge-base.
+    intent_local_els = list(local_els)
+    partial_plan = None
+    cost_alignment_context = None
 
     try:
         creds = get_creds()
@@ -7319,6 +10159,23 @@ def sync_doc(file_id, md_path, tab_id=None):
 
     base_lkeys = [k_base_local(e) for e in base_els]
     local_keys = [k_local(e) for e in local_els]
+    intent_local_keys = list(local_keys)
+    intent_token_pos = {token: i for i, token in enumerate(
+        _occurrence_ids(intent_local_keys))}
+    base_intent_tokens = _occurrence_ids(base_lkeys)
+
+    def _intent_for_origin(base_i):
+        local_i = intent_token_pos.get(base_intent_tokens[base_i])
+        return (intent_local_els[local_i] if local_i is not None else None)
+
+    def _intent_style_changed(base_i):
+        lel = _intent_for_origin(base_i)
+        if lel is None or base_els[base_i]["type"] == "opaque":
+            return False
+        expected_sig = base_els[base_i].get(
+            "md_sig", base_els[base_i].get("sig"))
+        return lel.get("sig") is not None and lel["sig"] != expected_sig
+
     base_rkeys = [k_base_remote(e) for e in base_els]
     remote_keys = [k_base_remote(e) for e in remote_els]
 
@@ -7333,6 +10190,989 @@ def sync_doc(file_id, md_path, tab_id=None):
             if base_els[i].get("doc_fp") != remote_els[r_map[i]].get("doc_fp"):
                 r_status[i] = "changed"
 
+    # --- anchor-aware alignment preflight (r15) ---
+    # The first diff is only a draft: it tells us whether a destructive local
+    # intent exists.  Anchor accounting and its freshness snapshot MUST happen
+    # before the final alignment, because the final choice of which equal
+    # block moves depends on which blocks are pinned by live comments.
+    draft_removal = any(s in ("changed", "deleted")
+                        for s in l_status.values())
+    all_comments = anchored = universe = None
+    fp1 = None
+    snap = None
+
+    def _canary_note(msg):
+        """Clean up the canary before a pre-batch exit, reporting failure.
+
+        This helper is deliberately defined before the r15 materialisation
+        detours below.  Those detours run after ``_fresh_anchor_snapshot``
+        has inserted the canary, and an internal refusal must therefore use
+        exactly the same cleanup/recovery protocol as every later refusal.
+        """
+        cleanup_ok = (snap is None or _cleanup_canary(
+            docs_service, file_id, snap["canary"]))
+        if not cleanup_ok:
+            msg += (f" ВНИМАНИЕ: в конце документа осталась служебная "
+                    f"строка «{snap['canary']['text']}» — удалите её "
+                    f"вручную (данные не потеряны).")
+        return msg
+
+    def _materialize_deferred(base_i, label):
+        """Materialize one deferred base block without weakening v1 parsing.
+
+        A parser note is safe to ignore only when the one parsed element is a
+        supported, raw-verbatim paragraph.  In particular an image/raw block
+        is represented as ``opaque-md`` plus a note; it is not a writable
+        downstream element and must remain a refusal.  Keep this decision in
+        one helper so all four deferred hull planners have identical canary
+        and error semantics.
+        """
+        raw = base_els[base_i].get("raw_md", "")
+        parsed, problems = _md_elements(raw)
+        element = parsed[0] if len(parsed) == 1 else None
+        kind = element.get("type") if element else None
+        supported = kind in _DEFERRED_SUPPORTED_KINDS
+        raw_verbatim = bool(element and element.get("raw") == raw)
+        # The parser currently emits no note that preserves a paragraph-like
+        # element.  Keep the allowlist explicit so a future note cannot turn
+        # an image/code/html/blockquote opaque atom into a writable element by
+        # accident; adding a note here requires a proof of raw semantics and
+        # downstream request support.
+        safe_notes = frozenset()
+        parse_note_is_safe = bool(problems) and all(
+            str(problem) in safe_notes for problem in problems)
+        if (len(parsed) == 1 and supported and raw_verbatim
+                and (not problems or parse_note_is_safe)):
+            return element
+        detail = "; ".join(str(problem) for problem in problems) or (
+            f"parsed {len(parsed)} elements")
+        _error(_canary_note(
+            f"internal: cannot materialize a deferred {label} block "
+            f"{base_i}: {detail}"))
+
+    anchor_origins = set()
+    forced = set()
+    body_content = (doc_tab.get("body", {}) or {}).get("content", [])
+    body_end = body_content[-1]["endIndex"] if body_content else 2
+    named_intervals = []
+    if draft_removal:
+        all_comments, anchored, fp1, universe = _census_comments(
+            drive_service, file_id)
+        named_intervals = _named_range_intervals(doc_tab)
+        if anchored:
+            snap, retry_reason = _fresh_anchor_snapshot(
+                docs_service, drive_service, file_id, doc, doc_tab,
+                anchored, named_intervals, body_end, fp1=fp1,
+                universe=universe, tid=_tid)
+            if snap is None:
+                _error(f"{retry_reason} — re-run sync (nothing applied)")
+
+            # Translate each healthy mapped anchor from the live remote
+            # paragraph back to its base origin.  Only a block that the draft
+            # would move is pinned: an unrelated insert between anchored
+            # neighbours must stay possible.
+            inverse_r = {remote_i: base_i for base_i, remote_i in r_map.items()
+                         if r_status.get(base_i) != "deleted"}
+            local_pos = {token: i for i, token in enumerate(
+                         _occurrence_ids(local_keys))}
+            composite_groups = []
+            for anchor_start, anchor_end, _text, _aid in snap["anchors"]:
+                group = []
+                for remote_i, rel in enumerate(remote_els):
+                    if (rel["start"] < anchor_end and
+                            anchor_start < rel["end"] and
+                            remote_i in inverse_r):
+                        origin = inverse_r[remote_i]
+                        anchor_origins.add(origin)
+                        group.append(origin)
+                if len(group) > 1:
+                    composite_groups.append(group)
+
+            # A cross-paragraph anchor is one composite object.  Keeping its
+            # member paragraphs pinned individually is insufficient: an
+            # existing third origin can then be "moved" between the members
+            # by insert+delete, silently expanding the live thread range.
+            # Fresh unmatched insertion remains allowed (insertText does not
+            # destroy an anchor); only an existing B(i) origin violates the
+            # composite's exact local contiguity.
+            composite_violation = set()
+            base_tokens_now = _occurrence_ids(base_lkeys)
+            for group in composite_groups:
+                member_positions = [
+                    local_pos.get(base_tokens_now[origin])
+                    for origin in group
+                ]
+                if (any(pos is None for pos in member_positions)
+                        or member_positions != sorted(member_positions)):
+                    # Missing members hit the ordinary protected deletion
+                    # fence; reordered members become crossing pins below.
+                    continue
+                lo_pos, hi_pos = min(member_positions), max(member_positions)
+                intruders = {
+                    origin for origin, token in enumerate(base_tokens_now)
+                    if origin not in group
+                    and token in local_pos
+                    and lo_pos < local_pos[token] < hi_pos
+                }
+                if intruders:
+                    composite_violation.update(group)
+                    composite_violation.update(intruders)
+
+            if composite_violation:
+                hull_lo = min(composite_violation)
+                hull_hi = max(composite_violation)
+                local_members = [
+                    local_pos[token]
+                    for origin, token in enumerate(base_tokens_now)
+                    if hull_lo <= origin <= hull_hi and token in local_pos
+                ]
+                local_lo, local_hi = min(local_members), max(local_members)
+                remote_clean = all(
+                    r_status.get(i, "equal") == "equal"
+                    or (i in r_map
+                        and base_rkeys[i] == remote_keys[r_map[i]]
+                        and not _intent_style_changed(i))
+                    for i in range(hull_lo, hull_hi + 1)
+                ) and not any(hull_lo <= gap <= hull_hi + 1
+                              for gap in r_inserts)
+                if remote_clean:
+                    restored = []
+                    for base_i in range(hull_lo, hull_hi + 1):
+                        restored.append(_materialize_deferred(
+                            base_i, "composite"))
+                    local_els = (intent_local_els[:local_lo] + restored
+                                 + intent_local_els[local_hi + 1:])
+                    local_keys = [k_local(el) for el in local_els]
+                    local_pos = {token: i for i, token in enumerate(
+                        _occurrence_ids(local_keys))}
+                    # Do not align every other pin yet: another independent
+                    # component may itself cross.  The loop below collects
+                    # and localizes it; calling the pinned aligner here would
+                    # raise after the canary was inserted and orphan it.
+                    l_status, l_inserts, l_map = _diff_status(
+                        base_lkeys, local_keys)
+                    partial_plan = {
+                        "reason": "composite-anchor",
+                        "base_hulls": [(hull_lo, hull_hi)],
+                        "local_hulls": [(local_lo, local_hi)],
+                    }
+
+            while True:
+                base_tokens = _occurrence_ids(base_lkeys)
+                additions = {
+                    (base_i, local_pos[base_tokens[base_i]])
+                    for base_i in anchor_origins
+                    if l_status.get(base_i, "equal") != "equal"
+                    and base_tokens[base_i] in local_pos
+                }
+                additions -= forced
+                if not additions:
+                    break
+                forced.update(additions)
+                try:
+                    l_status, l_inserts, l_map = _diff_status_pinned(
+                        base_lkeys, local_keys, forced)
+                except ValueError:
+                    component_local_els = list(local_els)
+                    component_local_keys = list(local_keys)
+                    # Crossing pins have no order-preserving solution.  Find
+                    # the smallest crossing origin hull, then absorb reorder
+                    # corridors that touch it.  Text replacements immediately
+                    # outside remain independent; a move or insertion using
+                    # the hull's boundary gap does not.
+                    ordered_pins = sorted(forced)
+                    crossing = set()
+                    for p, (bi, oi) in enumerate(ordered_pins):
+                        for bj, oj in ordered_pins[p + 1:]:
+                            if oi > oj:
+                                crossing.update(((bi, oi), (bj, oj)))
+                    if not crossing:
+                        break  # defensive; the final overlap fence still wins
+                    hull_lo = min(bi for bi, _oi in crossing)
+                    hull_hi = max(bi for bi, _oi in crossing)
+                    base_pos = {token: i for i, token in enumerate(
+                        _occurrence_ids(base_lkeys))}
+                    local_pos_full = {token: i for i, token in enumerate(
+                        _occurrence_ids(component_local_keys))}
+                    changed = True
+                    while changed:
+                        changed = False
+                        for token in base_pos.keys() & local_pos_full.keys():
+                            bi, oi = base_pos[token], local_pos_full[token]
+                            if bi == oi:
+                                continue
+                            move_lo, move_hi = sorted((bi, oi))
+                            if (move_lo <= hull_hi + 1 and
+                                    hull_lo <= move_hi + 1):
+                                new_lo = min(hull_lo, move_lo)
+                                # `oi` is in the local coordinate space and
+                                # may exceed the last base origin after an
+                                # insertion.  The base hull can absorb the
+                                # last origin, never a fictitious one-past
+                                # origin; the corresponding local extent is
+                                # computed separately below.
+                                new_hi = min(len(base_els) - 1,
+                                             max(hull_hi, move_hi))
+                                if (new_lo, new_hi) != (hull_lo, hull_hi):
+                                    hull_lo, hull_hi = new_lo, new_hi
+                                    changed = True
+
+                    local_hull_positions = [
+                        local_pos_full[token]
+                        for token, bi in base_pos.items()
+                        if hull_lo <= bi <= hull_hi
+                        and token in local_pos_full
+                    ]
+                    local_lo = min(local_hull_positions)
+                    local_hi = max(local_hull_positions)
+
+                    # A changed origin INSIDE the deferred base hull and its
+                    # paired unmatched local payload are one operation.  If
+                    # only the deletion half is restored, the payload leaks
+                    # through as an insertion and the document ends up with
+                    # both old and new paragraphs (reviewer P0 repro:
+                    # [P1,A,P2] -> [P2,P1,A-edit]).  Occurrence identities
+                    # exclude moved equal origins from this semantic pairing.
+                    residual_base = [
+                        base_i for base_i, token in enumerate(base_tokens)
+                        if token not in local_pos_full
+                    ]
+                    residual_local = [
+                        local_i for local_i, token in enumerate(
+                            _occurrence_ids(component_local_keys))
+                        if token not in base_pos
+                    ]
+                    semantic_local = []
+                    # Pairing changed payloads by SequenceMatcher opcodes is
+                    # unsafe: a crossing equal block can make it call the
+                    # wrong later origin "changed" and the real replacement
+                    # "inserted".  Residual order is the only stable evidence
+                    # left.  When cardinalities differ, absorb every local
+                    # rank that the inside base rank could occupy after the
+                    # surplus insertions/deletions; over-deferral is safe,
+                    # leaking either half is not.
+                    m, n = len(residual_base), len(residual_local)
+                    for rank, base_i in enumerate(residual_base):
+                        if not (hull_lo <= base_i <= hull_hi) or not n:
+                            continue
+                        lower = max(0, rank - max(0, m - n))
+                        upper = min(n - 1, rank + max(0, n - m))
+                        semantic_local.extend(
+                            residual_local[k]
+                            for k in range(lower, upper + 1))
+                    if semantic_local:
+                        local_lo = min(local_lo, *semantic_local)
+                        local_hi = max(local_hi, *semantic_local)
+
+                    # A true insertion at the shared right boundary is part
+                    # of the component.  Take the contiguous unmatched run
+                    # only; the first equal occurrence after it is an
+                    # independent boundary.  Same-cardinality unmatched
+                    # blocks have already been paired above when they replace
+                    # an origin inside the base hull.
+                    if len(component_local_els) > len(base_els):
+                        unmatched = {
+                            i for token, i in local_pos_full.items()
+                            if token not in base_pos
+                        }
+                        cursor = local_hi + 1
+                        while cursor in unmatched:
+                            local_hi = cursor
+                            cursor += 1
+
+                    # A deferred ordering component may carry fresh remote
+                    # styling per origin, but it must not straddle remote
+                    # text/reorder/insert work.  That would make the local
+                    # precedence intent refer to origins whose boundary graph
+                    # changed underneath it, so keep the existing global
+                    # conflict/refusal path instead of manufacturing a blend.
+                    remote_dirty = any(
+                        r_status.get(i, "equal") != "equal"
+                        and not (i in r_map and
+                                 base_rkeys[i] == remote_keys[r_map[i]]
+                                 and not _intent_style_changed(i))
+                        for i in range(hull_lo, hull_hi + 1)
+                    ) or any(hull_lo <= gap <= hull_hi + 1
+                             for gap in r_inserts)
+                    if remote_dirty:
+                        break
+
+                    def _base_as_local(base_i):
+                        return _materialize_deferred(base_i, "base")
+
+                    local_els = (
+                        component_local_els[:local_lo]
+                        + [_base_as_local(i)
+                           for i in range(hull_lo, hull_hi + 1)]
+                        + component_local_els[local_hi + 1:]
+                    )
+                    local_keys = [k_local(e) for e in local_els]
+                    safe_pos = {token: i for i, token in enumerate(
+                        _occurrence_ids(local_keys))}
+                    safe_pins = [
+                        (base_i, safe_pos[base_tokens[base_i]])
+                        for base_i in anchor_origins
+                        if base_tokens[base_i] in safe_pos
+                    ]
+                    l_status, l_inserts, l_map = _diff_status_pinned(
+                        base_lkeys, local_keys, safe_pins)
+                    if partial_plan is None:
+                        partial_plan = {
+                            "reason": "crossing-pins",
+                            "base_hulls": [(hull_lo, hull_hi)],
+                            "local_hulls": [(local_lo, local_hi)],
+                        }
+                    else:
+                        partial_plan["reason"] += "+crossing-pins"
+                        partial_plan.setdefault("base_hulls", []).append(
+                            (hull_lo, hull_hi))
+                        partial_plan.setdefault("local_hulls", []).append(
+                            (local_lo, local_hi))
+                    break
+
+            # Pinned detours are allowed only under the aggregate M23 budget.
+            # If independent pure moves exceed it, retain the cheapest
+            # feasible subset and defer the rest.  The filtering is performed
+            # on origins before request generation, so no unsafe request can
+            # leak into the batch and the expected-state verifier describes
+            # exactly the safe target.
+            if partial_plan is None and forced:
+                def _within_pinned_caps(cost):
+                    return (
+                        cost["blocks"] <= _MAX_PINNED_MOVE_BLOCKS
+                        and cost["units"] <=
+                        _MAX_PINNED_DESTRUCTIVE_UNITS
+                        and cost["text"] <= _MAX_PINNED_TEXT_REQUESTS
+                        and cost["style"] <= _MAX_PINNED_STYLE_REQUESTS
+                    )
+
+                base_tokens = _occurrence_ids(base_lkeys)
+                local_tokens = _occurrence_ids(local_keys)
+                local_token_pos = {token: i for i, token in enumerate(
+                    local_tokens)}
+                origin_costs = []
+                for base_i, token in enumerate(base_tokens):
+                    local_i = local_token_pos.get(token)
+                    style_count = _MAX_PINNED_STYLE_REQUESTS + 1
+                    if (local_i is not None and base_i in r_map
+                            and base_els[base_i]["type"] != "opaque"):
+                        preserve, _dropped = _capture_preserve(
+                            remote_els[r_map[base_i]], with_text=False)
+                        style_count = len(_style_requests_for_block(
+                            local_els[local_i], 1, preserve))
+                    origin_costs.append({
+                        "blocks": 1,
+                        "units": 2 * (
+                            _utf16_len(base_els[base_i].get("text", "")) + 1),
+                        # One delete plus one insert is a conservative upper
+                        # bound; coalescing can only reduce the sent count.
+                        "text": 2,
+                        "style": style_count,
+                    })
+                caps = {
+                    "blocks": _MAX_PINNED_MOVE_BLOCKS,
+                    "units": _MAX_PINNED_DESTRUCTIVE_UNITS,
+                    "text": _MAX_PINNED_TEXT_REQUESTS,
+                    "style": _MAX_PINNED_STYLE_REQUESTS,
+                }
+                # Normalize every pure occurrence-qualified permutation into
+                # explicit origin moves.  SequenceMatcher may spell the same
+                # move as changed+inserted, which is unsuitable for cost
+                # accounting.  Small inputs retain exact Pareto enumeration;
+                # large inputs use a valid constrained alignment and say
+                # explicitly that optimality was not proven.
+                mandatory_origins = (
+                    set(anchor_origins)
+                    | {base_i for base_i, _local_i in forced}
+                )
+                normalized = _normalized_permutation_alignment(
+                    base_lkeys, local_keys, origin_costs,
+                    mandatory_origins, caps)
+                normalized_moves = None
+                if normalized is not None:
+                    l_status = normalized["status"]
+                    l_inserts = normalized["inserts"]
+                    l_map = normalized["mapping"]
+                    normalized_moves = set(normalized["moved_origins"])
+                    cost_alignment_context = {
+                        "strategy": normalized["strategy"],
+                        "optimality_proven": normalized[
+                            "optimality_proven"],
+                        "origin_count": normalized["origin_count"],
+                    }
+
+                inserted_local = {
+                    j for indices in l_inserts.values() for j in indices
+                }
+                move_costs = []
+                for base_i, state in l_status.items():
+                    token = base_tokens[base_i]
+                    local_i = local_token_pos.get(token)
+                    is_explicit_move = (
+                        base_i in normalized_moves
+                        if normalized_moves is not None
+                        else state == "deleted" and local_i in inserted_local
+                    )
+                    if (is_explicit_move and
+                            base_els[base_i]["type"] != "opaque"):
+                        move_costs.append({
+                            "base": base_i, "local": local_i,
+                            **origin_costs[base_i],
+                        })
+
+                total_cost = {
+                    name: sum(move[name] for move in move_costs)
+                    for name in ("blocks", "units", "text", "style")
+                }
+                if move_costs and not _within_pinned_caps(total_cost):
+                    groups = []
+                    for move in sorted(
+                            move_costs,
+                            key=lambda item: min(item["base"], item["local"])):
+                        lo = min(move["base"], move["local"])
+                        hi = max(move["base"], move["local"])
+                        if groups and lo <= groups[-1]["hi"] + 1:
+                            groups[-1]["hi"] = max(groups[-1]["hi"], hi)
+                            groups[-1]["moves"].append(move)
+                        else:
+                            groups.append({"lo": lo, "hi": hi,
+                                           "moves": [move]})
+                    for group in groups:
+                        group["cost"] = {
+                            name: sum(move[name] for move in group["moves"])
+                            for name in ("blocks", "units", "text", "style")
+                        }
+                    selected, used = [], {
+                        "blocks": 0, "units": 0, "text": 0, "style": 0,
+                    }
+                    for group in sorted(
+                            groups,
+                            key=lambda item: (item["cost"]["style"],
+                                              item["cost"]["text"],
+                                              item["cost"]["units"],
+                                              item["cost"]["blocks"],
+                                              item["lo"])):
+                        candidate = {
+                            name: used[name] + group["cost"][name]
+                            for name in used
+                        }
+                        if _within_pinned_caps(candidate):
+                            selected.extend(group["moves"])
+                            used = candidate
+                    deferred = [move for move in move_costs
+                                if move not in selected]
+                    deferred_set = {
+                        (move["base"], move["local"]) for move in deferred
+                    }
+                    deferred_groups = [
+                        group for group in groups
+                        if any((move["base"], move["local"])
+                               in deferred_set
+                               for move in group["moves"])
+                    ]
+                    deferred_remote_clean = all(
+                        all(
+                            r_status.get(i, "equal") == "equal"
+                            or (i in r_map
+                                and base_rkeys[i] == remote_keys[r_map[i]]
+                                and not _intent_style_changed(i))
+                            for i in range(group["lo"], group["hi"] + 1)
+                        )
+                        and not any(
+                            group["lo"] <= gap <= group["hi"] + 1
+                            for gap in r_inserts)
+                        for group in deferred_groups
+                    ) and not any(
+                        # A defensive cross-check: every deferred move must
+                        # belong to exactly one atomic corridor group.
+                        not any(move in group["moves"]
+                                for group in deferred_groups)
+                        for move in deferred
+                    )
+
+                    # Cost filtering is currently limited to a pure origin
+                    # permutation.  Other semantic edits keep the ordinary
+                    # fail-closed path until they can be componentized without
+                    # guessing an origin for a changed/inserted block.
+                    if (len(base_tokens) == len(local_tokens)
+                            and set(base_tokens) == set(local_tokens)
+                            and deferred_remote_clean):
+                        selected_origins = {move["base"] for move in selected}
+                        origin_order = [i for i in range(len(base_els))
+                                        if i not in selected_origins]
+                        intent_origins = [
+                            {token: i for i, token in enumerate(base_tokens)}[t]
+                            for t in local_tokens
+                        ]
+                        for move in sorted(selected,
+                                           key=lambda m: m["local"]):
+                            base_i, local_i = move["base"], move["local"]
+                            next_origin = next(
+                                (origin for origin in intent_origins[local_i + 1:]
+                                 if origin in origin_order), None)
+                            if next_origin is None:
+                                origin_order.append(base_i)
+                            else:
+                                origin_order.insert(
+                                    origin_order.index(next_origin), base_i)
+
+                        safe_els = []
+                        deferred_origins = {
+                            move["base"] for move in deferred
+                        }
+                        for base_i in origin_order:
+                            intent_el = _intent_for_origin(base_i)
+                            if (base_i not in deferred_origins
+                                    and _intent_style_changed(base_i)
+                                    and intent_el is not None):
+                                safe_els.append(intent_el)
+                                continue
+                            safe_els.append(_materialize_deferred(
+                                base_i, "cost-deferred"))
+                        local_els = safe_els
+                        local_keys = [k_local(e) for e in local_els]
+                        # Normalize again after selecting components.  Every
+                        # unselected origin is mandatory here: an equivalent
+                        # diff spelling must not make a deferred origin pay
+                        # for an applied move or split a corridor in half.
+                        selected_alignment = (
+                            _normalized_permutation_alignment(
+                                base_lkeys, local_keys, origin_costs,
+                                set(range(len(base_tokens)))
+                                - selected_origins,
+                                caps)
+                        )
+                        assert selected_alignment is not None, (
+                            "selected cost components lost their valid "
+                            "occurrence-origin alignment")
+                        l_status = selected_alignment["status"]
+                        l_inserts = selected_alignment["inserts"]
+                        l_map = selected_alignment["mapping"]
+                        applied_origins = set(
+                            selected_alignment["moved_origins"])
+                        used = {
+                            name: sum(origin_costs[base_i][name]
+                                      for base_i in applied_origins)
+                            for name in ("blocks", "units", "text", "style")
+                        }
+                        partial_plan = {
+                            "reason": "cost-limit",
+                            "applied_cost": used,
+                            "aggregate_cost": total_cost,
+                            "planner": cost_alignment_context,
+                            "deferred_base_indices": [
+                                move["base"] for move in deferred],
+                            # Lifecycle cannot infer this second coordinate
+                            # from a cost corridor: unlike hull-based partials,
+                            # a deferred move may also carry local markdown
+                            # style intent at a distant occurrence-qualified
+                            # position.  Persist the exact origin edge.
+                            "deferred_origin_intent": [
+                                {
+                                    "base_index": move["base"],
+                                    "intent_local_index": intent_token_pos[
+                                        base_tokens[move["base"]]],
+                                }
+                                for move in deferred
+                            ],
+                        }
+
+    # --- changed duplicate multiplicity: localize the ambiguous hull (#53) ---
+    if partial_plan is None:
+        from collections import Counter
+        base_counts = Counter(base_lkeys)
+        intent_counts = Counter(intent_local_keys)
+        ambiguous_keys = {
+            key for key in base_counts.keys() | intent_counts.keys()
+            if (base_counts[key] > 1 or intent_counts[key] > 1)
+            and base_counts[key] != intent_counts[key]
+            and base_counts[key] > 0
+        }
+        if ambiguous_keys:
+            duplicate_base = [i for i, key in enumerate(base_lkeys)
+                              if key in ambiguous_keys]
+            duplicate_local = [i for i, key in enumerate(intent_local_keys)
+                               if key in ambiguous_keys]
+            hull_lo, hull_hi = min(duplicate_base), max(duplicate_base)
+
+            # A reorder corridor sharing the ambiguity boundary belongs to
+            # the same component; otherwise an operation could still choose
+            # which twin is which indirectly through the shared gap.
+            base_pos = {token: i for i, token in enumerate(
+                _occurrence_ids(base_lkeys))}
+            intent_pos = {token: i for i, token in enumerate(
+                _occurrence_ids(intent_local_keys))}
+
+            def _duplicate_local_hull():
+                """Inclusive local hull, or ``(boundary, boundary-1)``.
+
+                All copies of an ambiguous key may have been deleted.  An
+                empty local side is a real component, not a reason to call
+                min([]) after the freshness canary exists (reviewer P0).
+                Surviving origins inside an expanded reorder corridor join
+                the local hull; otherwise neighbouring survivors prove the
+                deletion boundary.
+                """
+                members = list(duplicate_local)
+                members.extend(
+                    intent_pos[token]
+                    for token, base_i in base_pos.items()
+                    if hull_lo <= base_i <= hull_hi and token in intent_pos)
+                if members:
+                    return min(members), max(members)
+                right = [
+                    intent_pos[token] for token, base_i in base_pos.items()
+                    if base_i > hull_hi and token in intent_pos
+                ]
+                if right:
+                    boundary = min(right)
+                else:
+                    left = [
+                        intent_pos[token] for token, base_i in base_pos.items()
+                        if base_i < hull_lo and token in intent_pos
+                    ]
+                    boundary = max(left, default=-1) + 1
+                return boundary, boundary - 1
+
+            local_lo, local_hi = _duplicate_local_hull()
+            changed = True
+            while changed:
+                changed = False
+                for token in base_pos.keys() & intent_pos.keys():
+                    bi, oi = base_pos[token], intent_pos[token]
+                    if bi == oi:
+                        continue
+                    move_lo, move_hi = sorted((bi, oi))
+                    if (move_lo <= hull_hi + 1 and
+                            hull_lo <= move_hi + 1):
+                        new_lo = min(hull_lo, move_lo)
+                        new_hi = min(len(base_els) - 1,
+                                     max(hull_hi, move_hi))
+                        if (new_lo, new_hi) != (hull_lo, hull_hi):
+                            hull_lo, hull_hi = new_lo, new_hi
+                            local_lo, local_hi = _duplicate_local_hull()
+                            changed = True
+
+            remote_clean = all(
+                r_status.get(i, "equal") == "equal"
+                or (i in r_map
+                    and base_rkeys[i] == remote_keys[r_map[i]]
+                    and not _intent_style_changed(i))
+                for i in range(hull_lo, hull_hi + 1)
+            ) and not any(hull_lo <= gap <= hull_hi + 1
+                          for gap in r_inserts)
+            if remote_clean:
+                restored = []
+                for base_i in range(hull_lo, hull_hi + 1):
+                    restored.append(_materialize_deferred(
+                        base_i, "duplicate ambiguity"))
+                local_els = (intent_local_els[:local_lo] + restored
+                             + intent_local_els[local_hi + 1:])
+                local_keys = [k_local(e) for e in local_els]
+                safe_tokens = _occurrence_ids(local_keys)
+                safe_pos = {token: i for i, token in enumerate(safe_tokens)}
+                safe_pins = [
+                    (base_i, safe_pos[base_intent_tokens[base_i]])
+                    for base_i in anchor_origins
+                    if base_intent_tokens[base_i] in safe_pos
+                ]
+                l_status, l_inserts, l_map = _diff_status_pinned(
+                    base_lkeys, local_keys, safe_pins)
+                partial_plan = {
+                    "reason": "duplicate-ambiguity",
+                    "base_hulls": [(hull_lo, hull_hi)],
+                    "local_hulls": [(local_lo, local_hi)],
+                    "keys": [repr(key) for key in sorted(
+                        ambiguous_keys, key=repr)],
+                }
+
+    # --- localize final named/anchor/blocked fences (r15) ---
+    # The final request-list fence below remains the hard safety boundary.
+    # Before reaching it, turn every PROVABLY LOCAL protected operation into
+    # a deferred component and rebuild the executable sequence.  Doing this
+    # at semantic-op level (rather than dropping an already coalesced Docs
+    # request) is what keeps both halves of a move/replacement atomic.
+    protected_for_partial = list(named_intervals)
+    if snap is not None:
+        protected_for_partial.extend(
+            (start, end,
+             f"live comment anchor (docx id {aid}, {text[:40]!r}); "
+             "rewrite it with `patch`, or move/delete it in the Google "
+             "Docs UI")
+            for start, end, text, aid in snap["anchors"])
+        protected_for_partial.extend(snap["blocked"])
+        protected_for_partial.extend(
+            snap.get("cell_anchor_tables") or [])
+
+    if protected_for_partial:
+        current_tokens = _occurrence_ids(local_keys)
+        base_tokens = _occurrence_ids(base_lkeys)
+        inserted_records = [
+            (gap, local_i, local_els[local_i])
+            for gap, indices in l_inserts.items()
+            for local_i in indices
+        ]
+        current_deleted = [
+            base_i for base_i, state in l_status.items()
+            if state == "deleted"
+        ]
+        current_moves = _pair_moved_blocks(
+            current_deleted,
+            [(gap, lel) for gap, _local_i, lel in inserted_records],
+            base_els, local_els)
+        move_destination = {}
+        for _gap, local_i, _lel in inserted_records:
+            origin = current_moves.get(current_tokens[local_i])
+            if origin is not None:
+                move_destination[origin] = local_i
+
+        # Connected reorder corridors are atomic.  Touching intervals share
+        # a boundary gap, so splitting them could retain the insertion half
+        # of one move while restoring the deletion half of its neighbour.
+        move_groups = []
+        for origin, local_i in sorted(
+                move_destination.items(),
+                key=lambda pair: min(pair[0], pair[1])):
+            lo, hi = sorted((origin, local_i))
+            hi = min(len(base_els) - 1, hi)
+            if move_groups and lo <= move_groups[-1]["hi"] + 1:
+                move_groups[-1]["hi"] = max(move_groups[-1]["hi"], hi)
+                move_groups[-1]["moves"].add(origin)
+            else:
+                move_groups.append({"lo": lo, "hi": hi,
+                                    "moves": {origin}})
+
+        def _removal_interval(base_i, state):
+            """Exact destructive interval before adjacent-delete merging."""
+            if base_i not in r_map or r_status.get(base_i) == "deleted":
+                return None
+            rel = remote_els[r_map[base_i]]
+            if state == "changed":
+                return rel["start"], rel["start"] + _utf16_len(rel["text"])
+            start, end = rel["start"], rel["end"]
+            # Match the final-newline adjustment used by request generation.
+            if end >= body_end:
+                if start <= 1:
+                    return 1, body_end - 1
+                return start - 1, end - 1
+            return start, end
+
+        protected_hits = {}
+        for base_i, state in l_status.items():
+            if state not in ("changed", "deleted"):
+                continue
+            interval = _removal_interval(base_i, state)
+            if interval is None:
+                # A local removal whose remote origin disappeared is an
+                # ordinary three-way conflict, never a partial candidate.
+                continue
+            start, end = interval
+            labels = {
+                label for ps, pe, label in protected_for_partial
+                if start < pe and ps < end
+            }
+            if labels:
+                protected_hits[base_i] = labels
+
+        if protected_hits:
+            selected_groups = []
+            singleton_origins = set()
+            for base_i in protected_hits:
+                group = next((candidate for candidate in move_groups
+                              if candidate["lo"] <= base_i <=
+                              candidate["hi"]), None)
+                if group is not None:
+                    if group not in selected_groups:
+                        selected_groups.append(group)
+                else:
+                    singleton_origins.add(base_i)
+
+            components = [
+                {"lo": group["lo"], "hi": group["hi"],
+                 "reorder": True, "moves": set(group["moves"])}
+                for group in selected_groups
+            ]
+            components.extend(
+                {"lo": origin, "hi": origin, "reorder": False,
+                 "moves": set()}
+                for origin in sorted(singleton_origins))
+
+            deferred_base_ops = set()
+            deferred_local_inserts = set()
+            component_receipts = []
+            intent_index_by_object = {
+                id(lel): i for i, lel in enumerate(intent_local_els)
+            }
+
+            def _intent_boundary_after(base_hi):
+                right = [
+                    intent_token_pos[token]
+                    for origin, token in enumerate(base_intent_tokens)
+                    if origin > base_hi and token in intent_token_pos
+                ]
+                if right:
+                    return min(right)
+                left = [
+                    intent_token_pos[token]
+                    for origin, token in enumerate(base_intent_tokens)
+                    if origin <= base_hi and token in intent_token_pos
+                ]
+                return max(left, default=-1) + 1
+
+            for component in components:
+                lo, hi = component["lo"], component["hi"]
+                # A deferred hull must be remote-clean.  Remote style-only is
+                # compatible with a pure local move/equal origin because the
+                # lifecycle carries fresh raw payload.  It is NOT compatible
+                # with a local replace/delete/style delta: rebasing that raw
+                # would silently choose one side.
+                remote_dirty = False
+                for origin in range(lo, hi + 1):
+                    remote_state = r_status.get(origin, "equal")
+                    if remote_state == "equal":
+                        continue
+                    intent_el = _intent_for_origin(origin)
+                    unchanged_intent = (
+                        intent_el is not None
+                        and k_local(intent_el) == base_lkeys[origin]
+                        and not _intent_style_changed(origin)
+                    )
+                    style_only_remote = (
+                        origin in r_map
+                        and base_rkeys[origin] == remote_keys[r_map[origin]]
+                    )
+                    if not (unchanged_intent and style_only_remote):
+                        remote_dirty = True
+                        break
+                if any(lo <= gap <= hi + 1 for gap in r_inserts):
+                    remote_dirty = True
+                if remote_dirty:
+                    labels = sorted({
+                        label for origin, origin_labels in protected_hits.items()
+                        if lo <= origin <= hi
+                        for label in origin_labels
+                    })
+                    _error(_canary_note(
+                        "protected sync component is not remote-clean — "
+                        "three-way conflict, nothing applied; fences="
+                        f"{labels}, base hull=[{lo}, {hi}]"))
+
+                if component["reorder"]:
+                    base_ops = {
+                        origin for origin in range(lo, hi + 1)
+                        if l_status.get(origin, "equal") != "equal"
+                    }
+                    insert_indices = {
+                        local_i for gap, local_i, _lel in inserted_records
+                        if lo <= gap <= hi + 1
+                    }
+                    # Defensive: every paired insertion of a move in this
+                    # corridor belongs to it even if cardinality skew made
+                    # SequenceMatcher report a surprising boundary gap.
+                    insert_indices.update(
+                        move_destination[origin]
+                        for origin in component["moves"]
+                        if origin in move_destination)
+                else:
+                    origin = lo
+                    base_ops = {origin}
+                    insert_indices = set()
+
+                deferred_base_ops.update(base_ops)
+                deferred_local_inserts.update(insert_indices)
+
+                # Lifecycle indices name the COMPLETE original intent, not
+                # the progressively restored executable sequence.
+                original_local = set()
+                if component["reorder"]:
+                    for origin in range(lo, hi + 1):
+                        token = base_intent_tokens[origin]
+                        if token in intent_token_pos:
+                            original_local.add(intent_token_pos[token])
+                for origin in base_ops:
+                    current_i = l_map.get(origin)
+                    if current_i is not None:
+                        original_i = intent_index_by_object.get(
+                            id(local_els[current_i]))
+                        if original_i is not None:
+                            original_local.add(original_i)
+                for current_i in insert_indices:
+                    original_i = intent_index_by_object.get(
+                        id(local_els[current_i]))
+                    if original_i is not None:
+                        original_local.add(original_i)
+                if original_local:
+                    local_lo, local_hi = (min(original_local),
+                                          max(original_local))
+                else:
+                    boundary = _intent_boundary_after(hi)
+                    local_lo, local_hi = boundary, boundary - 1
+
+                labels = sorted({
+                    label for origin, origin_labels in protected_hits.items()
+                    if lo <= origin <= hi
+                    for label in origin_labels
+                })
+                component_receipts.append({
+                    "base_hull": [lo, hi],
+                    "local_hull": [local_lo, local_hi],
+                    "kind": ("reorder" if component["reorder"]
+                             else l_status.get(lo, "edit")),
+                    "fences": labels,
+                })
+
+            def _base_as_local_for_fence(base_i):
+                return _materialize_deferred(base_i, "protected")
+
+            # Rebuild from semantic operations.  This happens before request
+            # coalescing, so a deferred replacement cannot leak its inserted
+            # payload and a deferred move cannot retain its destination half.
+            safe_local_els = []
+            for gap in range(len(base_els) + 1):
+                for local_i in l_inserts.get(gap, []):
+                    if local_i not in deferred_local_inserts:
+                        safe_local_els.append(local_els[local_i])
+                if gap == len(base_els):
+                    continue
+                state = l_status.get(gap, "equal")
+                if gap in deferred_base_ops:
+                    safe_local_els.append(_base_as_local_for_fence(gap))
+                elif state != "deleted" and gap in l_map:
+                    safe_local_els.append(local_els[l_map[gap]])
+
+            local_els = safe_local_els
+            local_keys = [k_local(el) for el in local_els]
+            safe_pos = {token: i for i, token in enumerate(
+                _occurrence_ids(local_keys))}
+            safe_pins = [
+                (origin, safe_pos[base_tokens[origin]])
+                for origin in anchor_origins
+                if base_tokens[origin] in safe_pos
+            ]
+            try:
+                l_status, l_inserts, l_map = _diff_status_pinned(
+                    base_lkeys, local_keys, safe_pins)
+            except ValueError:
+                _error(_canary_note(
+                    "protected-component rebuild left crossing live-comment "
+                    "pins — nothing applied"))
+
+            if partial_plan is None:
+                partial_plan = {
+                    "reason": "protected-fence",
+                    "base_hulls": [],
+                    "local_hulls": [],
+                }
+            elif "protected-fence" not in partial_plan.get("reason", ""):
+                partial_plan["reason"] += "+protected-fence"
+            for receipt in component_receipts:
+                partial_plan.setdefault("base_hulls", []).append(
+                    receipt["base_hull"])
+                partial_plan.setdefault("local_hulls", []).append(
+                    receipt["local_hull"])
+            partial_plan.setdefault("protected_components", []).extend(
+                component_receipts)
+
     # --- duplicate-ambiguity guard on BOTH sides (codex sync-r1 #6) ---
     from collections import Counter
 
@@ -7340,27 +11180,52 @@ def sync_doc(file_id, md_path, tab_id=None):
         # duplicates WITHIN a sequence are ambiguous; the same key appearing
         # once in base and once in the other side is just an unchanged
         # paragraph
-        dups = ({k for k, n in Counter(bkeys).items() if n > 1}
-                | {k for k, n in Counter(okeys).items() if n > 1})
+        bcount, ocount = Counter(bkeys), Counter(okeys)
+        # Equal multiplicities have a deterministic order identity now
+        # (key, occurrence_index).  Only a changed multiplicity leaves a
+        # genuinely unpaired twin and therefore remains ambiguous.
+        dups = {k for k in bcount.keys() | ocount.keys()
+                if (bcount[k] > 1 or ocount[k] > 1)
+                and bcount[k] != ocount[k]}
         if not dups:
             return
+        other_elements = local_els if side == "local" else remote_els
+        evidence = _duplicate_alignment_evidence(
+            bkeys, okeys, dups, base_els, other_elements)
+        samples = evidence["samples"]
+        twin_note = "; ".join(
+            f"quote «{item['quote']}» base positions "
+            f"{item['base_positions']} (count {item['base_position_count']}), "
+            f"{side} positions {item['other_positions']} "
+            f"(count {item['other_position_count']})"
+            for item in samples)
+        if evidence["duplicate_key_count"] > len(samples):
+            twin_note += (f"; ещё ключей: "
+                          f"{evidence['duplicate_key_count'] - len(samples)} "
+                          f"(полный набор sha256 "
+                          f"{evidence['duplicate_keys_sha256'][:16]}…)")
+        details = {"side": side, **evidence}
         for i, k in enumerate(bkeys):
             if k in dups and status.get(i, "equal") != "equal":
-                _error(
+                _error(_canary_note(
                     f"duplicate paragraphs are involved in {side} changes "
-                    f"(base element {i}) — alignment would be ambiguous. "
+                    f"(base element {i}); twins: {twin_note} — alignment "
+                    f"would be ambiguous. "
                     f"Make the copies differ by a word and run it again, or "
                     f"edit in the UI. (`patch` does not help while the "
                     f"paragraph has a twin: it targets by quote, and a quote "
-                    f"inside a duplicate is not unique either.)"
-                )
+                    f"inside a duplicate is not unique either.)"),
+                    reason="sync_duplicate_alignment_ambiguous",
+                    details=details)
         for _g, idxs in inserts.items():
             for j in idxs:
                 if okeys[j] in dups:
-                    _error(
+                    _error(_canary_note(
                         f"a {side}-inserted paragraph duplicates an existing "
-                        f"one — alignment would be ambiguous; edit in the UI"
-                    )
+                        f"one; twins: {twin_note} — alignment would be "
+                        f"ambiguous; edit in the UI"),
+                        reason="sync_duplicate_alignment_ambiguous",
+                        details=details)
 
     _dup_guard(base_lkeys, local_keys, l_status, l_inserts, "local")
     _dup_guard(base_rkeys, remote_keys, r_status, r_inserts, "remote")
@@ -7429,57 +11294,80 @@ def sync_doc(file_id, md_path, tab_id=None):
                 inserted.append((g, lel))
     if conflicts:
         print(json.dumps({
-            "error": "sync conflicts — nothing was applied",
+            "error": _canary_note(
+                "sync conflicts — nothing was applied"),
             "conflicts": conflicts,
             "hint": "re-download the doc, re-apply your edits, then sync",
         }, ensure_ascii=False, indent=2))
         sys.exit(2)
     if unsupported:
         print(json.dumps({
-            "error": "unsupported constructs in changed zones — nothing "
-                     "was applied",
+            "error": _canary_note(
+                "unsupported constructs in changed zones — nothing was "
+                "applied"),
             "details": unsupported,
             "md_notes": md_errors,
         }, ensure_ascii=False, indent=2))
         sys.exit(2)
 
     if not (replaced or deleted or inserted or style_only):
+        if partial_plan is not None:
+            if snap is not None and not _cleanup_canary(
+                    docs_service, file_id, snap["canary"]):
+                _error(
+                    f"partial sync found no safe content operation, but "
+                    f"could not remove the skrepka-canary "
+                    f"«{snap['canary']['text']}»; the document is NOT "
+                    f"unchanged — remove that service line manually")
+            noop_journal = {
+                "doc_id": file_id,
+                "revision_before": doc.get("revisionId"),
+                "plan": {"replaced": [], "deleted": [], "inserted": [],
+                         "moved": [], "style_only": []},
+                "phases": [{"phase": "complete",
+                            "status": "partial-noop", "advanced": False}],
+                "deferred": partial_plan,
+            }
+            if cost_alignment_context is not None:
+                noop_journal["planner"] = cost_alignment_context
+            noop_journal_path = None
+            noop_journal_error = None
+            try:
+                noop_journal_path = _write_journal(md_path, noop_journal)
+            except Exception as exc:
+                noop_journal_error = str(exc)
+            noop_result = {
+                "action": "partial-noop",
+                "advanced": False,
+                "permanent": partial_plan.get("reason") != "cost-limit",
+                "deferred": _public_deferred_summary(partial_plan),
+                "journal": noop_journal_path,
+                **({"planner": cost_alignment_context}
+                   if cost_alignment_context is not None else {}),
+                "note": "all local intent belongs to a deferred component",
+            }
+            if noop_journal_error:
+                noop_result["journal_error"] = (
+                    "partial noop recovery journal could not be written: "
+                    f"{noop_journal_error}")
+            print(json.dumps(noop_result, ensure_ascii=False, indent=2))
+            sys.exit(3)
+        note = _canary_note("no local changes to apply")
         print(json.dumps({
             "action": "synced", "noop": True, "advanced": False,
-            "note": "no local changes to apply",
+            "note": note,
         }, ensure_ascii=False))
         return
 
-    # --- protected ranges: named ranges + comment anchors (plan v4) ---
-    all_comments, anchored, fp1, universe = _census_comments(
-        drive_service, file_id)
-    body_content = (doc_tab.get("body", {}) or {}).get("content", [])
-    body_end = body_content[-1]["endIndex"] if body_content else 2
-    # named ranges only guard REMOVALS (plan scope) — an insert/style-only
-    # sync must not trip over a malformed mark it cannot touch
-    named_intervals = (_named_range_intervals(doc_tab)
-                       if (replaced or deleted) else [])
-    snap = None
-    if anchored and (replaced or deleted):
-        # W8 export-based anchor map with a freshness canary: paragraph
-        # replaces/deletes are allowed as long as they touch no anchor
-        snap, retry_reason = _fresh_anchor_snapshot(
-            docs_service, drive_service, file_id, doc, doc_tab,
-            anchored, named_intervals, body_end, fp1=fp1,
-            universe=universe, tid=_tid)
-        if snap is None:
-            # retryable race, but re-planning is this whole function —
-            # a CLI re-run is the retry (nothing has been applied)
-            _error(f"{retry_reason} — re-run sync (nothing applied)")
-
-    def _canary_note(msg):
-        """Clean up the canary before erroring out of a pre-batch refusal."""
-        if snap is not None and not _cleanup_canary(
-                docs_service, file_id, snap["canary"]):
-            msg += (f" ВНИМАНИЕ: в конце документа осталась служебная "
-                    f"строка «{snap['canary']['text']}» — удалите её "
-                    f"вручную (данные не потеряны).")
-        return msg
+    # --- protected ranges: named ranges + comment anchors (plan v4/r15) ---
+    # Text-removal plans already took their census/snapshot before the final
+    # alignment above.  Pure inserts and style-only edits need the comment
+    # count for the receipt, but not an anchor map: they delete no text.
+    if all_comments is None:
+        all_comments, anchored, fp1, universe = _census_comments(
+            drive_service, file_id)
+    if not (replaced or deleted):
+        named_intervals = []
 
     # --- map plan to remote positions ---
     def remote_el(i):
@@ -7508,8 +11396,29 @@ def sync_doc(file_id, md_path, tab_id=None):
             insert_before.setdefault(target, []).extend(by_gap[g])
 
     # --- expected merged sequence + style slots (codex sync-r1 #2) ---
-    expected, style_slots, styles_dropped = [], [], []
+    expected, safe_slots, style_slots, styles_dropped = [], [], [], []
     moved_src = _pair_moved_blocks(deleted, inserted, base_els, local_els)
+    local_move_tokens = _occurrence_ids(local_keys)
+    move_token_by_object = {
+        id(lel): local_move_tokens[i] for i, lel in enumerate(local_els)
+    }
+    local_index_by_object = {id(lel): i for i, lel in enumerate(local_els)}
+    remote_origin = {
+        remote_i: base_i for base_i, remote_i in r_map.items()
+        if r_status.get(base_i) != "deleted"
+    }
+
+    def _remote_slot(remote_i):
+        origin = remote_origin.get(remote_i)
+        return (("B", origin) if origin is not None
+                else ("R", remote_i))
+
+    def _insert_slot(lel):
+        move_token = move_token_by_object.get(id(lel))
+        origin = moved_src.get(move_token)
+        if origin is not None:
+            return ("B", origin)
+        return ("L", local_index_by_object[id(lel)])
 
     def _entry_para(text):
         return ("para", _norm_ws(text))
@@ -7526,7 +11435,7 @@ def sync_doc(file_id, md_path, tab_id=None):
         """
         if lel["type"] == "opaque-md":
             return _FRESH_BLOCK_PRESERVE
-        src = moved_src.get((lel["type"], _norm_ws(lel["text"])))
+        src = moved_src.get(move_token_by_object.get(id(lel)))
         if src is None or src not in r_map:
             return _FRESH_BLOCK_PRESERVE
         preserve, _dropped = _capture_preserve(remote_els[r_map[src]],
@@ -7537,6 +11446,7 @@ def sync_doc(file_id, md_path, tab_id=None):
         for lel in insert_before.get(j, []):
             style_slots.append((len(expected), lel, _insert_preserve(lel)))
             expected.append(_entry_para(lel["text"]))
+            safe_slots.append(_insert_slot(lel))
         a = action.get(j)
         if a and a[0] == "delete":
             continue
@@ -7553,8 +11463,10 @@ def sync_doc(file_id, md_path, tab_id=None):
                 })
             style_slots.append((len(expected), a[1], preserve))
             expected.append(_entry_para(a[1]["text"]))
+            safe_slots.append(_remote_slot(j))
         elif rel["type"] == "opaque":
             expected.append(("opaque", rel.get("hash", "")))
+            safe_slots.append(_remote_slot(j))
         else:
             if j in so_remote:
                 # text untouched: runs keep their styles, only the
@@ -7562,9 +11474,11 @@ def sync_doc(file_id, md_path, tab_id=None):
                 preserve, _ = _capture_preserve(rel, with_text=False)
                 style_slots.append((len(expected), so_remote[j], preserve))
             expected.append(_entry_para(rel["text"]))
+            safe_slots.append(_remote_slot(j))
     for lel in end_inserts:
         style_slots.append((len(expected), lel, _insert_preserve(lel)))
         expected.append(_entry_para(lel["text"]))
+        safe_slots.append(_insert_slot(lel))
 
     # --- text requests ---
     text_requests = []
@@ -7644,11 +11558,14 @@ def sync_doc(file_id, md_path, tab_id=None):
                         for i in deleted if i not in moved_dst],
             "inserted": [{"gap": g, "text": lel["text"][:80]}
                          for g, lel in inserted
-                         if (lel["type"], _norm_ws(lel["text"]))
+                         if move_token_by_object.get(id(lel))
                          not in moved_src],
-            "moved": [{"base_index": i, "type": kind, "text": text[:80]}
-                      for (kind, text), i in sorted(moved_src.items(),
-                                                    key=lambda kv: kv[1])],
+            "moved": [{
+                "base_index": i,
+                "type": base_els[i]["type"],
+                "text": (base_els[i].get("text") or "")[:80],
+            } for _token, i in sorted(moved_src.items(),
+                                      key=lambda kv: kv[1])],
             "style_only": [{"base_index": i} for i, _ in style_only],
         },
         "phases": [],
@@ -7657,6 +11574,14 @@ def sync_doc(file_id, md_path, tab_id=None):
         journal["anchor_accounting"] = snap["metrics"]
     if named_intervals:
         journal["named_ranges_protected"] = len(named_intervals)
+    if cost_alignment_context is not None:
+        journal["planner"] = cost_alignment_context
+    if partial_plan is not None:
+        # A recovery journal must explain both halves of a partial result:
+        # what was safe enough to send (``plan`` above) and what intent was
+        # deliberately left in the working markdown.  Without the latter a
+        # journal can reconstruct the document, but not explain exit code 3.
+        journal["deferred"] = partial_plan
 
     def _fail_partial(reason, extra=None):
         journal["phases"].append({"phase": "failed", "reason": reason,
@@ -7679,6 +11604,58 @@ def sync_doc(file_id, md_path, tab_id=None):
     # --- apply text changes (single atomic batch) ---
     text_requests.sort(key=lambda pair: pair[0], reverse=True)
     flat = [req for _, reqs in text_requests for req in reqs]
+    if forced:
+        # Final hard gate on what will ACTUALLY be sent.  The bounded Pareto
+        # search is an optimizer, not a safety boundary: on a >20-block pure
+        # permutation SequenceMatcher may spell a move as changed+inserted,
+        # which older accounting simply did not count.  Request volume is
+        # representation-independent and therefore closes that hole.
+        final_text_requests = len(flat)
+        final_units = 0
+        for req in flat:
+            if "insertText" in req:
+                final_units += _utf16_len(req["insertText"].get("text", ""))
+            rng = (req.get("deleteContentRange") or {}).get("range")
+            if rng:
+                final_units += max(
+                    0, rng.get("endIndex", 0) - rng.get("startIndex", 0))
+        final_style_requests = sum(
+            len(_style_requests_for_block(lel, 1, preserve))
+            for _slot, lel, preserve in style_slots
+        )
+        final_blocks = (
+            len(replaced) + len(deleted) + len(inserted) - len(moved_src)
+        )
+        final_cost = {
+            "blocks": final_blocks,
+            "units": final_units,
+            "text": final_text_requests,
+            "style": final_style_requests,
+        }
+        final_caps = {
+            "blocks": _MAX_PINNED_MOVE_BLOCKS,
+            "units": _MAX_PINNED_DESTRUCTIVE_UNITS,
+            "text": _MAX_PINNED_TEXT_REQUESTS,
+            "style": _MAX_PINNED_STYLE_REQUESTS,
+        }
+        exceeded = {
+            name: (final_cost[name], final_caps[name])
+            for name in final_cost
+            if final_cost[name] > final_caps[name]
+        }
+        if exceeded:
+            planner_note = ""
+            if (cost_alignment_context is not None
+                    and not cost_alignment_context["optimality_proven"]):
+                planner_note = (
+                    "; planner context: occurrence-origin "
+                    f"{cost_alignment_context['strategy']}, "
+                    "optimality_proven=false"
+                )
+            _error(_canary_note(
+                f"final pinned sync plan exceeds measured hard safety caps "
+                f"{exceeded}; nothing applied — split the reorder into "
+                f"smaller runs{planner_note}"))
     if snap is not None:
         # the canary delete goes FIRST: the canary sits strictly at the
         # end of the doc, so removing it first restores R0 coordinates
@@ -7983,6 +11960,7 @@ def sync_doc(file_id, md_path, tab_id=None):
 
     # --- lifecycle: advance md + sidecar to the merged remote state ---
     advanced, advance_error, recovery = False, None, None
+    mapping_hole = None
     md_advanced = False
     try:
         from markdownify import markdownify as md_convert
@@ -7995,6 +11973,217 @@ def sync_doc(file_id, md_path, tab_id=None):
         new_md = new_md.replace(" ", " ")
 
         payload = _sidecar_payload(file_id, md_path, new_md, doc3)
+        advance_md = new_md
+        if partial_plan is not None:
+            # Rebase the complete working intent onto the fresh remote
+            # payload, rather than overwriting it with the safe subset.  A
+            # base-origin keeps the freshly exported raw block (including a
+            # collaborator's text/style); only precedence comes from the
+            # deferred local order.  The sidecar below deliberately remains
+            # the fresh remote merge-base and therefore hashes ``new_md``, not
+            # this rebased working file.
+            fresh_md_els, fresh_notes = _md_elements(new_md)
+            base_token_pos = {token: i for i, token in enumerate(
+                _occurrence_ids(base_lkeys))}
+            deferred_origins = set(partial_plan.get(
+                "deferred_base_indices", []))
+            for start, end in partial_plan.get("base_hulls", []):
+                deferred_origins.update(range(start, end + 1))
+            deferred_local_hulls = partial_plan.get("local_hulls", [])
+            deferred_local_indices = {
+                i for start, end in deferred_local_hulls
+                for i in range(start, end + 1)
+            }
+            intent_tokens = _occurrence_ids(intent_local_keys)
+            deferred_mapping_reasons = []
+            deferred_origin_intent = {}
+            for edge in partial_plan.get("deferred_origin_intent", []):
+                origin = edge.get("base_index")
+                local_i = edge.get("intent_local_index")
+                if (not isinstance(origin, int)
+                        or not isinstance(local_i, int)
+                        or not 0 <= origin < len(base_intent_tokens)
+                        or not 0 <= local_i < len(intent_tokens)):
+                    deferred_mapping_reasons.append(
+                        f"invalid deferred origin edge {edge!r}")
+                    continue
+                if base_intent_tokens[origin] != intent_tokens[local_i]:
+                    deferred_mapping_reasons.append(
+                        "deferred origin edge does not name the same "
+                        f"occurrence ({origin} -> {local_i})")
+                    continue
+                if (origin in deferred_origin_intent
+                        or local_i in deferred_origin_intent.values()):
+                    deferred_mapping_reasons.append(
+                        f"duplicate deferred origin edge {edge!r}")
+                    continue
+                deferred_origin_intent[origin] = local_i
+                deferred_origins.add(origin)
+                deferred_local_indices.add(local_i)
+            if partial_plan.get("reason") == "cost-limit":
+                cost_origins = set(partial_plan.get(
+                    "deferred_base_indices", []))
+                if cost_origins != set(deferred_origin_intent):
+                    deferred_mapping_reasons.append(
+                        "cost-limit deferred origins lack an exact intent "
+                        "index mapping")
+
+            # Prove the second leg of the lifecycle graph: Docs state after
+            # the batch <-> exported markdown.  `safe_slots` was built in
+            # parallel with `expected`, so cardinality changes and even
+            # net-zero insert/delete pairs do not shift an origin silently.
+            doc3_tabs = _collect_tabs(doc3)
+            doc3_els = (_doc_elements(doc3_tabs[0][2])
+                        if len(doc3_tabs) == 1 else [])
+            doc3_sequence = [_entry_actual(el) for el in doc3_els]
+            mapping_reasons = []
+            mapping_reasons.extend(deferred_mapping_reasons)
+            if not payload.get("sync_supported"):
+                mapping_reasons.append(
+                    f"fresh Docs/export mismatch: {payload.get('reason')}")
+            if fresh_notes:
+                mapping_reasons.append(f"fresh markdown notes: {fresh_notes}")
+            if doc3_sequence != expected:
+                mapping_reasons.append(
+                    "fresh Docs snapshot no longer equals the verified safe "
+                    "target")
+            if len(fresh_md_els) != len(safe_slots):
+                mapping_reasons.append(
+                    f"fresh markdown blocks {len(fresh_md_els)} != proven "
+                    f"safe slots {len(safe_slots)}")
+            if len(set(safe_slots)) != len(safe_slots):
+                mapping_reasons.append("safe origin graph contains duplicates")
+
+            if mapping_reasons:
+                mapping_hole = "partial rebase mapping hole: " + "; ".join(
+                    mapping_reasons)
+                recovery = md_path + ".merged.md"
+                deferred_raw = [
+                    intent_local_els[i].get(
+                        "raw", intent_local_els[i].get("text", ""))
+                    for i in sorted(deferred_local_indices)
+                    if 0 <= i < len(intent_local_els)
+                ]
+                recovery_text = new_md.rstrip("\n")
+                if deferred_raw:
+                    recovery_text += (
+                        "\n\n<!-- skrepka: exact deferred local intent; "
+                        "manually reconcile with the fresh document above "
+                        "-->\n\n" + "\n\n".join(
+                            block.strip("\n") for block in deferred_raw))
+                recovery_text += "\n"
+                safeio.atomic_write(recovery, recovery_text)
+                journal["phases"].append({
+                    "phase": "advance",
+                    "status": "partial-rebase-mapping-hole",
+                    "recovery": recovery,
+                })
+                raise RuntimeError(mapping_hole)
+
+            fresh_raw_by_slot = {
+                slot: block.get("raw", block.get("text", ""))
+                for slot, block in zip(safe_slots, fresh_md_els)
+            }
+
+            # Give every full-intent element an origin.  Equal/moved blocks
+            # use occurrence-qualified B(i).  Safe changed blocks retain
+            # their B(i) through object identity; true inserts use the same
+            # L(i) assigned while `expected` was built.
+            intent_slot = [None] * len(intent_local_els)
+            used_origins = set()
+            for local_i, token in enumerate(intent_tokens):
+                origin = base_token_pos.get(token)
+                if origin is not None:
+                    intent_slot[local_i] = ("B", origin)
+                    used_origins.add(origin)
+            intent_index_by_object = {
+                id(lel): i for i, lel in enumerate(intent_local_els)
+            }
+            for origin, state in l_status.items():
+                if state != "changed" or origin not in l_map:
+                    continue
+                safe_i = l_map[origin]
+                original_i = intent_index_by_object.get(
+                    id(local_els[safe_i]))
+                if (original_i is not None
+                        and intent_slot[original_i] is None
+                        and origin not in used_origins):
+                    intent_slot[original_i] = ("B", origin)
+                    used_origins.add(origin)
+
+            # The executable safe sequence deliberately restored changed
+            # payloads inside a deferred hull.  Pair the remaining base/local
+            # residuals by occurrence order only inside that hull; outside,
+            # current safe object identity above is the stronger witness.
+            unmatched_base = [
+                i for i, token in enumerate(base_intent_tokens)
+                if token not in set(intent_tokens)
+            ]
+            unmatched_local = [
+                i for i, token in enumerate(intent_tokens)
+                if token not in set(base_intent_tokens)
+            ]
+            for origin, original_i in zip(unmatched_base, unmatched_local):
+                if (origin in deferred_origins
+                        and original_i in deferred_local_indices
+                        and intent_slot[original_i] is None
+                        and origin not in used_origins):
+                    intent_slot[original_i] = ("B", origin)
+                    used_origins.add(origin)
+
+            safe_index_by_object = {
+                id(lel): i for i, lel in enumerate(local_els)
+            }
+            for original_i, lel in enumerate(intent_local_els):
+                if intent_slot[original_i] is not None:
+                    continue
+                safe_i = safe_index_by_object.get(id(lel))
+                intent_slot[original_i] = (
+                    ("L", safe_i) if safe_i is not None
+                    else ("D", original_i))
+
+            fresh_slot_set = set(safe_slots)
+            entries = []
+            for local_i, (lel, slot) in enumerate(zip(
+                    intent_local_els, intent_slot)):
+                if slot in fresh_slot_set or local_i in deferred_local_indices:
+                    entries.append([slot, local_i, lel])
+            entry_slots = [entry[0] for entry in entries]
+            if len(set(entry_slots)) != len(entry_slots):
+                raise RuntimeError(
+                    "partial rebase origin graph maps two intent blocks to "
+                    "one origin")
+
+            # Weave remote-only fresh slots into the intent order at their
+            # next surviving safe neighbour.  A restored deferred B(i) that
+            # is absent from intent represents a deferred deletion and must
+            # not be reintroduced as a remote insert.
+            deferred_base_slots = {("B", i) for i in deferred_origins}
+            for slot in safe_slots:
+                if slot in entry_slots or slot in deferred_base_slots:
+                    continue
+                right = next((candidate for candidate in safe_slots[
+                    safe_slots.index(slot) + 1:] if candidate in entry_slots),
+                    None)
+                insert_at = (entry_slots.index(right)
+                             if right is not None else len(entries))
+                entries.insert(insert_at, [slot, None, None])
+                entry_slots.insert(insert_at, slot)
+
+            rebased_blocks = []
+            for slot, local_i, lel in entries:
+                raw = fresh_raw_by_slot.get(slot)
+                if raw is None:
+                    raw = lel.get("raw", lel.get("text", ""))
+                elif (slot[0] == "B" and slot[1] in deferred_origins
+                      and local_i in deferred_local_indices):
+                    origin = slot[1]
+                    text_changed = k_local(lel) != base_lkeys[origin]
+                    if text_changed or _intent_style_changed(origin):
+                        raw = lel.get("raw", lel.get("text", ""))
+                rebased_blocks.append(raw)
+            advance_md = "\n\n".join(
+                block.strip("\n") for block in rebased_blocks) + "\n"
         # crash-safe: build BOTH temps first; only then check the local file
         # hash IMMEDIATELY before the first rename (codex sync-r2 #4) and
         # commit md -> sidecar, journaling each subphase (codex sync-r2 #6)
@@ -8006,7 +12195,7 @@ def sync_doc(file_id, md_path, tab_id=None):
         # advances them, preserving the staged-then-decide recovery logic.
         tmp_md = md_path + ".tmp"
         tmp_sc = sidecar_path + ".tmp"
-        safeio.atomic_write(tmp_md, new_md)
+        safeio.atomic_write(tmp_md, advance_md)
         safeio.atomic_write(
             tmp_sc, json.dumps(payload, ensure_ascii=False, indent=1))
         with open(md_path, "r", encoding="utf-8") as f:
@@ -8037,8 +12226,27 @@ def sync_doc(file_id, md_path, tab_id=None):
         except Exception:
             pass
 
+    journal_path = None
+    journal_error = None
+    if partial_plan is not None or cost_alignment_context is not None:
+        journal["phases"].append({
+            "phase": "complete",
+            "status": ("partially-synced" if partial_plan is not None
+                       else "synced"),
+            "advanced": advanced,
+        })
+        try:
+            journal_path = _write_journal(md_path, journal)
+        except Exception as e:
+            # The remote write has already happened.  Reporting the missing
+            # local receipt is the only honest recovery action; turning this
+            # into a generic pre-write refusal would falsely claim nothing
+            # was applied.
+            journal_error = str(e)
+
     result = {
-        "action": "synced",
+        "action": ("partially-synced" if partial_plan is not None
+                   else "synced"),
         "doc_id": file_id,
         "replaced": len(replaced),
         # a moved block is one event, not a delete plus an insert — counting
@@ -8050,9 +12258,28 @@ def sync_doc(file_id, md_path, tab_id=None):
         "styled_blocks": styled,
         "comments_on_doc": len(all_comments),
         "advanced": advanced,
+        "applied": {
+            "replaced": len(replaced),
+            "moved": len(moved_src),
+            "inserted": len(inserted) - len(moved_src),
+            "deleted": len(deleted) - len(moved_src),
+            "style_only": len(style_only),
+            "styled_blocks": styled,
+        },
     }
     if snap is not None:
         result["anchor_accounting"] = snap["metrics"]
+    if cost_alignment_context is not None:
+        result["planner"] = cost_alignment_context
+        result["journal"] = journal_path
+    if partial_plan is not None:
+        result["deferred"] = _public_deferred_summary(partial_plan)
+        result["permanent"] = partial_plan.get("reason") != "cost-limit"
+        result["journal"] = journal_path
+    if journal_error:
+        result["journal_error"] = (
+            f"sync was applied, but its recovery journal could not be "
+            f"written: {journal_error}")
     if closed_note:
         result["closed_threads"] = closed_note
     if outcome_uncertain:
@@ -8067,9 +12294,17 @@ def sync_doc(file_id, md_path, tab_id=None):
     if styles_dropped:
         result["inline_styles_dropped"] = styles_dropped
     if recovery:
-        result["note"] = (
-            f"local md was edited during sync — NOT overwritten; merged "
-            f"doc state saved to {recovery}; re-download before next sync")
+        result["recovery"] = recovery
+        if mapping_hole:
+            result["note"] = (
+                f"partial intent could not be mapped onto every fresh remote "
+                f"origin — local md and sidecar were NOT advanced; fresh "
+                f"merged doc state saved to {recovery}; re-download and "
+                f"re-apply the deferred component before next sync")
+        else:
+            result["note"] = (
+                f"local md was edited during sync — NOT overwritten; merged "
+                f"doc state saved to {recovery}; re-download before next sync")
     if advance_error:
         if md_advanced:
             result["md_advanced"] = True
@@ -8082,6 +12317,8 @@ def sync_doc(file_id, md_path, tab_id=None):
                 f"{advance_error} — local md/sidecar NOT advanced; "
                 f"re-download before the next sync")
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    if partial_plan is not None:
+        sys.exit(3)
 
 
 # ---------------------------------------------------------------------------
@@ -8355,6 +12592,15 @@ def main():
     rp.add_argument("--yes", action="store_true",
                     help="Confirm the resolve without a prompt (only with "
                          "--resolve; closing a thread is the person's call)")
+    rp.add_argument("--tab", dest="tab_id", default=None,
+                    help="Tab ID (required if doc has multiple tabs)")
+
+    # unreply command
+    ur = sub.add_parser(
+        "unreply", help="Delete one ordinary reply authored by this account")
+    ur.add_argument("file_id", help="Google Doc file ID or URL")
+    ur.add_argument("comment_id", help="Exact parent comment ID")
+    ur.add_argument("reply_id", help="Exact reply ID to delete")
 
     # resolve command
     rs = sub.add_parser("resolve", help="Resolve a comment thread")
@@ -8365,6 +12611,8 @@ def main():
     rs.add_argument("--yes", action="store_true",
                     help="Confirm without a prompt (closing a thread is the "
                          "person's call, not the agent's)")
+    rs.add_argument("--tab", dest="tab_id", default=None,
+                    help="Tab ID (required if doc has multiple tabs)")
 
     # comment command (document-level, unanchored)
     cc = sub.add_parser("comment", help="Create a document-level comment (no anchor)")
@@ -8377,6 +12625,10 @@ def main():
     pt.add_argument("ops", help="Path to ops.json with list of operations")
     pt.add_argument("--tab", dest="tab_id", default=None,
                     help="Tab ID (required if doc has multiple tabs)")
+    pt.add_argument("--dry-run", action="store_true",
+                    help="Read-only advisory: report what would happen; no writes")
+    pt.add_argument("--output", default=None,
+                    help="Write the full dry-run JSON receipt to a file")
 
     # mark command (named ranges)
     mk = sub.add_parser("mark", help="Create a named range around a text fragment")
@@ -8385,8 +12637,8 @@ def main():
     mk.add_argument("--quote", required=True, help="Text fragment to wrap")
     mk.add_argument("--tab", dest="tab_id", default=None,
                     help="Tab ID (required if doc has multiple tabs)")
-    mk.add_argument("--occurrence", type=int, default=1,
-                    help="1-based match index if quote is non-unique (default: 1)")
+    mk.add_argument("--occurrence", type=int, default=None,
+                    help="1-based match index (required when quote is non-unique)")
 
     # download command
     dl = sub.add_parser("download", help="Download a Google Doc")
@@ -8456,17 +12708,21 @@ def main():
         if args.yes and not args.resolve:
             _error("--yes applies only together with --resolve — nothing done")
         reply_comment(args.file_id, args.comment_id, args.text,
-                      resolve=args.resolve, yes=args.yes)
+                      resolve=args.resolve, yes=args.yes,
+                      tab_id=args.tab_id)
+    elif args.command == "unreply":
+        unreply_comment(args.file_id, args.comment_id, args.reply_id)
     elif args.command == "resolve":
         resolve_comment(args.file_id, args.comment_id, text=args.text,
-                        yes=args.yes)
+                        yes=args.yes, tab_id=args.tab_id)
     elif args.command == "comment":
         create_comment(args.file_id, args.text)
     elif args.command == "mark":
         mark_range(args.file_id, args.name, args.quote,
                    tab_id=args.tab_id, occurrence=args.occurrence)
     elif args.command == "patch":
-        patch_doc(args.file_id, args.ops, tab_id=args.tab_id)
+        patch_doc(args.file_id, args.ops, tab_id=args.tab_id,
+                  dry_run=args.dry_run, output=args.output)
     elif args.command == "download":
         download_doc(args.file_id, fmt=args.format, output=args.output,
                      images_dir=args.images_dir)

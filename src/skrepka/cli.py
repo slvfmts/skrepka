@@ -30,7 +30,7 @@ Comments & edits:
   resolve      Resolve a comment thread (the person's decision, not an agent's)
   comment      Create a document-level comment
   patch        Apply anchor-safe text edits (keeps comment threads alive —
-               start here when a doc has comments)
+               use --dry-run for a read-only advisory)
   mark         Create a named range around a text fragment
   suggestions  List suggestions on a doc
 

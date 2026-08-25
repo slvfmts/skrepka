@@ -177,6 +177,21 @@ Google-консоль, согласие. Это делает **человек**,
 - **[контракт]** Не запускай `logout` / `revoke` / `forget` по своей инициативе;
   только если человек явно об этом просит.
 
+### 2.9. `unreply` удаляет только доказанно лишний собственный ответ
+
+`author.me: true` доказывает аккаунт, но не автора внутри этого аккаунта: тот же
+OAuth-токен использует и человек, и агент. Поэтому техническая проверка владения
+не даёт права чистить старую переписку.
+
+- **[механически]** `unreply` принимает точные `comment_id`/`reply_id` и удаляет
+  только ещё живой обычный reply с явным `author.me: true` в живом открытом
+  родительском треде. Чужие ответы, удалённые записи и действия
+  `resolve`/`reopen` отклоняются до записи.
+- **[контракт]** Агент вызывает `unreply` только чтобы отменить ответ, который он
+  сам только что ошибочно отправил в текущем проходе, либо когда человек явно
+  попросил удалить конкретный reply. Старое сообщение текущего аккаунта нельзя
+  считать агентским и удалять по собственной инициативе.
+
 ---
 
 ## 3. Инвариант для Codex: runtime-approval ≠ семантическое разрешение
@@ -264,6 +279,112 @@ agentic-использование `skrepka` — **бета**, а не вери�
 compliance-границу — нельзя.
 
 ---
+
+## 4.10. Точечное оформление (#39)
+
+`style_quote` и `style_range` — безопасные точечные операции: они не удаляют
+текст, но всё равно требуют явного `doc_id`, выбранной вкладки, revision pin и
+существующих suggestion/overlap gates. На документе с живыми комментариями
+цитата должна быть уникальной в выбранной вкладке; поле `occurrence` запрещено
+в любом виде для `style_range` и на комментированном документе для
+`style_quote`. Не обходи отказ стиля полной перезаписью или экспортом.
+
+## 4.11. Адресация правки по треду (#52)
+
+`replace_anchor` допускается только с точным `comment_id` корневого активного
+треда и `with`. Диапазон нельзя брать из `quotedFileContent`, occurrence или
+догадки по одинаковому тексту: движок получает его только из свежего DOCX
+marker после canary, проверяет root/child tab, стабильный comments/Docs census
+и revision pin. Ghost, resolved, inaccessible, malformed или multiple marker,
+неоднозначная вкладка, suggestion и protected/named-range fence — локальный
+отказ до semantic write. Пустая замена запрещена, если она удаляет весь
+якорь: потеря треда не является допустимой ценой адресации.
+Даже при доказанном marker `with: ""` намеренно остаётся fail-closed safety
+boundary: удаление всего диапазона может осиротить thread.
+Агрегированный label fence (`и ещё...`) не является доказательством владения:
+ghost/table/scope source на том же или пересекающемся range сохраняет отказ;
+снять fence можно только когда все source records — exact ambiguous
+descriptors этого `comment_id`.
+
+## 4.12. Замена внешнего диапазона вокруг якоря (#33)
+
+Для диапазона, который **строго содержит** живой якорь, используй отдельную
+операцию `replace_around_anchor`:
+
+```json
+{"op":"replace_around_anchor", "comment_id":"AAACFwKC8_w",
+ "quote":"старый внешний фрагмент", "with":"новый внешний фрагмент",
+ "before_utf16":4, "after_utf16":5,
+ "anchor":{"text":"точный новый фрагмент", "start_utf16":7}}
+```
+
+`before_utf16` и `after_utf16` — неотрицательные extents от свежего marker;
+хотя бы один должен быть положительным. Они вычисляют внешний диапазон
+`[anchor_start-before_utf16, anchor_end+after_utf16)` в выбранной вкладке.
+`quote` — обязательный exact witness текста именно этого диапазона, но не
+глобальный поисковый ключ; одинаковые внешние строки различаются marker-ом.
+`anchor.text` и `anchor.start_utf16` обязательны и адресуют ровно тот фрагмент
+`with`, на котором должен остаться тред; повторяющийся текст без offset не
+принимается. Offset — в UTF-16 единицах Google Docs и не может попасть внутрь
+суррогатной пары. Skrepka не угадывает новый anchor.
+
+Если внешний `quote` и `with` уже совпадают, no-op допустим лишь при точном
+совпадении `anchor.start_utf16` с относительным fresh-marker offset и текста
+anchor с marker. Offset другой одинаковой копии — bounded refusal, а не тихий
+no-op. После общих freshness/suggestion gates такой no-op не проходит
+style/named/foreign deletion-only fences, потому что semantic batch не
+отправляется; оставшийся protected/ambiguous fence не обходится. Canary cleanup
+обязателен и при отказе receipt называет его
+literal и ручное восстановление. Guard старого anchor из одного code point
+(ASCII или emoji) проверяется до shortcut и сохраняет bounded refusal даже для
+текстуального no-op.
+
+Диапазон якоря берётся только из свежего DOCX marker пути #52. Сначала в одном
+revision-pinned batch выполняется proven anchor rewrite, затем точно по его
+изменившейся длине меняется правая часть и после этого левая; обе стороны не
+пересекают anchor. Любой другой anchor, protected/named range, suggestion,
+невалидный extent/witness, гонка census или невалидный fragment даёт отказ до
+смысловой записи. Выбранный новый anchor не может быть пустым. Старый anchor
+из одного code point (включая один emoji) явно отказывается: proven rewrite не
+имеет внутренней безопасной границы; такой случай правится в UI.
+
+## 4.13. Диагностика отказов (#51)
+
+Отказ C1 обязан назвать bounded UTF-16 ranges anchor, исходной правки и
+попытки сужения, а также видимые общий префикс/суффикс. Оставь окружение
+anchor дословным и раздели соседние правки. `replace_anchor` рекламируется
+только для применимой anchor-only geometry и точного `comment_id`, а
+`replace_around_anchor` — только для явного outer quote с extents и новым
+anchor; cross-paragraph/TOC/named-range/control/grapheme refusal не обещает
+эти команды. Не советуй occurrence на комментируемом дубликате. Остаточный
+`sync` duplicate/twin guard показывает ограниченные quotes, sampled positions,
+counts и hashes; deferred receipts additionally cap every sampled scalar and
+dynamic key representation (including nested composite keys), render controls
+visibly and retain full-list count/SHA-256. Full deferred data belongs only in
+the recovery journal. r15 уже
+локализованный `duplicate-ambiguity` не возвращается к старому глобальному
+отказу.
+
+После `_fresh_anchor_snapshot` любой deferred-hull materialization отказ
+обязан пройти `_canary_note`: сначала попытаться удалить canary существующим
+протоколом, а при cleanup/transport ambiguity назвать literal canary и ручное
+восстановление. Нельзя сообщать «ничего не применено» без этого состояния.
+Parse note допускается только для единственного raw-verbatim paragraph-like
+элемента, который поддерживает downstream; image/raw `opaque-md` остаётся
+fail-closed.
+
+## 4.14. Advisory `patch --dry-run` (#50)
+
+`patch --dry-run` — отдельный read-only entrypoint. Он не получает writer
+service и не вызывает `batchUpdate`, replies/deletes, canary или DOCX export.
+Receipt обязан иметь `action=dry-run`, `writes_performed=0` и статусы
+`would_apply`, `would_refuse`, `noop`, `unknown` или `not_simulated`; слова
+`patched`, `partially-patched` и `applied` не являются dry-run результатом.
+Clean index plan может быть exact, но после неизвестной freshness-dependent
+операции следующие зависящие операции получают `not_simulated` и
+`depends_on`. `unknown` с причиной `fresh_anchor_map_requires_canary` нельзя
+пересказывать человеку как «применится». Exit 0 допустим только когда все
+операции `would_apply` или `noop`; любой отказ/unknown/not_simulated даёт 3.
 
 ## 5. Каноническое ядро для скиллов
 

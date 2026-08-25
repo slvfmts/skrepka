@@ -2,6 +2,189 @@
 
 Формат: [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии по [SemVer](https://semver.org/lang/ru/). До 1.0 публичный контракт может меняться.
 
+## [Unreleased]
+
+### Добавлено
+
+- **r15 deferred materialization safety (Fable P1).** Все materialization
+  refusals после свежего anchor canary проходят общий cleanup/recovery path и
+  называют literal canary при cleanup failure. Parse notes не подавляются для
+  `opaque-md`/image/raw blocks: допускается только один raw-verbatim элемент,
+  чья paragraph-like семантика поддержана downstream; semantic write при
+  отказе не выполняется.
+
+- **#50: advisory `patch --dry-run`.** Read-only planner receipts report
+  `would_apply`, `would_refuse`, `noop`, `unknown` and `not_simulated` per
+  operation. The dry-run path never receives a writer/export/canary service,
+  always reports `action=dry-run` and `writes_performed=0`, and exits 3 unless
+  every operation is `would_apply` or `noop`. Fresh anchor-map dependent edits
+  remain honestly `unknown`; later unsimulated operations carry
+  `depends_on`.
+
+- **#51: bounded diagnostics for C1 and sync twins.** A full-anchor refusal
+  now reports the anchor/edit/narrowing UTF-16 ranges, visible common
+  prefix/suffix witnesses and only applicable recovery paths (cross-paragraph,
+  TOC, named-range, control-character and grapheme refusals do not advertise
+  anchor commands). The final sync duplicate guard reports bounded twin
+  quotes, sampled positions, counts and hashes; r15's already-safe duplicate
+  hull deferral remains unchanged. Machine-readable `reason/details` survive
+  per-op receipts; focused diagnostics and an 11/11 mutation stand cover the
+  bounds and remote-dirty residual guard. Public deferred receipts also cap
+  every sampled scalar and dynamic/nested key representation, retaining full
+  list count/SHA-256 while keeping unbounded deferred data only in the journal.
+
+- **#33: `replace_around_anchor` с обязательным новым anchor-фрагментом.**
+  Операция принимает marker-relative `before_utf16`/`after_utf16`, exact
+  witness `quote`, replacement `with` и `{text,start_utf16}` для точного места,
+  на котором должен остаться тред. Одинаковые внешние строки различаются
+  свежим #52 marker, без global uniqueness. Anchor rewrite и правки
+  слева/справа идут одним revision-pinned batch. Невалидные extents/witness,
+  пустой fragment, чужие fences, suggestions, named ranges, one-codepoint old
+  anchor и races дают отказ до semantic write. Pre-hardening live API/DOCX
+  split пройден; current relative extents покрыты offline, UI survival остаётся
+  acceptance gate.
+  True no-op дополнительно требует marker-relative anchor offset; другая
+  duplicate-позиция отказывается, а style/named/foreign deletion-only fences
+  обходятся только после общих suggestion/freshness gates; remaining
+  protected/ambiguous fence не обходится. Canary cleanup failure содержит
+  literal witness и recovery instruction. One-codepoint old-anchor guard
+  применяется до no-op shortcut (ASCII и emoji bounded-refuse).
+
+- **#52: `replace_anchor` адресует правку по `comment_id`.** Диапазон берётся
+  только из свежего DOCX marker после canary, поэтому повторяющийся текст не
+  требует occurrence и не может попасть в соседнюю копию. Операция требует
+  ровно один активный доступный тред, точную вкладку, стабильный comments/Docs
+  census и revision pin; ghost/resolved/ambiguous/malformed marker,
+  suggestions, защищённые диапазоны и пустая замена отказываются до смысловой
+  записи. Duplicate ordinal считается только по top-level paragraphs
+  доказанной вкладки с exact совпадением текста marker-а: title, table и
+  non-twin paragraphs его не сдвигают; число совпадений обязано совпасть с API
+  lattice. Одинаковые root/reply marker descriptors дедуплицируются, разные
+  ranges остаются отказом. `with: ""` намеренно остаётся fail-closed: удаление
+  всего якоря может осиротить thread и не является безопасной заменой. После
+  Fable round-2 merged `ghost`/`table`/scope fences сохраняют структурный
+  source provenance и не могут быть сняты target-owned ambiguous marker-ом.
+
+- **#39: точечное оформление через `patch`.** Добавлены `style_quote` и
+  `style_range` с tab-scoped `updateTextStyle`, строгим allowlist полей,
+  revision pin и per-op безопасным путём для документов с комментариями.
+  `download --format md` предупреждает о цветах и другом inline-оформлении,
+  которое Markdown не представляет.
+
+- **Лишний собственный ответ можно удалить, не закрывая тред (#18).** Новая
+  команда `skrepka unreply <doc> <comment_id> <reply_id>` перед удалением
+  перечитывает все страницы комментариев вместе с удалёнными записями и требует
+  точного совпадения живого родителя и обычного ответа с `author.me: true`.
+  Чужой, уже удалённый, системный `resolve`/`reopen` или неоднозначный ответ
+  отклоняется до записи. Отказ учёта теперь первым называет этот recovery, а не
+  советует закрыть продолжающийся разговор.
+
+- **`sync` закрепляет абзацы с живыми комментариями при перестановке (#32).**
+  Если нужный порядок можно получить, передвинув непрокомментированного соседа,
+  skrepka выбирает именно такой план: сам якорный абзац не удаляется. Ограничения
+  нескольких якорей учитываются вместе; если они требуют пересечься, невозможный
+  компонент остаётся в локальном намерении, а независимые безопасные правки
+  применяются.
+
+- **Частичная синхронизация стала явным результатом.** `partially-synced` и
+  `partial-noop` завершаются кодом 3, называют постоянную причину отложенного
+  компонента и не выдают часть за полный успех. После частичного применения
+  рабочий `.md` перебазируется на свежий документ: правки и оформление коллеги
+  сохраняются, отложенное намерение остаётся в файле, а sidecar хранит именно
+  свежую удалённую merge-base.
+
+- **#35a:** `mark --occurrence` теперь различает пропущенный флаг и явное
+  `--occurrence 1`: при нескольких совпадениях без флага операция отказывает,
+  а явное вхождение проверяется в диапазоне `1..N` до записи.
+
+- **#35b:** `replace_range` на документе с якорными комментариями больше не
+  переводит именованный диапазон в `replaceAllText`. После свежего canary-снимка
+  он повторно разрешается на закреплённой ревизии и заменяется точными
+  `deleteContentRange` + `insertText`; дубликат текста вне диапазона не меняется.
+  Живые/скрытые защитные интервалы, другой named range, suggestions и гонка
+  fingerprint по-прежнему дают отказ до смысловой записи.
+  Для адресации требуется один объект с непустым стабильным `namedRangeId`;
+  duplicate IDs под одним именем и смена identity между снимками также дают
+  отказ до canary.
+
+### Исправлено
+
+- **Одинаковые абзацы больше не выбираются случайно при перестановке (#53).**
+  Идентичность блока включает номер его вхождения. В решающем случае
+  `[X, A, X] → [X, X, A]` переезжает уникальный `A`, а обе неразличимые копии
+  `X` остаются на своих местах. Изменившееся число одинаковых копий по-прежнему
+  отклоняется: сопоставить лишнюю копию с конкретным происхождением нельзя.
+
+- **`suggestions` читает предложения во всех вкладках, включая дочерние (#54).**
+  Обе preview-версии запрашиваются с содержимым tabs, сопоставляются строго по
+  `tabId`, а каждый хунк получает `tab_id` и `tab_title`. Разный или
+  дублирующийся набор вкладок даёт повторяемый отказ вместо ложного
+  `has_suggestions: false`; в ответе появились `tab_count`,
+  `tabs_with_suggestions` и сводка `tabs[]`.
+
+- **`reply` и `resolve` больше не могут попасть в тред соседней вкладки
+  (#44).** В многовкладочном документе команда требует `--tab <id>` и
+  принимает его только после точного сопоставления якоря комментария с этой
+  вкладкой. Свежесть DOCX-экспорта доказывается служебной canary-записью;
+  устаревший, неоднозначный или чужой якорь даёт отказ до ответа. Комментарии
+  уровня всего документа остаются replyable без `--tab`, а явно приписать их
+  вкладке нельзя.
+
+- **`comments` показывает доказуемую вкладку треда и честную
+  неопределённость (#44).** Точное совпадение сохранённой цитаты в теле ровно
+  одной корневой или дочерней вкладки даёт `tab_id`; несколько или ноль
+  совпадений, отсутствующая цитата и повреждённые tabId остаются `unknown` с
+  причиной и кандидатами. Комментарии уровня документа выделены отдельно.
+  Атрибуция строится только по стабильному Docs-снимку: revisionId, а в
+  view-only ответе без него — канонический hash всего ответа, должен
+  совпасть до и после выгрузки. Атрибуция вкладки не выдаёт DOCX за свежий:
+  команда не ставит canary и ничего не пишет.
+
+- **Потерявший привязку тред виден до сборки правок (#37).** `comments`
+  добавляет каждому треду `anchor_export`: `ghost` появляется, только когда
+  уникальная запись треда отсутствует, в выгрузке есть запись новее последней
+  текущей записи треда (включая resolve/reopen), а старая цитата исчезла из
+  всех текущих вкладок. Экспорт ограничен двумя read-sandwich попытками:
+  полный пагинированный список комментариев и Docs-снимок должны совпасть по
+  обе стороны; гонка или нечитаемый author/date дают `unknown`. `record_present`
+  означает ровно наличие записи в прочитанном DOCX, не текущую сохранность
+  якоря: read-only команда не ставит canary, поэтому `export_freshness` честно
+  равно `unproven`.
+
+- **Архив закрытых тредов больше не теряет удалённые ответы (#28).** Если
+  ответ исчез из Google между двумя запусками `sync`, прежняя архивная копия
+  остаётся, а свежие ответы и их исправленный текст добавляются по точной
+  паре `(автор, время создания)`. Повреждённый прежний список ответов не
+  перезаписывается: синхронизация останавливается до правки файла архива.
+
+- **Оглавление больше не выключает безопасную перезапись во всём документе
+  (#23).** Его сгенерированный текст не становится целью `patch`, но
+  консервативно участвует в проверке уникальности `replaceAllText`. Поэтому
+  нерелевантное оглавление не мешает правке, а совпавшая в нём строка даёт
+  отказ до записи. Меняет ли Google сам текст оглавления, пока не измерено;
+  это решение безопасно при обоих вариантах и не выдаёт предположение за факт.
+
+### Безопасность и пределы
+
+- **Release supply chain закреплён (#6).** Все GitHub Actions ссылаются на
+  точные commit SHA, а архив gitleaks сверяется с опубликованным SHA-256 до
+  распаковки. CI проверяет эти инварианты офлайн.
+
+- **sdist больше не содержит неработающий illustrated quickstart (#7).** Его
+  скриншоты предназначены для GitHub и не входят в пакет; теперь рядом с ними
+  исключён и `docs/QUICKSTART.md`, поэтому внутри архива нет пятнадцати битых
+  ссылок на картинки.
+
+- Дополнительные обходные переезды вокруг закреплённых блоков ограничены
+  совокупно: 500 блоков, 201 000 удаляемых UTF-16 единиц, 1 000 текстовых и
+  2 500 стилевых запросов. Для чистой перестановки до 20 блоков план ищется по
+  точному недоминируемому фронту затрат. Для более длинной перестановки
+  строится детерминированное допустимое выравнивание между закреплёнными и
+  непрозрачными блоками; оно честно помечено `optimality_proven: false`.
+  Независимые дорогие компоненты откладываются, а прошедшие совокупный бюджет
+  применяются. Фактический финальный батч повторно проверяется по тем же
+  жёстким пределам как последняя страховка от ошибки планировщика.
+
 ## [0.16.0] — 2026-08-24
 
 Перестановка блоков перестала быть тихо разрушительной. Замер показал неожиданное: `sync` переставлял разделы уже сегодня — на документе, где переезжающие абзацы не прокомментированы, порядок текста получался правильный. Но переехавший абзац приезжал как свежий блок из markdown и терял всё, чего markdown не выражает: цвет, подсветку, кегль. Молча. А скилл при этом сообщал агенту, что перестановка через skrepka не выполняется вовсе, — и агент отказывался, не попробовав.

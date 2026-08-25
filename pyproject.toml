@@ -55,9 +55,10 @@ packages = ["src/skrepka"]
 # contract, and public docs. Never the `internal/` working context (plans,
 # backups, screenshots, test doc IDs) or the local venv.
 [tool.hatch.build.targets.sdist]
-# Screenshots under docs/img are for GitHub rendering only — pointless in the
-# installed package, and they would bloat the sdist by several MB.
-exclude = ["/docs/img"]
+# The illustrated quickstart is a GitHub guide: its screenshots are several
+# megabytes and excluded from distributions, so shipping the markdown alone
+# would leave fifteen broken image links (#7).
+exclude = ["/docs/img", "/docs/QUICKSTART.md"]
 include = [
     "/src",
     "/tests",

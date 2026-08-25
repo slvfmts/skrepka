@@ -10,8 +10,8 @@ import json
 import pytest
 
 from test_sync_anchors import (CREATED, CREATED_SEC, DocsStub, DriveStub,
-                               _crossing_docx, _docx_builder, api_comment,
-                               make_doc, make_workdir, wire)
+                               _crossing_docx, _docx_builder, _no_content_mutation,
+                               api_comment, make_doc, make_workdir, wire)
 
 
 # ---------------------------------------------------------------------------
@@ -141,38 +141,35 @@ def _p(text, kind="p"):
 def test_pair_moved_matches_a_delete_with_the_same_insert(engine):
     base = [_p(A), _p(B), _p(C)]
     local = [_p(B), _p(A), _p(C)]
-    pairs = engine._pair_moved_blocks([1], [(0, _p(B))], base, local)
-    assert pairs == {("p", B): 1}
+    pairs = engine._pair_moved_blocks([1], [(0, local[0])], base, local)
+    assert pairs == {(('p', B), 0): 1}
 
 
 def test_pair_moved_needs_the_same_structural_type(engine):
     base, local = [_p(A, "h2")], [_p(A)]
-    assert engine._pair_moved_blocks([0], [(1, _p(A))], base, local) == {}
+    assert engine._pair_moved_blocks([0], [(1, local[0])], base, local) == {}
 
 
 def test_pair_moved_refuses_a_duplicate_inside_the_changed_zone(engine):
     base, local = [_p(B), _p(B)], [_p(B)]
-    assert engine._pair_moved_blocks([0, 1], [(0, _p(B))], base, local) == {}
+    assert engine._pair_moved_blocks([0, 1], [(0, local[0])], base, local) == {}
 
 
-def test_pair_moved_refuses_a_twin_sitting_outside_the_changed_zone(engine):
-    """Близнец в нетронутой части документа — всё ещё близнец.
-
-    Считать повторы только по изменённой зоне значит объявить переездом
-    абзац, который отличить не от чего: одна копия правится, вторая молча
-    стоит рядом, и какая из них несёт тред — не доказать.
-    """
+def test_pair_moved_uses_occurrence_identity_for_a_twin(engine):
+    """Equal multiplicity makes the ordered occurrence a proven origin."""
     base = [_p(B), _p(A), _p(B)]        # вторая копия B стоит в стороне
     local = [_p(A), _p(B), _p(B)]
-    assert engine._pair_moved_blocks([0], [(2, _p(B))], base, local) == {}
+    assert engine._pair_moved_blocks([0], [(2, local[1])], base, local) == {
+        (("p", B), 0): 0}
 
 
 def test_pair_moved_skips_opaque_on_both_sides(engine):
     base = [{"type": "opaque", "kind": "table", "hash": "h"}]
-    assert engine._pair_moved_blocks([0], [(1, _p(A))], base, [_p(A)]) == {}
+    local = [_p(A)]
+    assert engine._pair_moved_blocks([0], [(1, local[0])], base, local) == {}
+    opaque_local = [{"type": "opaque-md", "raw": "|x|"}]
     assert engine._pair_moved_blocks(
-        [0], [(1, {"type": "opaque-md", "raw": "|x|"})], [_p(A)],
-        [{"type": "opaque-md", "raw": "|x|"}]) == {}
+        [0], [(1, opaque_local[0])], [_p(A)], opaque_local) == {}
 
 
 def test_pair_moved_tolerates_nbsp_but_not_a_width_change(engine):
@@ -180,7 +177,7 @@ def test_pair_moved_tolerates_nbsp_but_not_a_width_change(engine):
     # та же — переезд остаётся переездом
     base, local = [_p("Alpha beta")], [_p("Alpha\u00a0beta")]
     assert engine._pair_moved_blocks([0], [(1, local[0])], base, local) == \
-        {("p", "Alpha beta"): 0}
+        {(('p', "Alpha beta"), 0): 0}
 
 
 def test_pair_moved_refuses_when_the_captured_runs_would_not_tile(engine,
@@ -417,17 +414,32 @@ def test_a_comment_beside_the_move_does_not_stop_it(engine, monkeypatch,
     assert out["action"] == "synced" and out["moved"] == 1
 
 
-def test_moving_a_commented_block_refuses_and_says_it_is_a_move(engine,
-                                                                monkeypatch,
-                                                                tmp_path,
-                                                                capsys):
-    with pytest.raises(SystemExit):
-        run_sync(engine, monkeypatch, tmp_path, [A, B, C, D], [A, C, B, D],
-                 comments=[api_comment("c1", "A", CREATED)], anchors={C})
-    err = json.loads(capsys.readouterr().out)["error"]
-    assert "переставлен" in err
-    assert "`patch`" not in err, "у patch нет операции переноса"
-    assert "Leave that paragraph unchanged" not in err
+def test_a_commented_block_is_pinned_while_its_neighbour_moves(engine,
+                                                               monkeypatch,
+                                                               tmp_path,
+                                                               capsys):
+    """r15: the requested order has two equivalent edit scripts.
+
+    The draft moves commented C.  Pinning C before the final alignment chooses
+    the other script and moves unanchored B instead, so the useful reorder no
+    longer has to be refused.
+    """
+    docs = run_sync(
+        engine, monkeypatch, tmp_path, [A, B, C, D], [A, C, B, D],
+        comments=[api_comment("c1", "A", CREATED)], anchors={C})
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "synced" and out["moved"] == 1
+    body_end = sum(len(t) + 1 for t in [A, B, C, D]) + 1
+    plan_reqs = [r for r in text_batch(docs)
+                 if r.get("deleteContentRange", {}).get(
+                     "range", {}).get("endIndex", 0) <= body_end
+                 or "insertText" in r]
+    assert replay([A, B, C, D], plan_reqs) == [A, C, B, D]
+    deleted = [r["deleteContentRange"]["range"]
+               for r in plan_reqs if "deleteContentRange" in r]
+    c_start = 1 + len(A) + 1 + len(B) + 1
+    assert all(not (r["startIndex"] <= c_start < r["endIndex"])
+               for r in deleted), "the anchored C paragraph was still moved"
 
 
 def test_a_remote_move_is_never_taken_for_a_local_one(engine, monkeypatch,
@@ -491,13 +503,15 @@ def test_sidecar_without_a_revision_closes_sync_and_says_why(engine, tmp_path):
 
 def test_rewriting_a_commented_block_still_points_at_patch(engine, monkeypatch,
                                                            tmp_path, capsys):
-    """Совет про patch верен для правки и должен остаться для неё."""
+    """Отложенная правка по-прежнему называет безопасный путь через patch."""
     with pytest.raises(SystemExit):
         run_sync(engine, monkeypatch, tmp_path, [A, B, C], [A, "Bravo edited",
                                                             C],
                  comments=[api_comment("c1", "A", CREATED)], anchors={B})
-    err = json.loads(capsys.readouterr().out)["error"]
-    assert "`patch`" in err and "переставлен" not in err
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "partial-noop"
+    deferred = json.dumps(out["deferred"], ensure_ascii=False)
+    assert "`patch`" in deferred and "переставлен" not in deferred
 
 
 # ---------------------------------------------------------------------------
@@ -692,9 +706,105 @@ def test_a_dragged_selection_over_a_move_does_not_promise_patch(engine,
                       "\n\n".join(local))
     with pytest.raises(SystemExit):
         engine.sync_doc("doc1", md)
-    err = json.loads(capsys.readouterr().out)["error"]
-    assert "несколько абзацев" in err
-    assert "`patch`" not in err
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "partial-noop"
+    explanation = json.dumps(out, ensure_ascii=False)
+    assert "crossing" in explanation
+    assert "`patch`" not in explanation
+
+
+def _late_anchor_snapshot(engine, monkeypatch, *, anchor):
+    """Expose the final protected-range gate after planning the real move.
+
+    r15 normally localizes a mapped anchor before request generation.  The
+    r14 safety net still owns the final request-list refusal, though, and its
+    advice must remain correct if a confirmed export anchor arrives after the
+    planner has already selected a move.  This seam keeps the real DOCX/API
+    fixture and real reorder geometry, while making that late-confirmation
+    boundary explicit and deterministic.
+    """
+    original = engine._fresh_anchor_snapshot
+
+    def fresh(*args, **kwargs):
+        snap, reason = original(*args, **kwargs)
+        assert snap is not None, reason
+
+        class Late(dict):
+            accesses = 0
+
+            def __getitem__(self, key):
+                if key == "anchors":
+                    self.accesses += 1
+                    # preflight and protected-component localization have
+                    # already completed; the final interval fence sees the
+                    # confirmed anchor on its third read.
+                    if self.accesses < 3:
+                        return []
+                    return anchor
+                return super().__getitem__(key)
+
+        return Late(snap), reason
+
+    monkeypatch.setattr(engine, "_fresh_anchor_snapshot", fresh)
+
+
+def test_wholly_contained_moved_anchor_gets_move_advice_at_final_gate(
+        engine, monkeypatch, tmp_path, capsys):
+    """A moved block's anchor names the handoff, never generic ``patch``."""
+    base = [A, B, C]
+    local = [B, A, C]                 # real planner moves B (base index 1)
+    doc = make_doc(base)
+    docs = DocsStub(doc, merged_doc=make_doc(local, rev="R2"))
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        _docx_builder(docs, [(t, [("0", 0, len(t))] if t == B else [])
+                             for t in base], [("0", "A", CREATED_SEC)]),
+        html=("".join(f"<p>{t}</p>" for t in local)).encode())
+    wire(engine, monkeypatch, docs, drive)
+    anchor_start = 1 + len(A) + 1
+    _late_anchor_snapshot(
+        engine, monkeypatch,
+        anchor=[(anchor_start, anchor_start + len(B), B, "0")])
+    md = make_workdir(engine, tmp_path, doc, "\n\n".join(base),
+                      "\n\n".join(local))
+    with pytest.raises(SystemExit) as exc:
+        engine.sync_doc("doc1", md)
+    assert exc.value.code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert "error" in out
+    assert "переставлен" in out["error"]
+    assert "сделайте руками" in out["error"]
+    assert "`patch`" not in out["error"]
+    assert _no_content_mutation(docs)
+
+
+def test_confirmed_crossing_anchor_gets_crossing_advice_at_final_gate(
+        engine, monkeypatch, tmp_path, capsys):
+    """A confirmed cross-paragraph anchor must not promise point editing."""
+    base = ["Заголовок", "Подзаголовок", C]
+    local = ["Подзаголовок", "Заголовок", C]
+    doc = make_doc(base)
+    docs = DocsStub(doc, merged_doc=make_doc(local, rev="R2"))
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        _crossing_docx(docs, base, "0", (0, 0), (1, len("Подзаголовок")),
+                       [("0", "A", CREATED_SEC)]),
+        html=("".join(f"<p>{t}</p>" for t in local)).encode())
+    wire(engine, monkeypatch, docs, drive)
+    _late_anchor_snapshot(
+        engine, monkeypatch,
+        anchor=[(1, 1 + len(base[0]) + 1 + len(base[1]),
+                 f"{base[0]}\n{base[1]}", "0")])
+    md = make_workdir(engine, tmp_path, doc, "\n\n".join(base),
+                      "\n\n".join(local))
+    with pytest.raises(SystemExit) as exc:
+        engine.sync_doc("doc1", md)
+    assert exc.value.code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert "error" in out
+    assert "захватывает несколько абзацев" in out["error"]
+    assert "`patch`" not in out["error"]
+    assert _no_content_mutation(docs)
 
 
 def test_fingerprint_ignores_empty_runs(engine):
