@@ -263,3 +263,29 @@ def test_docs_read_failure_keeps_comments_but_marks_quote_unknown(
         "document_tabs_unavailable")
     assert rows["document"]["tab_attribution"]["status"] == "document"
     assert "Docs offline" in captured.err
+
+
+def test_raw_drive_anchor_is_not_emitted_as_a_public_field(
+        engine, monkeypatch, capsys):
+    """The opaque `kix.…` anchor is an internal discriminator, not a field.
+
+    It is requested so a quote-less thread can be called document-level, and
+    skrepka cannot decode it into coordinates. Emitting it would invite
+    callers to parse something that means nothing to them (codex P2).
+    """
+    import json
+
+    raw = {"id": "c1", "content": "c", "createdTime": "2026-08-01T00:00:00Z",
+           "author": {"displayName": "A", "me": True},
+           "anchor": "kix.opaqueblob", "resolved": False, "replies": []}
+    monkeypatch.setattr(engine, "get_creds", lambda: object())
+    monkeypatch.setattr(engine, "_list_comments_raw", lambda *a, **k: [raw])
+    monkeypatch.setattr(engine, "get_drive_service", lambda c: object())
+    monkeypatch.setattr(engine, "get_docs_service", lambda c: object())
+    monkeypatch.setattr(engine, "_read_comment_evidence",
+                        lambda *a, **k: ([raw], None, None,
+                                         "document_tabs_unavailable", [], None))
+    engine.list_comments("doc1")
+    out = json.loads(capsys.readouterr().out)
+    assert out[0]["id"] == "c1"
+    assert "anchor" not in out[0]

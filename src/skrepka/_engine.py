@@ -1680,6 +1680,12 @@ def list_comments(file_id, output=None):
             # The Drive action is needed only for the internal freshness
             # floor.  Keep the historical public comments schema unchanged.
             reply.pop("action", None)
+        # Same rule for the raw Drive `anchor`: it is requested so that a
+        # thread with no quote can be classified as document-level, and it is
+        # an opaque `kix.…` blob that skrepka cannot decode into coordinates.
+        # Emitting it would turn an internal discriminator into a public field
+        # somebody starts parsing (codex P2).
+        c.pop("anchor", None)
 
     summary = {"comments": len(comments),
                "unresolved": sum(1 for c in comments

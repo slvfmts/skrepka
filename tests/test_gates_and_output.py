@@ -143,22 +143,6 @@ def _fake_reply_drive(seen):
     return Drive()
 
 
-def _fake_reply_docs():
-    """Single legacy tab for reply tests unrelated to #44 tab attribution."""
-    class _Req:
-        def execute(self):
-            return {"documentId": "doc1", "title": "Legacy", "body": {}}
-
-    class Docs:
-        def documents(self):
-            return self
-
-        def get(self, **_kw):
-            return _Req()
-
-    return Docs()
-
-
 def test_resolve_without_flag_refuses_before_any_api_call(engine, monkeypatch,
                                                           capsys):
     _explode_on_auth(monkeypatch, engine)
@@ -184,8 +168,6 @@ def test_resolve_with_flag_reaches_the_api(engine, monkeypatch, capsys):
     monkeypatch.setattr(engine, "get_creds", lambda: object())
     monkeypatch.setattr(engine, "get_drive_service",
                         lambda c: _fake_reply_drive(seen))
-    monkeypatch.setattr(engine, "get_docs_service",
-                        lambda c: _fake_reply_docs())
     engine.resolve_comment("doc1", "c1", yes=True)
     assert seen["body"]["action"] == "resolve"
     assert json.loads(capsys.readouterr().out)["resolved"] is True
@@ -198,8 +180,6 @@ def test_cli_passes_the_flag_through_to_resolve(engine, monkeypatch, capsys):
     monkeypatch.setattr(engine, "get_creds", lambda: object())
     monkeypatch.setattr(engine, "get_drive_service",
                         lambda c: _fake_reply_drive(seen))
-    monkeypatch.setattr(engine, "get_docs_service",
-                        lambda c: _fake_reply_docs())
     monkeypatch.setattr(sys, "argv", ["skrepka", "resolve", "doc1", "c1",
                                       "--yes"])
     engine.main()
@@ -216,8 +196,6 @@ def test_cli_passes_the_flag_through_to_reply_resolve(engine, monkeypatch,
     monkeypatch.setattr(engine, "get_creds", lambda: object())
     monkeypatch.setattr(engine, "get_drive_service",
                         lambda c: _fake_reply_drive(seen))
-    monkeypatch.setattr(engine, "get_docs_service",
-                        lambda c: _fake_reply_docs())
     monkeypatch.setattr(sys, "argv", ["skrepka", "reply", "doc1", "c1", "hi",
                                       "--resolve", "--yes"])
     engine.main()
@@ -252,8 +230,6 @@ def test_reply_prints_the_second_its_reply_landed_in(engine, monkeypatch,
     monkeypatch.setattr(engine, "get_creds", lambda: object())
     monkeypatch.setattr(engine, "get_drive_service",
                         lambda c: _fake_reply_drive(seen))
-    monkeypatch.setattr(engine, "get_docs_service",
-                        lambda c: _fake_reply_docs())
     engine.reply_comment("doc1", "c1", "text")
     out = json.loads(capsys.readouterr().out)
     assert out["createdTime"] == "2026-07-31T10:00:00.000Z"
