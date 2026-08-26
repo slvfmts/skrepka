@@ -2349,6 +2349,14 @@ def _parse_docx_anchor_spans(docx_bytes):
                 texts[pos] = "\n".join(parts)
             el["cell_text"] = texts
 
+    # Built once: two full scans of `para_meta` per span made the parser
+    # quadratic on a long document (codex P2).
+    para_roll = [
+        (para_top[i], meta["text"], para_paths[i],
+         not meta["has_objects"] and not meta["has_unknown"])
+        for i, meta in enumerate(para_meta)
+    ]
+
     for sp in spans:
         head, tail = para_meta[sp["para_index"]], para_meta[sp["end_para_index"]]
         sp["top"] = para_top[sp["para_index"]]
@@ -2361,6 +2369,14 @@ def _parse_docx_anchor_spans(docx_bytes):
         # of tables in a container and the grid width of a row must agree, or
         # the two sides are describing different documents (M16).
         sp["docx_lattice"] = docx_lattice
+        # The export's own paragraph roll, shared by reference like the
+        # lattice above. It is what lets `_twin_position` say WHICH copy of a
+        # repeated paragraph an anchor sits on — on a document whose format
+        # requires identical previews, nothing else tells the copies apart
+        # (постмортем 2026-08-25). `readable` matters as much as the text: a
+        # paragraph holding an inline object is counted by the export and
+        # dropped by the API, so one of them would silently shift the count.
+        sp["docx_paragraphs"] = para_roll
         if sp["end_para_index"] == sp["para_index"]:
             sp["anchor_text"] = _slice_utf16(
                 head["text"], sp["start_off"], sp["end_off"])
@@ -2795,6 +2811,43 @@ def _cells_agree(api, got, title, n):
     return None
 
 
+def _twin_position(sp, first=None, last=None):
+    """Which copy of a repeated paragraph this anchor sits on, and whether
+    that number can be trusted. Returns (ordinal, total, trusted).
+
+    The export and the API walk the same document in the same order, so the
+    Nth identical paragraph on one side is the Nth on the other — but only
+    while both sides SEE the same paragraphs. They do not always: a paragraph
+    holding an inline object, an equation or a footnote reference is counted
+    by the export and dropped by the API, and a suggested insertion is read
+    by the API and skipped by the export. Either one shifts the count
+    silently, and the counts can still coincide (codex counterexample). So a
+    single unreadable twin makes the whole ordinal untrusted, not just its
+    own position.
+
+    `first`/`last` confine the count to one tab's segment: on a multi-tab
+    document the export has no tab boundaries, and counting across all of
+    them would compare against an API side that only has the target tab.
+    """
+    rows = sp.get("docx_paragraphs") or []
+    idx, text, path = sp.get("para_index"), sp.get("para_text"), sp.get("path")
+    if idx is None or text is None:
+        return None, None, False
+    ordinal = total = 0
+    trusted = True
+    for i, (top, ptext, ppath, readable) in enumerate(rows):
+        if ptext != text or ppath != path:
+            continue
+        if first is not None and not (first <= top <= last):
+            continue
+        if not readable:
+            trusted = False
+        if i < idx:
+            ordinal += 1
+        total += 1
+    return ordinal, total, trusted
+
+
 def _confine_spans_to_segment(spans, first, last):
     """Split spans into the target tab's own and the rest.
 
@@ -2820,6 +2873,11 @@ def _confine_spans_to_segment(spans, first, last):
         # остался бы без защиты (найдено тестом).
         sides = [(-1 if t < first else (0 if t <= last else 1)) for t in tops]
         if sides == [0, 0]:
+            # Recomputed against THIS tab's segment: the roll covers the whole
+            # export, and the API side the mapper compares to holds only the
+            # target tab (codex P2).
+            (sp["twin_ordinal"], sp["twin_total"],
+             sp["twin_trusted"]) = _twin_position(sp, first, last)
             inside.append(sp)
         elif sides[0] == sides[1]:
             outside.append(sp)
@@ -3482,6 +3540,32 @@ def _map_anchors_to_doc(doc_tab, spans):
                     f"chip or a rich link at {hosts[:3]}) could be its home "
                     f"too — undecidable (fail closed): "
                     f"{_visible_controls(ptext)[:50]!r}")
+                continue
+            # The copies are identical to the eye and to a text search, but
+            # not to their POSITION. The export lists paragraphs in document
+            # order, so the anchor's own copy number picks the right one —
+            # provided both sides agree on how many copies there are. If they
+            # disagree the two readings describe different documents and the
+            # fence stands, exactly as before.
+            if "twin_ordinal" in s:
+                ordinal, total = s["twin_ordinal"], s["twin_total"]
+                trusted = s.get("twin_trusted", False)
+            else:
+                ordinal, total, trusted = _twin_position(s)
+            # Three conditions, and each closes its own way of being wrong:
+            # `trusted` — every twin in the export is fully readable, so the
+            # two walkers saw the same paragraphs; `not hosts_here` — no
+            # paragraph of this domain is opaque to the API for the mirror
+            # reason; equal totals — both sides ended up with the same number
+            # of copies. Two of the three were not enough: an inline image on
+            # one twin and a suggested insertion on another cancel out in the
+            # count while the order moves (codex counterexample).
+            if (ordinal is not None and trusted and not hosts_here
+                    and total == len(exact)
+                    and 0 <= ordinal < len(exact)):
+                base = exact[ordinal][0]
+                ranges.append((base + s["start_off"], base + s["end_off"],
+                               s.get("anchor_text", ""), s["docx_id"]))
                 continue
             ambiguous.append({
                 "docx_id": s["docx_id"], "para_text": ptext,

@@ -209,3 +209,52 @@ def test_replacement_states_the_style_instead_of_inheriting_it(engine,
     assert style["textStyle"]["link"] == {"url": "https://example.test"}
     assert style["range"]["endIndex"] - style["range"]["startIndex"] == \
         len("адрес")
+
+
+# ---------------------------------------------------------------------------
+# главный боевой случай: дубль, на котором висит живой комментарий
+# ---------------------------------------------------------------------------
+
+def test_the_commented_copy_itself_is_editable(engine, monkeypatch):
+    """Постскриптум пост-мортема: «на одном из этих двух вхождений висит мой
+    собственный свежий комментарий — замечание, которое я оставил, чтобы его
+    отработали, отработать нельзя».
+
+    Теперь можно. Копия, на которой стоит якорь, доказывается местом в
+    выгрузке, а сам якорь переписывается изнутри, поэтому тред переезжает на
+    новый текст вместо того, чтобы стать призраком."""
+    docs, drive = _stand(engine, monkeypatch,
+                         make_doc(["Заголовок", DUP, "Хвост", DUP]),
+                         ["Заголовок", DUP, "Хвост", DUP], 3, (0, len(DUP)))
+    note = engine._apply_op_anchor_safe(docs, drive, "doc1", {
+        "op": "replace_quote", "quote": DUP, "with": NEW,
+        "occurrence": 2}, None)
+    assert note["applied_as"] == "rewritten"
+    main = semantic_batch(docs)
+    # правка идёт по второй копии: она начинается после «Заголовок», первой
+    # копии и «Хвост»
+    second = 1 + len("Заголовок") + 1 + len(DUP) + 1 + len("Хвост") + 1
+    assert any(r.get("insertText", {}).get("location", {}).get("index",
+                                                               -1) >= second
+               for r in main)
+    # промежуточный поиск склеивает старый текст с новым, поэтому в нетронутой
+    # первой копии такой строки нет и она не может быть задета
+    probe = next(r["replaceAllText"]["containsText"]["text"] for r in main
+                 if "replaceAllText" in r)
+    assert NEW in probe and probe not in DUP
+    assert probe.count(DUP[:20]) >= 1
+
+
+def test_the_free_copy_stays_untouched_while_the_commented_one_changes(
+        engine, monkeypatch):
+    """Соседняя копия не должна пострадать — ради этого всё и затевалось."""
+    docs, drive = _stand(engine, monkeypatch,
+                         make_doc([DUP, DUP]), [DUP, DUP], 1, (0, len(DUP)))
+    engine._apply_op_anchor_safe(docs, drive, "doc1", {
+        "op": "replace_quote", "quote": DUP, "with": NEW,
+        "occurrence": 2}, None)
+    main = semantic_batch(docs)
+    for r in main[1:]:
+        rng = r.get("deleteContentRange", {}).get("range")
+        if rng and rng["endIndex"] <= 1 + len(DUP) + 1:
+            raise AssertionError(f"правка задела первую копию: {rng}")

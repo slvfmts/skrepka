@@ -1186,13 +1186,14 @@ def test_patch_survives_two_identical_paragraphs(engine, monkeypatch):
 
 
 def test_patch_refuses_an_op_reaching_into_a_copy(engine, monkeypatch, capsys):
-    """The other half: an operation whose range touches either copy is
-    refused, and the refusal names the thread instead of the export row.
+    """Операция, накрывающая живой якорь целиком, отказывает — и с 0.17
+    отказ называет НАСТОЯЩУЮ причину.
 
-    The op here also covers a healthy anchor completely, so BOTH refusal
-    sources are live at once. The fence has to win: the rewrite path of #21
-    could otherwise delete text next to an anchor it cannot see, because an
-    ambiguous anchor is absent from `anchors` by construction."""
+    Раньше здесь срабатывала ограда двойников: якорь стоял на одной из двух
+    одинаковых «Bravo», и какая из них — было неизвестно, поэтому отказ
+    говорил про одинаковые копии. Теперь копия известна, ограды нет, и видна
+    та причина, которая на самом деле мешает: замена накрывает якорь целиком,
+    а переписать разом два абзаца скрепка не умеет."""
     doc = make_doc(["Alpha", "Bravo", "Charlie", "Bravo"])
     docs = DocsStub(doc)
     drive = DriveStub(
@@ -1210,8 +1211,8 @@ def test_patch_refuses_an_op_reaching_into_a_copy(engine, monkeypatch, capsys):
     with pytest.raises(SystemExit):
         engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
     err = json.loads(capsys.readouterr().out)["error"]
-    assert "одинаковых копий" in err
-    assert "отклонена ИМЕННО ЭТА операция" in err
+    assert "накрывает целиком последний якорь треда c1" in err
+    assert "Правьте абзацы по отдельности" in err
     assert _no_content_mutation(docs)
 
 
@@ -3226,19 +3227,49 @@ def _make_doc_styled(specs, rev="R0"):
 
 def test_sync_refuses_to_rewrite_a_twin_of_an_anchored_paragraph(
         engine, monkeypatch, tmp_path, capsys):
-    """The end-to-end half of #26 on the sync path. A heading and a paragraph
-    can carry the same text: for sync's own alignment they are different
-    (the type is part of the key), but the anchor map sees one text twice and
-    cannot tell which copy the comment is on. The fence covers both, so the
-    positional rewrite — `deleteContentRange`, the operation that ghosts an
-    anchor — is refused before any write."""
+    """Зеркальная половина на пути sync: правится СВОБОДНЫЙ двойник.
+
+    Заголовок и абзац могут нести один текст. Раньше карта якорей видела
+    текст дважды, не знала, на какой копии комментарий, и огораживала обе —
+    правка заголовка отказывала, хотя комментарий был на абзаце. Теперь копия
+    доказана местом, и свободный двойник переписывается. Отказ на самой
+    прокомментированной копии проверяет следующий тест."""
+    doc = _make_doc_styled([("Bravo", "HEADING_1"), ("Bravo", "NORMAL_TEXT"),
+                            ("Charlie", "NORMAL_TEXT")])
+    merged = _make_doc_styled([("Bravo edited", "HEADING_1"),
+                               ("Bravo", "NORMAL_TEXT"),
+                               ("Charlie", "NORMAL_TEXT")], rev="R2")
+    docs = DocsStub(doc, merged_doc=merged)
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        # якорь на копии-АБЗАЦЕ; правка ниже трогает заголовок, и теперь это
+        # разные адреса, а не два кандидата
+        _docx_builder(docs, [("Bravo", []), ("Bravo", [("0", 0, 5)]),
+                             ("Charlie", [])],
+                      [("0", "A", CREATED_SEC)]),
+        html=b"<h1>Bravo edited</h1><p>Bravo</p><p>Charlie</p>")
+    wire(engine, monkeypatch, docs, drive)
+    md = make_workdir(engine, tmp_path, doc,
+                      "# Bravo\n\nBravo\n\nCharlie",
+                      "# Bravo edited\n\nBravo\n\nCharlie")
+    engine.sync_doc("doc1", md)
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "synced"
+
+
+def test_sync_refuses_to_rewrite_the_anchored_copy_itself(
+        engine, monkeypatch, tmp_path, capsys):
+    """И зеркало: правка САМОЙ прокомментированной копии по-прежнему отказывает.
+
+    Позиционная перезапись — `deleteContentRange` — делает якорь призраком,
+    когда накрывает его целиком (C1, подтверждено замером M24-0). Знание о
+    том, какая копия прокомментирована, эту опасность не отменяет, оно лишь
+    сужает её до одной копии вместо обеих."""
     doc = _make_doc_styled([("Bravo", "HEADING_1"), ("Bravo", "NORMAL_TEXT"),
                             ("Charlie", "NORMAL_TEXT")])
     docs = DocsStub(doc)
     drive = DriveStub(
         [api_comment("c1", "A", CREATED)],
-        # the anchor is on the BODY copy; the local edit below touches the
-        # heading, and skrepka must still refuse — it cannot know which is which
         _docx_builder(docs, [("Bravo", []), ("Bravo", [("0", 0, 5)]),
                              ("Charlie", [])],
                       [("0", "A", CREATED_SEC)]),
@@ -3246,22 +3277,20 @@ def test_sync_refuses_to_rewrite_a_twin_of_an_anchored_paragraph(
     wire(engine, monkeypatch, docs, drive)
     md = make_workdir(engine, tmp_path, doc,
                       "# Bravo\n\nBravo\n\nCharlie",
-                      "# Bravo edited\n\nBravo\n\nCharlie")
+                      "# Bravo\n\nBravo edited\n\nCharlie")
     with pytest.raises(SystemExit):
         engine.sync_doc("doc1", md)
-    err = json.loads(capsys.readouterr().out)["error"]
-    assert "одинаковых копий" in err
     assert _no_content_mutation(docs)
 
 
 def test_sync_applies_away_from_the_copies_and_counts_them_honestly(
         engine, monkeypatch, tmp_path, capsys):
-    """The payoff of #26 on the sync path: a document whose commented
-    paragraph has a twin used to be frozen whole. Now the twins are fenced and
-    everything else merges. The receipt counts ambiguous ANCHORS, not fenced
-    intervals — one anchor with two candidates is one anchor skrepka could not
-    place, and reporting two would send the person hunting for a comment that
-    does not exist."""
+    """Расписка про двойников. С 0.17 копия, на которой стоит якорь,
+    доказывается местом в выгрузке, поэтому неразмещённых якорей больше нет:
+    и `ambiguous_anchors`, и ограда пусты, а документ сливается целиком.
+
+    Счётчик остаётся в контракте и проверяется на документе, где сторонам
+    верить нельзя, — тестом ниже."""
     doc = _make_doc_styled([("Bravo", "HEADING_1"), ("Bravo", "NORMAL_TEXT"),
                             ("Charlie", "NORMAL_TEXT")])
     merged = _make_doc_styled([("Bravo", "HEADING_1"), ("Bravo", "NORMAL_TEXT"),
@@ -3281,8 +3310,8 @@ def test_sync_applies_away_from_the_copies_and_counts_them_honestly(
     out = json.loads(capsys.readouterr().out)
     assert out["action"] == "synced"
     accounting = out["anchor_accounting"]
-    assert accounting["ambiguous_anchors"] == 1
-    assert accounting["blocked_anchors"] == 2  # both copies fenced
+    assert accounting["ambiguous_anchors"] == 0
+    assert accounting["blocked_anchors"] == 0
 
 
 # ---------------------------------------------------------------------------

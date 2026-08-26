@@ -213,12 +213,27 @@ def test_the_twin_trap_is_not_walked_into(engine, make_docx):
     assert [(s, e) for s, e, _t, _i in ranges] == [(15, 28)]
 
 
-def test_two_identical_soft_break_paragraphs_are_fenced_not_placed(engine,
-                                                                   make_docx):
-    """Ограда #26 работает на новом алфавите так же: два дословных двойника —
-    кандидаты, а не выбор."""
+def test_two_identical_soft_break_paragraphs_are_told_apart_by_position(
+        engine, make_docx):
+    """На новом алфавите работает то же правило: двойники различаются местом.
+    Якорь стоит на втором абзаце выгрузки — значит на втором в документе."""
     body = (_break_para("ПОВТОР", "строка")
             + _break_para("ПОВТОР", "строка", cid="0"))
+    spans, _p, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    ranges, mproblems, ambiguous = engine._map_anchors_to_doc(
+        _tab([["ПОВТОР\vстрока"], ["ПОВТОР\vстрока"]]), spans)
+    assert (mproblems, ambiguous) == ([], [])
+    assert len(ranges) == 1
+    assert ranges[0][0] >= 1 + len("ПОВТОР\vстрока") + 1   # вторая копия
+
+
+def test_soft_break_twins_stay_fenced_when_the_readings_disagree(engine,
+                                                                 make_docx):
+    """А когда сторонам верить нельзя — ограда на месте: в выгрузке три
+    двойника, в документе два."""
+    body = (_break_para("ПОВТОР", "строка")
+            + _break_para("ПОВТОР", "строка", cid="0")
+            + _break_para("ПОВТОР", "строка"))
     spans, _p, _c = engine._parse_docx_anchor_spans(make_docx(body))
     ranges, mproblems, ambiguous = engine._map_anchors_to_doc(
         _tab([["ПОВТОР\vстрока"], ["ПОВТОР\vстрока"]]), spans)
