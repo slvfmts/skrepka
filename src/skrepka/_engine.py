@@ -1817,20 +1817,18 @@ def _resolve_op(op, doc_tab, tab_id):
         if total == 0:
             _error(f"quote not found: {quote!r}")
         if total > 1 and "occurrence" not in op:
-            # `occurrence` is refused outright once the doc has anchored
-            # comments, so sending everyone there would be a dead end for the
-            # documents this tool is for (#24: a refusal must name a path that
-            # exists). The quote is the path — make it longer.
+            # Ambiguity is still a refusal — skrepka must not pick a copy on
+            # the person's behalf. What changed is that the refusal now names
+            # a path that WORKS on a commented document too: since the write
+            # goes by index, the occurrence number is a real address (M24-0).
             _error(
                 f"quote is non-unique ({total} matches): {quote!r}. "
-                f"Extend the quote until it is unique — include the "
-                f"surrounding sentence. That fails when the paragraph itself "
-                f"repeats word for word: no quote inside it is unique, so the "
-                f"edit cannot be addressed at all. Do not guess a copy — tell "
-                f"the person the text repeats and ask what to do. "
-                f"'occurrence': N also disambiguates, but only on a doc "
-                f"WITHOUT anchored comments — with them it is refused, so "
-                f"sending an agent there alone would be a dead end."
+                f"Say WHICH one with 'occurrence': N (1..{total}), counted "
+                f"from the start of the tab — it works on documents with "
+                f"comments as well. A longer quote also disambiguates, but "
+                f"not when the paragraph itself repeats word for word. Do "
+                f"not guess a copy: if it is not clear which one the person "
+                f"meant, ask."
             )
         if occurrence > total:
             _error(
@@ -5399,8 +5397,15 @@ def _execute_anchor_rewrite(docs_service, file_id, tid, requests, revision_id,
 
 
 def _resolve_replace_target(op, doc_tab, r, check_style=True):
-    """Shared replace-target checks on a given snapshot: exact text,
-    uniqueness, round-trip, style uniformity. Returns search_text.
+    """Resolve the exact text of a replace target on a given snapshot.
+
+    Uniqueness is deliberately NOT checked here any more. It was never a
+    property of the edit — it was a requirement of `replaceAllText`, which
+    addresses by searching the tab for a string. Since the write goes by
+    absolute index (`_execute_index_replace`), the range is the address, and
+    a paragraph that repeats word for word is editable like any other. A
+    document whose format requires identical previews used to be uneditable
+    for exactly this reason (постмортем 2026-08-25).
 
     `check_style=False` defers the style check to the caller. The anchor-safe
     path needs that: it may narrow the range, and a mixed style sitting in the
@@ -5409,12 +5414,6 @@ def _resolve_replace_target(op, doc_tab, r, check_style=True):
     """
     if "quote" in op:
         search_text = op["quote"]
-        if "occurrence" in op and int(op["occurrence"]) != 1:
-            _error(
-                f"'occurrence' targeting is not supported on docs with "
-                f"anchored comments ({r['source']}); provide a longer "
-                f"quote that is unique in the tab"
-            )
     else:
         search_text = _extract_exact_text_range(doc_tab, r["start"], r["end"])
         if search_text is None:
@@ -5426,28 +5425,72 @@ def _resolve_replace_target(op, doc_tab, r, check_style=True):
         if not search_text:
             _error(f"named range {r['source']} resolved to empty text")
 
-    total = _replace_all_match_count(doc_tab, search_text)
-    if total != 1:
-        outside = _count_text_outside_body(doc_tab, search_text)
-        where = (f" ({outside} of them in a header/footer/footnote, which "
-                 f"replaceAllText also rewrites)" if outside else "")
+    # The resolved range must still hold the text it was resolved from: the
+    # snapshot can be older than the write. This replaces the old global
+    # uniqueness + round-trip pair, which proved the same thing indirectly
+    # and only for a text search.
+    here = _extract_exact_text_range(doc_tab, r["start"], r["end"])
+    if here != search_text:
         _error(
-            f"replace target must be unique in tab for the anchor-safe "
-            f"path, found {total} matches{where} ({r['source']}); provide a "
-            f"longer unique quote"
-        )
-    # Round-trip: the unique match must be exactly the resolved range.
-    found = _find_quote_in_doctab(doc_tab, search_text)
-    if found != (r["start"], r["end"]):
-        _error(
-            f"resolved text for {r['source']} matches a different "
-            f"location ({found} vs ({r['start']}, {r['end']})) — refused"
+            f"text at the resolved range changed since it was addressed "
+            f"({here!r} vs {search_text!r}) for {r['source']} — refused"
         )
     if check_style:
         problem = _style_refusal(doc_tab, r["start"], r["end"], r["source"])
         if problem:
             _error(problem)
     return search_text
+
+
+def _range_style(doc_tab, start, end):
+    """The textStyle of a uniformly-styled range, for re-applying it.
+
+    `insertText` inherits formatting unpredictably (FINDINGS, 2026-07-14):
+    the honest way is to state the style rather than hope for it. Callers
+    only reach here for a range that `_match_style_signature` called uniform,
+    so the first intersecting run speaks for all of them.
+    """
+    body = doc_tab.get("body", {}) or {}
+    for s, e, tr in _extract_runs_full(body.get("content", [])):
+        if s < end and e > start and not tr.get("suggestedInsertionIds"):
+            return {f: v for f, v in (tr.get("textStyle") or {}).items()
+                    if f in _STYLE_FIELDS and v is not None}
+    return {}
+
+
+def _execute_index_replace(docs_service, file_id, tid, start, end, new_text,
+                           style, revision_id, extra_requests_before=None):
+    """Replace [start, end) by absolute index — no text search involved.
+
+    This is what lets a repeated paragraph be addressed at all: the range is
+    already known, and `replaceAllText` threw that knowledge away to search
+    the tab by text, which is why a document whose format REQUIRES identical
+    previews could not be edited (постмортем 2026-08-25).
+
+    Deleting first and inserting into the collapsed point is the measured
+    protocol M24-0. Style is stated explicitly because `insertText` inherits
+    it from a neighbour and would, for example, hand the new text the link of
+    the word next to it.
+    """
+    requests = list(extra_requests_before or [])
+    if start < end:
+        requests.append({"deleteContentRange": {"range": {
+            "startIndex": start, "endIndex": end}}})
+    if new_text:
+        requests.append({"insertText": {
+            "location": {"index": start}, "text": new_text}})
+        if style:
+            requests.append({"updateTextStyle": {
+                "range": {"startIndex": start,
+                          "endIndex": start + _utf16_len(new_text)},
+                "textStyle": style,
+                "fields": ",".join(sorted(style)),
+            }})
+    docs_service.documents().batchUpdate(
+        documentId=file_id,
+        body={"requests": _scope_requests(requests, tid),
+              "writeControl": _write_control(revision_id)},
+    ).execute()
 
 
 def _execute_replace_all(docs_service, file_id, tid, search_text, new_text,
@@ -5596,9 +5639,16 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
         start_at, end_at, applied_text = r["start"], r["end"], r["text"]
         hits = _blocked_hits(start_at, end_at, snap["blocked"])
         doomed = _doomed_threads(start_at, end_at, snap["anchors"], attribution)
-        # mixed styles are a reason to narrow too, not only a reason to refuse:
-        # replaceAllText flattens them, a range that avoids them does not
-        style_problem = _style_refusal(doc_tab, start_at, end_at, r["source"])
+        # A pure deletion has no style question at all: there is no new text
+        # to format. The old refusal came from `replaceAllText`, which would
+        # have flattened the surviving runs — `deleteContentRange` touches no
+        # style. This is the header case «убрать ссылку „Бриф“» from the
+        # постмортем 2026-08-25, refused for a reason that never applied.
+        # A non-empty replacement still needs one style to state, so a mixed
+        # range remains a reason to narrow, and then to refuse.
+        style_problem = (
+            None if not applied_text
+            else _style_refusal(doc_tab, start_at, end_at, r["source"]))
         narrowed = None
         if hits or doomed or style_problem:
             narrowed = _narrow_replace(
@@ -5685,9 +5735,12 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
                     r["source"],
                     extra_requests_before=[_canary_delete_request(canary)])
             else:
-                _execute_replace_all(
-                    docs_service, file_id, tid, search_text, applied_text,
-                    snap["r1"], r["source"],
+                _execute_index_replace(
+                    docs_service, file_id, tid, start_at, end_at,
+                    applied_text,
+                    _range_style(doc_tab, start_at, end_at)
+                    if applied_text else None,
+                    snap["r1"],
                     extra_requests_before=[_canary_delete_request(canary)])
         except PatchOpError:
             raise  # occurrence mismatch: batch APPLIED, canary already gone

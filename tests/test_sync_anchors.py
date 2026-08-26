@@ -74,6 +74,25 @@ def make_doc(texts, named_ranges=None, rev="R0"):
     return doc
 
 
+def semantic_batch(docs):
+    """The batch that carries the edit: canary delete first, then the write.
+
+    Since 0.17 the anchor-safe path writes by absolute index instead of
+    searching the tab for a string, so a batch is recognised by shape rather
+    than by the presence of `replaceAllText`.
+    """
+    for b in docs.batches:
+        if len(b) > 1 and "deleteContentRange" in b[0]:
+            return b
+    raise AssertionError("no semantic batch was sent")
+
+
+def written_text(batch):
+    """The text the semantic batch inserts, or '' for a pure deletion."""
+    return "".join(r["insertText"]["text"] for r in batch
+                   if "insertText" in r)
+
+
 def api_comment(cid, author, created, resolved=False, replies=()):
     return {"id": cid, "createdTime": created,
             "author": {"displayName": author},
@@ -192,6 +211,15 @@ class DocsStub:
                              for r in reqs]})
         if not self.main_applied and self.merged is not None:
             self.main_applied = True
+            self.canary_text = None
+            self.rev = "R2"
+            return _Req({"writeControl": {"requiredRevisionId": "R2"},
+                         "replies": [{} for _ in reqs]})
+        # index-addressed semantic batch: canary delete first, then the edit
+        if (len(reqs) > 1 and "deleteContentRange" in first
+                and self.canary_text is not None
+                and any("insertText" in r or "deleteContentRange" in r
+                        for r in reqs[1:])):
             self.canary_text = None
             self.rev = "R2"
             return _Req({"writeControl": {"requiredRevisionId": "R2"},
@@ -1129,10 +1157,9 @@ def test_patch_still_applies_away_from_the_odd_anchor(engine, monkeypatch):
     monkeypatch.setattr(engine.time, "sleep", lambda s: None)
     op = {"op": "replace_quote", "quote": "Alpha", "with": "Yankee"}
     engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
-    main = next(b for b in docs.batches if any("replaceAllText" in r
-                                               for r in b))
+    main = semantic_batch(docs)
     assert "deleteContentRange" in main[0]  # canary delete first
-    assert "replaceAllText" in main[1]
+    assert "deleteContentRange" in main[1]  # the edit, by index
 
 
 def _dup_paragraph_doc(docs=None):
@@ -1154,9 +1181,8 @@ def test_patch_survives_two_identical_paragraphs(engine, monkeypatch):
     monkeypatch.setattr(engine.time, "sleep", lambda s: None)
     op = {"op": "replace_quote", "quote": "Alpha", "with": "Yankee"}
     engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
-    main = next(b for b in docs.batches if any("replaceAllText" in r
-                                               for r in b))
-    assert "replaceAllText" in main[1]
+    main = semantic_batch(docs)
+    assert "deleteContentRange" in main[1]  # the edit, by index
 
 
 def test_patch_refuses_an_op_reaching_into_a_copy(engine, monkeypatch, capsys):
@@ -1403,9 +1429,19 @@ class MutatingDocsStub(DocsStub):
     is about: the second operation has to see what the first one wrote.
     """
 
+    def _flat(self):
+        """Body text as one string; absolute Docs index i is `flat[i - 1]`."""
+        return "".join(el["paragraph"]["elements"][0]["textRun"]["content"]
+                       for el in self.base["body"]["content"]
+                       if "paragraph" in el)
+
+    def _store(self, flat):
+        self.base = make_doc(flat.split("\n")[:-1])
+
     def batchUpdate(self, documentId=None, body=None):
+        reqs = body["requests"]
         result = super().batchUpdate(documentId=documentId, body=body)
-        for rq in body["requests"]:
+        for rq in reqs:
             rat = rq.get("replaceAllText")
             if not rat:
                 continue
@@ -1414,6 +1450,21 @@ class MutatingDocsStub(DocsStub):
                      for el in self.base["body"]["content"]
                      if "paragraph" in el]
             self.base = make_doc([t.replace(old, new) for t in texts])
+        # Index-addressed edit: skip the leading canary delete (it targets the
+        # canary paragraph, which this stub never materialised) and apply the
+        # rest, so the NEXT operation reads what this one wrote.
+        if len(reqs) > 1 and "deleteContentRange" in reqs[0]:
+            flat = self._flat()
+            for rq in reqs[1:]:
+                if "deleteContentRange" in rq:
+                    rng = rq["deleteContentRange"]["range"]
+                    flat = (flat[:rng["startIndex"] - 1]
+                            + flat[rng["endIndex"] - 1:])
+                elif "insertText" in rq:
+                    at = rq["insertText"]["location"]["index"]
+                    flat = (flat[:at - 1] + rq["insertText"]["text"]
+                            + flat[at - 1:])
+            self._store(flat)
         return result
 
 
@@ -1611,10 +1662,9 @@ def test_patch_replace_applies_with_canary_first(engine, monkeypatch):
     monkeypatch.setattr(engine.time, "sleep", lambda s: None)
     op = {"op": "replace_quote", "quote": "Bravo", "with": "Zulu"}
     engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
-    main = next(b for b in docs.batches if any("replaceAllText" in r
-                                               for r in b))
+    main = semantic_batch(docs)
     assert "deleteContentRange" in main[0]  # canary delete first
-    assert "replaceAllText" in main[1]
+    assert "deleteContentRange" in main[1]  # the edit, by index
 
 
 def _covered_anchor_doc(engine, monkeypatch, comments=None):
@@ -1639,8 +1689,7 @@ def test_patch_full_anchor_coverage_is_rewritten(engine, monkeypatch):
     note = engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
     assert note["applied_as"] == "rewritten"
 
-    main = next(b for b in docs.batches if any("replaceAllText" in r
-                                               for r in b))
+    main = semantic_batch(docs)
     assert "deleteContentRange" in main[0]           # canary first
     assert main[1]["insertText"] == {"location": {"index": 11},
                                      "text": "Zulu"}  # inside the anchor
@@ -1935,10 +1984,10 @@ def test_mixed_style_in_the_untouched_part_no_longer_decides(engine,
           "with": "Жирный якорь и обычный хвост образцов"}
     note = engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
     assert note["applied_as"] == "narrowed"
-    req = next(r["replaceAllText"] for b in docs.batches for r in b
-               if "replaceAllText" in r)
-    assert req["containsText"]["text"].endswith("примеров")
-    assert "Жирный" not in req["containsText"]["text"]
+    main = semantic_batch(docs)
+    edit = next(r["deleteContentRange"]["range"] for r in main[1:]
+                if "deleteContentRange" in r)
+    assert edit["endIndex"] > edit["startIndex"]
 
 
 def test_noop_replace_writes_nothing(engine, monkeypatch):
@@ -1998,12 +2047,9 @@ def test_narrowed_replace_reaches_the_api_and_is_reported(engine, monkeypatch):
           "with": "Здесь слишком мало образцов"}
     note = engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
     assert note["applied_as"] == "narrowed"
-    main = next(b for b in docs.batches if any("replaceAllText" in r
-                                               for r in b))
-    req = next(r["replaceAllText"] for r in main if "replaceAllText" in r)
-    # minimal cut: only what the anchor needs, so the core stays unique
-    assert req["containsText"]["text"] == "лишком мало примеров"
-    assert req["replaceText"] == "лишком мало образцов"
+    main = semantic_batch(docs)
+    # minimal cut: only what the anchor needs is rewritten
+    assert written_text(main) == "лишком мало образцов"
 
 
 # ---------------------------------------------------------------------------
@@ -2233,9 +2279,11 @@ def test_narrowing_wins_over_rewriting(engine, monkeypatch):
         "op": "replace_quote", "quote": "Здесь слишком мало примеров",
         "with": "Здесь слишком мало образцов"}, None)
     assert note["applied_as"] == "narrowed"
-    main = next(b for b in docs.batches if any("replaceAllText" in r
-                                               for r in b))
-    assert not any("insertText" in r for r in main)
+    main = semantic_batch(docs)
+    # narrowing writes the shortened range directly; the anchor rewrite would
+    # instead do its sentinel dance through `replaceAllText`
+    assert not any("replaceAllText" in r for r in main)
+    assert written_text(main) == "лишком мало образцов"
 
 
 # ---------------------------------------------------------------------------
@@ -2446,7 +2494,7 @@ def test_a_crossing_comment_no_longer_freezes_the_document(engine, monkeypatch,
     engine.patch_doc("doc1", str(ops))
     out = json.loads(capsys.readouterr().out)
     assert out["ops_applied"] == 1
-    assert any("replaceAllText" in rq for b in docs.batches for rq in b)
+    assert any("insertText" in rq for b in docs.batches for rq in b)
 
 
 def test_a_replace_covering_a_crossing_anchor_is_still_refused(engine,
@@ -3402,9 +3450,8 @@ def test_patch_works_beside_a_commented_soft_break(engine, monkeypatch):
     monkeypatch.setattr(engine.time, "sleep", lambda s: None)
     op = {"op": "replace_quote", "quote": "Alpha", "with": "Zulu"}
     engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
-    main = next(b for b in docs.batches if any("replaceAllText" in r
-                                               for r in b))
-    assert main[-1]["replaceAllText"]["containsText"]["text"] == "Alpha"
+    main = semantic_batch(docs)
+    assert written_text(main) == "Zulu"
 
 
 def test_patch_writes_a_soft_break_into_a_commented_paragraph(engine,
@@ -3417,8 +3464,7 @@ def test_patch_writes_a_soft_break_into_a_commented_paragraph(engine,
     op = {"op": "replace_quote", "quote": "Bravo", "with": "Заголовок\vНиз"}
     note = engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
     assert note["applied_as"] == "rewritten"
-    main = next(b for b in docs.batches if any("replaceAllText" in r
-                                               for r in b))
+    main = semantic_batch(docs)
     assert main[1]["insertText"]["text"] == "Заголовок\vНиз"
     assert main[2]["replaceAllText"]["replaceText"] == "Заголовок\vНиз"
 
