@@ -1817,20 +1817,18 @@ def _resolve_op(op, doc_tab, tab_id):
         if total == 0:
             _error(f"quote not found: {quote!r}")
         if total > 1 and "occurrence" not in op:
-            # `occurrence` is refused outright once the doc has anchored
-            # comments, so sending everyone there would be a dead end for the
-            # documents this tool is for (#24: a refusal must name a path that
-            # exists). The quote is the path — make it longer.
+            # Ambiguity is still a refusal — skrepka must not pick a copy on
+            # the person's behalf. What changed is that the refusal now names
+            # a path that WORKS on a commented document too: since the write
+            # goes by index, the occurrence number is a real address (M24-0).
             _error(
                 f"quote is non-unique ({total} matches): {quote!r}. "
-                f"Extend the quote until it is unique — include the "
-                f"surrounding sentence. That fails when the paragraph itself "
-                f"repeats word for word: no quote inside it is unique, so the "
-                f"edit cannot be addressed at all. Do not guess a copy — tell "
-                f"the person the text repeats and ask what to do. "
-                f"'occurrence': N also disambiguates, but only on a doc "
-                f"WITHOUT anchored comments — with them it is refused, so "
-                f"sending an agent there alone would be a dead end."
+                f"Say WHICH one with 'occurrence': N (1..{total}), counted "
+                f"from the start of the tab — it works on documents with "
+                f"comments as well. A longer quote also disambiguates, but "
+                f"not when the paragraph itself repeats word for word. Do "
+                f"not guess a copy: if it is not clear which one the person "
+                f"meant, ask."
             )
         if occurrence > total:
             _error(
@@ -2351,6 +2349,14 @@ def _parse_docx_anchor_spans(docx_bytes):
                 texts[pos] = "\n".join(parts)
             el["cell_text"] = texts
 
+    # Built once: two full scans of `para_meta` per span made the parser
+    # quadratic on a long document (codex P2).
+    para_roll = [
+        (para_top[i], meta["text"], para_paths[i],
+         not meta["has_objects"] and not meta["has_unknown"])
+        for i, meta in enumerate(para_meta)
+    ]
+
     for sp in spans:
         head, tail = para_meta[sp["para_index"]], para_meta[sp["end_para_index"]]
         sp["top"] = para_top[sp["para_index"]]
@@ -2363,6 +2369,14 @@ def _parse_docx_anchor_spans(docx_bytes):
         # of tables in a container and the grid width of a row must agree, or
         # the two sides are describing different documents (M16).
         sp["docx_lattice"] = docx_lattice
+        # The export's own paragraph roll, shared by reference like the
+        # lattice above. It is what lets `_twin_position` say WHICH copy of a
+        # repeated paragraph an anchor sits on — on a document whose format
+        # requires identical previews, nothing else tells the copies apart
+        # (постмортем 2026-08-25). `readable` matters as much as the text: a
+        # paragraph holding an inline object is counted by the export and
+        # dropped by the API, so one of them would silently shift the count.
+        sp["docx_paragraphs"] = para_roll
         if sp["end_para_index"] == sp["para_index"]:
             sp["anchor_text"] = _slice_utf16(
                 head["text"], sp["start_off"], sp["end_off"])
@@ -2797,6 +2811,43 @@ def _cells_agree(api, got, title, n):
     return None
 
 
+def _twin_position(sp, first=None, last=None):
+    """Which copy of a repeated paragraph this anchor sits on, and whether
+    that number can be trusted. Returns (ordinal, total, trusted).
+
+    The export and the API walk the same document in the same order, so the
+    Nth identical paragraph on one side is the Nth on the other — but only
+    while both sides SEE the same paragraphs. They do not always: a paragraph
+    holding an inline object, an equation or a footnote reference is counted
+    by the export and dropped by the API, and a suggested insertion is read
+    by the API and skipped by the export. Either one shifts the count
+    silently, and the counts can still coincide (codex counterexample). So a
+    single unreadable twin makes the whole ordinal untrusted, not just its
+    own position.
+
+    `first`/`last` confine the count to one tab's segment: on a multi-tab
+    document the export has no tab boundaries, and counting across all of
+    them would compare against an API side that only has the target tab.
+    """
+    rows = sp.get("docx_paragraphs") or []
+    idx, text, path = sp.get("para_index"), sp.get("para_text"), sp.get("path")
+    if idx is None or text is None:
+        return None, None, False
+    ordinal = total = 0
+    trusted = True
+    for i, (top, ptext, ppath, readable) in enumerate(rows):
+        if ptext != text or ppath != path:
+            continue
+        if first is not None and not (first <= top <= last):
+            continue
+        if not readable:
+            trusted = False
+        if i < idx:
+            ordinal += 1
+        total += 1
+    return ordinal, total, trusted
+
+
 def _confine_spans_to_segment(spans, first, last):
     """Split spans into the target tab's own and the rest.
 
@@ -2822,6 +2873,11 @@ def _confine_spans_to_segment(spans, first, last):
         # остался бы без защиты (найдено тестом).
         sides = [(-1 if t < first else (0 if t <= last else 1)) for t in tops]
         if sides == [0, 0]:
+            # Recomputed against THIS tab's segment: the roll covers the whole
+            # export, and the API side the mapper compares to holds only the
+            # target tab (codex P2).
+            (sp["twin_ordinal"], sp["twin_total"],
+             sp["twin_trusted"]) = _twin_position(sp, first, last)
             inside.append(sp)
         elif sides[0] == sides[1]:
             outside.append(sp)
@@ -3484,6 +3540,32 @@ def _map_anchors_to_doc(doc_tab, spans):
                     f"chip or a rich link at {hosts[:3]}) could be its home "
                     f"too — undecidable (fail closed): "
                     f"{_visible_controls(ptext)[:50]!r}")
+                continue
+            # The copies are identical to the eye and to a text search, but
+            # not to their POSITION. The export lists paragraphs in document
+            # order, so the anchor's own copy number picks the right one —
+            # provided both sides agree on how many copies there are. If they
+            # disagree the two readings describe different documents and the
+            # fence stands, exactly as before.
+            if "twin_ordinal" in s:
+                ordinal, total = s["twin_ordinal"], s["twin_total"]
+                trusted = s.get("twin_trusted", False)
+            else:
+                ordinal, total, trusted = _twin_position(s)
+            # Three conditions, and each closes its own way of being wrong:
+            # `trusted` — every twin in the export is fully readable, so the
+            # two walkers saw the same paragraphs; `not hosts_here` — no
+            # paragraph of this domain is opaque to the API for the mirror
+            # reason; equal totals — both sides ended up with the same number
+            # of copies. Two of the three were not enough: an inline image on
+            # one twin and a suggested insertion on another cancel out in the
+            # count while the order moves (codex counterexample).
+            if (ordinal is not None and trusted and not hosts_here
+                    and total == len(exact)
+                    and 0 <= ordinal < len(exact)):
+                base = exact[ordinal][0]
+                ranges.append((base + s["start_off"], base + s["end_off"],
+                               s.get("anchor_text", ""), s["docx_id"]))
                 continue
             ambiguous.append({
                 "docx_id": s["docx_id"], "para_text": ptext,
@@ -5399,8 +5481,15 @@ def _execute_anchor_rewrite(docs_service, file_id, tid, requests, revision_id,
 
 
 def _resolve_replace_target(op, doc_tab, r, check_style=True):
-    """Shared replace-target checks on a given snapshot: exact text,
-    uniqueness, round-trip, style uniformity. Returns search_text.
+    """Resolve the exact text of a replace target on a given snapshot.
+
+    Uniqueness is deliberately NOT checked here any more. It was never a
+    property of the edit — it was a requirement of `replaceAllText`, which
+    addresses by searching the tab for a string. Since the write goes by
+    absolute index (`_execute_index_replace`), the range is the address, and
+    a paragraph that repeats word for word is editable like any other. A
+    document whose format requires identical previews used to be uneditable
+    for exactly this reason (постмортем 2026-08-25).
 
     `check_style=False` defers the style check to the caller. The anchor-safe
     path needs that: it may narrow the range, and a mixed style sitting in the
@@ -5409,12 +5498,6 @@ def _resolve_replace_target(op, doc_tab, r, check_style=True):
     """
     if "quote" in op:
         search_text = op["quote"]
-        if "occurrence" in op and int(op["occurrence"]) != 1:
-            _error(
-                f"'occurrence' targeting is not supported on docs with "
-                f"anchored comments ({r['source']}); provide a longer "
-                f"quote that is unique in the tab"
-            )
     else:
         search_text = _extract_exact_text_range(doc_tab, r["start"], r["end"])
         if search_text is None:
@@ -5426,28 +5509,89 @@ def _resolve_replace_target(op, doc_tab, r, check_style=True):
         if not search_text:
             _error(f"named range {r['source']} resolved to empty text")
 
-    total = _replace_all_match_count(doc_tab, search_text)
-    if total != 1:
-        outside = _count_text_outside_body(doc_tab, search_text)
-        where = (f" ({outside} of them in a header/footer/footnote, which "
-                 f"replaceAllText also rewrites)" if outside else "")
+    # The resolved range must still hold the text it was resolved from: the
+    # snapshot can be older than the write. This replaces the old global
+    # uniqueness + round-trip pair, which proved the same thing indirectly
+    # and only for a text search.
+    here = _extract_exact_text_range(doc_tab, r["start"], r["end"])
+    if here != search_text:
         _error(
-            f"replace target must be unique in tab for the anchor-safe "
-            f"path, found {total} matches{where} ({r['source']}); provide a "
-            f"longer unique quote"
-        )
-    # Round-trip: the unique match must be exactly the resolved range.
-    found = _find_quote_in_doctab(doc_tab, search_text)
-    if found != (r["start"], r["end"]):
-        _error(
-            f"resolved text for {r['source']} matches a different "
-            f"location ({found} vs ({r['start']}, {r['end']})) — refused"
+            f"text at the resolved range changed since it was addressed "
+            f"({here!r} vs {search_text!r}) for {r['source']} — refused"
         )
     if check_style:
         problem = _style_refusal(doc_tab, r["start"], r["end"], r["source"])
         if problem:
             _error(problem)
     return search_text
+
+
+def _range_style(doc_tab, start, end):
+    """The textStyle of a uniformly-styled range, for re-applying it.
+
+    `insertText` inherits formatting unpredictably (FINDINGS, 2026-07-14):
+    the honest way is to state the style rather than hope for it. Callers
+    only reach here for a range that `_match_style_signature` called uniform,
+    so the first intersecting run speaks for all of them.
+
+    The dict is deliberately allowed to be empty. It is always sent with a
+    mask over EVERY style field, so an absent field means «switch this off»
+    rather than «leave whatever was inherited». Without that, plain text
+    written next to a link keeps the link: stating only the fields that are
+    set can never take a field away (codex P1).
+    """
+    body = doc_tab.get("body", {}) or {}
+    for s, e, tr in _extract_runs_full(body.get("content", [])):
+        if s < end and e > start and not tr.get("suggestedInsertionIds"):
+            return {f: v for f, v in (tr.get("textStyle") or {}).items()
+                    if f in _STYLE_FIELDS and v is not None}
+    return {}
+
+
+def _execute_index_replace(docs_service, file_id, tid, start, end, new_text,
+                           style, revision_id, extra_requests_before=None,
+                           paragraph_safe=True):
+    """Replace [start, end) by absolute index — no text search involved.
+
+    This is what lets a repeated paragraph be addressed at all: the range is
+    already known, and `replaceAllText` threw that knowledge away to search
+    the tab by text, which is why a document whose format REQUIRES identical
+    previews could not be edited (постмортем 2026-08-25).
+
+    Deleting first and inserting into the collapsed point is the measured
+    protocol M24-0. Style is stated explicitly because `insertText` inherits
+    it from a neighbour and would, for example, hand the new text the link of
+    the word next to it.
+    """
+    requests = list(extra_requests_before or [])
+    if start < end:
+        if paragraph_safe is False:
+            raise PatchOpError(
+                "internal: index replace asked to delete a paragraph "
+                "boundary — refused before the write",
+                state="not_applied")
+        requests.append({"deleteContentRange": {"range": {
+            "startIndex": start, "endIndex": end}}})
+    if new_text:
+        requests.append({"insertText": {
+            "location": {"index": start}, "text": new_text}})
+        if style is not None:
+            # The mask covers every style field, always. A field the source
+            # range did not have is then actively cleared on the new text
+            # instead of being inherited from whatever sat next to the
+            # insertion point — the case that would otherwise hand a plain
+            # word the link of its neighbour (codex P1).
+            requests.append({"updateTextStyle": {
+                "range": {"startIndex": start,
+                          "endIndex": start + _utf16_len(new_text)},
+                "textStyle": dict(style),
+                "fields": ",".join(_STYLE_FIELDS),
+            }})
+    docs_service.documents().batchUpdate(
+        documentId=file_id,
+        body={"requests": _scope_requests(requests, tid),
+              "writeControl": _write_control(revision_id)},
+    ).execute()
 
 
 def _execute_replace_all(docs_service, file_id, tid, search_text, new_text,
@@ -5558,6 +5702,18 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
                                     r["source"])
         search_text = _resolve_replace_target(op, doc_tab, r,
                                               check_style=False)
+        # A quote is allowed to span a paragraph break, and until 0.17 that
+        # was harmless: `replaceAllText` kept the boundary. The index writer
+        # really deletes the range, so the `\n` would go with it — merging two
+        # paragraphs and dropping the second one's paragraphStyle. Nothing
+        # measures that (M24-0 did not), so it is refused until it does. A
+        # newline in the NEW text is a different thing and stays allowed: it
+        # adds a paragraph rather than destroying one.
+        if "\n" in search_text:
+            _error(
+                f"эта правка удаляет границу абзаца — два абзаца слились бы "
+                f"в один, а оформление второго пропало. Разделите её на "
+                f"правки внутри каждого абзаца. ({r['source']})")
         body_content = (doc_tab.get("body", {}) or {}).get("content", [])
         body_end = body_content[-1]["endIndex"] if body_content else 2
         named_intervals = _named_range_intervals(doc_tab)
@@ -5596,9 +5752,16 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
         start_at, end_at, applied_text = r["start"], r["end"], r["text"]
         hits = _blocked_hits(start_at, end_at, snap["blocked"])
         doomed = _doomed_threads(start_at, end_at, snap["anchors"], attribution)
-        # mixed styles are a reason to narrow too, not only a reason to refuse:
-        # replaceAllText flattens them, a range that avoids them does not
-        style_problem = _style_refusal(doc_tab, start_at, end_at, r["source"])
+        # A pure deletion has no style question at all: there is no new text
+        # to format. The old refusal came from `replaceAllText`, which would
+        # have flattened the surviving runs — `deleteContentRange` touches no
+        # style. This is the header case «убрать ссылку „Бриф“» from the
+        # постмортем 2026-08-25, refused for a reason that never applied.
+        # A non-empty replacement still needs one style to state, so a mixed
+        # range remains a reason to narrow, and then to refuse.
+        style_problem = (
+            None if not applied_text
+            else _style_refusal(doc_tab, start_at, end_at, r["source"]))
         narrowed = None
         if hits or doomed or style_problem:
             narrowed = _narrow_replace(
@@ -5685,9 +5848,11 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
                     r["source"],
                     extra_requests_before=[_canary_delete_request(canary)])
             else:
-                _execute_replace_all(
-                    docs_service, file_id, tid, search_text, applied_text,
-                    snap["r1"], r["source"],
+                _execute_index_replace(
+                    docs_service, file_id, tid, start_at, end_at,
+                    applied_text,
+                    _range_style(doc_tab, start_at, end_at),
+                    snap["r1"],
                     extra_requests_before=[_canary_delete_request(canary)])
         except PatchOpError:
             raise  # occurrence mismatch: batch APPLIED, canary already gone

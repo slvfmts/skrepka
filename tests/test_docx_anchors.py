@@ -779,24 +779,25 @@ def _anchored(text, cid="2"):
             f'<w:commentRangeEnd w:id="{cid}"/></w:p>')
 
 
-def test_identical_paragraphs_are_fenced_not_frozen(engine, make_docx):
-    """#26: the anchor is provably in ONE of the copies, so every copy is
-    protected and the rest of the document stays editable. Before this, two
-    identical paragraphs disabled replaces everywhere."""
+def test_identical_paragraphs_are_placed_not_fenced(engine, make_docx):
+    """#26 огораживал обе копии, потому что не знал, на какой из них якорь.
+    Теперь знает — по месту в выгрузке, — и вторая копия правится свободно.
+    Огораживание осталось для случаев, где месту верить нельзя: они рядом,
+    ниже по файлу."""
     spans, problems, _c = engine._parse_docx_anchor_spans(
         make_docx(_anchored("такой текст") + _p("такой текст")))
     assert problems == []
     tab = _tab([["такой текст"], ["такой текст"]])
     ranges, mproblems, ambiguous = engine._map_anchors_to_doc(tab, spans)
-    assert (ranges, mproblems) == ([], [])
-    blocked, fproblems = engine._fence_off_ambiguous(ambiguous)
-    assert fproblems == []
-    assert [(s, e) for s, e, _l in blocked] == [(1, 12), (13, 24)]
+    assert (mproblems, ambiguous) == ([], [])
+    assert ranges == [(1, 12, "такой текст", "2")]   # первая копия, не обе
 
 
 def test_fence_names_the_thread_and_the_way_out(engine, make_docx):
+    # третья копия в выгрузке и две в документе: стороны читают разное,
+    # месту верить нельзя, ограда остаётся — её и проверяем
     spans, _p1, _c = engine._parse_docx_anchor_spans(
-        make_docx(_anchored("текст", cid="7") + _p("текст")))
+        make_docx(_anchored("текст", cid="7") + _p("текст") + _p("текст")))
     _r, _pr, ambiguous = engine._map_anchors_to_doc(
         _tab([["текст"], ["текст"]]), spans)
     blocked, _fp = engine._fence_off_ambiguous(
@@ -815,9 +816,10 @@ def test_four_anchors_on_a_duplicated_paragraph(engine, make_docx):
     body = ('<w:p><w:commentRangeStart w:id="0"/><w:r><w:t>аа</w:t></w:r>'
             '<w:commentRangeEnd w:id="0"/><w:r><w:t> </w:t></w:r>'
             '<w:commentRangeStart w:id="1"/><w:r><w:t>бб</w:t></w:r>'
-            '<w:commentRangeEnd w:id="1"/></w:p>' + _p("аа бб"))
+            '<w:commentRangeEnd w:id="1"/></w:p>' + _p("аа бб") + _p("аа бб"))
     spans, problems, _c = engine._parse_docx_anchor_spans(make_docx(body))
     assert problems == []
+    # три копии в выгрузке против двух в документе — место недоказуемо
     _r, mproblems, ambiguous = engine._map_anchors_to_doc(
         _tab([["аа бб"], ["аа бб"]]), spans)
     assert mproblems == []
@@ -835,7 +837,7 @@ def test_two_threads_on_the_same_range_collapse_to_one_fence(engine, make_docx):
     body = ('<w:p><w:commentRangeStart w:id="0"/><w:commentRangeStart w:id="1"/>'
             '<w:r><w:t>текст</w:t></w:r>'
             '<w:commentRangeEnd w:id="0"/><w:commentRangeEnd w:id="1"/></w:p>'
-            + _p("текст"))
+            + _p("текст") + _p("текст"))
     spans, _p1, _c = engine._parse_docx_anchor_spans(make_docx(body))
     _r, _pr, ambiguous = engine._map_anchors_to_doc(
         _tab([["текст"], ["текст"]]), spans)
@@ -945,10 +947,10 @@ def test_an_image_paragraph_is_not_a_possible_host(engine, make_docx):
         make_docx(_anchored("текст") + _p("текст")))
     tab = _tab([["текст"], ["текст"], [{"inlineObjectElement": {}}],
                 [{"inlineObjectElement": {}}, "Рис. 1"]])
-    _r, problems, ambiguous = engine._map_anchors_to_doc(tab, spans)
+    ranges, problems, ambiguous = engine._map_anchors_to_doc(tab, spans)
     assert problems == []
-    blocked, _fp = engine._fence_off_ambiguous(ambiguous)
-    assert [(s, e) for s, e, _l in blocked] == [(1, 6), (7, 12)]
+    # картинка не претендент, поэтому копий ровно две и место якоря доказано
+    assert (ambiguous, ranges) == ([], [(1, 6, "текст", "2")])
 
 
 def test_a_chip_paragraph_with_other_text_is_not_a_host(engine, make_docx):
@@ -970,11 +972,12 @@ def test_empty_paragraphs_are_never_candidates(engine, make_docx):
     three facts in three functions, which is why it needs a test."""
     spans, _p1, _c = engine._parse_docx_anchor_spans(
         make_docx(_p("") + _anchored("текст") + _p("") + _p("текст") + _p("")))
-    _r, problems, ambiguous = engine._map_anchors_to_doc(
+    ranges, problems, ambiguous = engine._map_anchors_to_doc(
         _tab([[], ["текст"], [], ["текст"], []]), spans)
     assert problems == []
-    blocked, _fp = engine._fence_off_ambiguous(ambiguous)
-    assert [(s, e) for s, e, _l in blocked] == [(2, 7), (9, 14)]
+    # пустые абзацы не претенденты, поэтому «текст» встречается дважды и
+    # якорь садится на первый из двух
+    assert (ambiguous, ranges) == ([], [(2, 7, "текст", "2")])
 
 
 def test_a_candidate_with_unusable_indices_is_refused_not_skipped(engine,
@@ -1221,3 +1224,93 @@ def test_the_remedy_for_a_thread_missing_from_the_export_is_doable(engine):
         "(ghost thread or stale export — indistinguishable)")
     assert "Ответьте в любой другой тред" in missing
     assert "переоткр" not in missing.lower()
+
+
+# ---------------------------------------------------------------------------
+# 0.17: которая копия повторяющегося абзаца — и когда этому нельзя верить
+# ---------------------------------------------------------------------------
+
+def _p_with_image(text):
+    """Абзац с картинкой: выгрузка считает его текст, API его исключает."""
+    return (f'<w:p><w:r><w:t>{text}</w:t></w:r>'
+            f'<w:r><w:drawing/></w:r></w:p>')
+
+
+def test_the_copy_the_anchor_sits_on_is_identified_by_its_position(
+        engine, make_docx):
+    """Два одинаковых абзаца различаются не текстом, а местом. Выгрузка
+    перечисляет абзацы в порядке документа, поэтому вторая копия в выгрузке
+    это вторая копия в документе — и якорь встаёт на неё, вместо того чтобы
+    огородить обе. Ради этого случая всё и делалось: формат CRM-рассылки
+    ТРЕБУЕТ одинаковых превью (постмортем 2026-08-25)."""
+    spans, problems, _c = engine._parse_docx_anchor_spans(
+        make_docx(_p("копия") + _anchored("копия")))
+    assert problems == []
+    ranges, mproblems, ambiguous = engine._map_anchors_to_doc(
+        _tab([["копия"], ["копия"]]), spans)
+    assert (mproblems, ambiguous) == ([], [])
+    # вторая копия: 1 + len("копия") + 1
+    assert ranges == [(7, 12, "копия", "2")]
+
+
+def test_an_unreadable_twin_makes_the_position_untrustworthy(engine, make_docx):
+    """Контрпример консилиума, и он не теоретический. Абзац с картинкой
+    выгрузка считает, а API молча пропускает; предложенную вставку — ровно
+    наоборот. Один такой абзац с каждой стороны, и счёт копий совпадает, а
+    порядок разъезжается: якорь встал бы на чужой абзац, а настоящий остался
+    бы без защиты. Поэтому нечитаемый двойник делает недоверенным весь
+    порядковый номер, а не только своё место."""
+    spans, problems, _c = engine._parse_docx_anchor_spans(
+        make_docx(_p_with_image("копия") + _anchored("копия")))
+    assert problems == []
+    # API видит две «копии»: ту, что с картинкой, он не отдаёт вовсе, зато
+    # отдаёт третью — предложенную вставку, которой нет в выгрузке
+    tab = _tab([["копия"], ["копия"]])
+    _r, _pr, ambiguous = engine._map_anchors_to_doc(tab, spans)
+    assert len(ambiguous) == 1          # огорожено, не размещено
+    assert ambiguous[0]["docx_id"] == "2"
+
+
+def test_a_count_mismatch_between_the_two_readings_keeps_the_fence(
+        engine, make_docx):
+    """Три копии в выгрузке, две в документе — стороны читают разные
+    документы, и порядковому номеру верить нельзя."""
+    spans, _p1, _c = engine._parse_docx_anchor_spans(
+        make_docx(_p("копия") + _anchored("копия") + _p("копия")))
+    _r, _pr, ambiguous = engine._map_anchors_to_doc(
+        _tab([["копия"], ["копия"]]), spans)
+    assert len(ambiguous) == 1
+
+
+def test_a_twin_inside_a_table_does_not_shift_the_body_ordinal(engine,
+                                                               make_docx):
+    """Порядковый номер считается среди двойников СВОЕГО домена. Абзац с тем
+    же текстом внутри таблицы — другой домен: если считать его вместе с
+    телом, счёт разъедется с API-стороной и место якоря станет недоказуемым
+    там, где оно доказуемо."""
+    body = ('<w:tbl><w:tr><w:tc><w:p><w:r><w:t>копия</w:t></w:r></w:p>'
+            '</w:tc></w:tr></w:tbl>'
+            + _p("копия") + _anchored("копия"))
+    spans, problems, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    assert problems == []
+    sp = next(s for s in spans if s["docx_id"] == "2")
+    assert sp["path"] == ()                       # якорь в теле
+    ordinal, total, trusted = engine._twin_position(sp)
+    assert (ordinal, total, trusted) == (1, 2, True)   # ячейка не в счёте
+
+
+def test_the_twin_count_is_confined_to_the_target_tab(engine, make_docx):
+    """Выгрузка границ вкладок не знает — она отдаёт весь документ одним
+    полотном. API-сторона содержит только целевую вкладку, поэтому считать
+    двойников по всему полотну значит сравнивать разные документы: чужая
+    вкладка с тем же текстом сдвинула бы и счёт, и номер."""
+    body = (_p("копия") + _p("копия")          # «чужая вкладка» слева
+            + _p("копия") + _anchored("копия"))  # целевой отрезок
+    spans, problems, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    assert problems == []
+    sp = next(s for s in spans if s["docx_id"] == "2")
+    # без отрезка виден весь документ: четыре двойника, якорь на четвёртом
+    assert engine._twin_position(sp) == (3, 4, True)
+    # отрезок целевой вкладки — только два последних абзаца
+    first, last = sp["top"] - 1, sp["top"]
+    assert engine._twin_position(sp, first, last) == (1, 2, True)
