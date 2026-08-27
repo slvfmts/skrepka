@@ -1280,3 +1280,37 @@ def test_a_count_mismatch_between_the_two_readings_keeps_the_fence(
     _r, _pr, ambiguous = engine._map_anchors_to_doc(
         _tab([["копия"], ["копия"]]), spans)
     assert len(ambiguous) == 1
+
+
+def test_a_twin_inside_a_table_does_not_shift_the_body_ordinal(engine,
+                                                               make_docx):
+    """Порядковый номер считается среди двойников СВОЕГО домена. Абзац с тем
+    же текстом внутри таблицы — другой домен: если считать его вместе с
+    телом, счёт разъедется с API-стороной и место якоря станет недоказуемым
+    там, где оно доказуемо."""
+    body = ('<w:tbl><w:tr><w:tc><w:p><w:r><w:t>копия</w:t></w:r></w:p>'
+            '</w:tc></w:tr></w:tbl>'
+            + _p("копия") + _anchored("копия"))
+    spans, problems, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    assert problems == []
+    sp = next(s for s in spans if s["docx_id"] == "2")
+    assert sp["path"] == ()                       # якорь в теле
+    ordinal, total, trusted = engine._twin_position(sp)
+    assert (ordinal, total, trusted) == (1, 2, True)   # ячейка не в счёте
+
+
+def test_the_twin_count_is_confined_to_the_target_tab(engine, make_docx):
+    """Выгрузка границ вкладок не знает — она отдаёт весь документ одним
+    полотном. API-сторона содержит только целевую вкладку, поэтому считать
+    двойников по всему полотну значит сравнивать разные документы: чужая
+    вкладка с тем же текстом сдвинула бы и счёт, и номер."""
+    body = (_p("копия") + _p("копия")          # «чужая вкладка» слева
+            + _p("копия") + _anchored("копия"))  # целевой отрезок
+    spans, problems, _c = engine._parse_docx_anchor_spans(make_docx(body))
+    assert problems == []
+    sp = next(s for s in spans if s["docx_id"] == "2")
+    # без отрезка виден весь документ: четыре двойника, якорь на четвёртом
+    assert engine._twin_position(sp) == (3, 4, True)
+    # отрезок целевой вкладки — только два последних абзаца
+    first, last = sp["top"] - 1, sp["top"]
+    assert engine._twin_position(sp, first, last) == (1, 2, True)

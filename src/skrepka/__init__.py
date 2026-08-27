@@ -4,4 +4,4 @@ Reply to comments and edit text without ghosting anchors and without
 flattening styles.
 """
 
-__version__ = "0.16.1"
+__version__ = "0.17.0"

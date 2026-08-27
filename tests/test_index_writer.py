@@ -310,3 +310,29 @@ def test_a_newline_in_the_new_text_is_still_allowed(engine, monkeypatch):
         None)
     main = semantic_batch(docs)
     assert written_text(main) == "Начало\nКонец"
+
+
+def test_the_resolved_range_must_still_hold_the_text_it_was_addressed_by(
+        engine):
+    """Диапазон — адрес, но адрес разрешён на снимке, а пишем мы позже. Если
+    к моменту записи по этим индексам лежит другой текст, это чужая правка,
+    и запись пошла бы не туда. Раньше то же самое доказывалось косвенно —
+    глобальной уникальностью и обратной сверкой, которых требовал поиск по
+    тексту."""
+    doc = make_doc(["Первый абзац", "Второй абзац"])
+    tab = doc
+    r = {"start": 1, "end": 1 + len("Первый абзац"),
+         "source": "quote='Другое'", "text": "неважно"}
+    with pytest.raises(SystemExit):
+        engine._resolve_replace_target({"quote": "Другое"}, tab, r,
+                                       check_style=False)
+
+
+def test_the_resolved_range_passes_when_the_text_still_matches(engine):
+    """Обратная сторона: совпало — работаем, и никакой уникальности при этом
+    не требуется."""
+    doc = make_doc([DUP, DUP])
+    r = {"start": 1 + len(DUP) + 1, "end": 1 + len(DUP) + 1 + len(DUP),
+         "source": f"quote={DUP!r} (#2/2)", "text": NEW}
+    assert engine._resolve_replace_target(
+        {"quote": DUP, "occurrence": 2}, doc, r, check_style=False) == DUP
