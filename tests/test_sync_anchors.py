@@ -1211,8 +1211,9 @@ def test_patch_refuses_an_op_reaching_into_a_copy(engine, monkeypatch, capsys):
     with pytest.raises(SystemExit):
         engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
     err = json.loads(capsys.readouterr().out)["error"]
-    assert "накрывает целиком последний якорь треда c1" in err
-    assert "Правьте абзацы по отдельности" in err
+    # с 0.17 отказ приходит раньше и называет причину точнее: запись идёт по
+    # индексам, поэтому такая правка СЪЕЛА БЫ границу абзаца
+    assert "удаляет границу абзаца" in err
     assert _no_content_mutation(docs)
 
 
@@ -2502,9 +2503,14 @@ def test_a_replace_covering_a_crossing_anchor_is_still_refused(engine,
                                                               monkeypatch,
                                                               tmp_path,
                                                               capsys):
-    """Placement is not permission: full coverage still ghosts the thread
-    (C1), and the rewrite path cannot save this one — `replaceAllText` does
-    not match across a paragraph break."""
+    """Размещение не равно разрешению: тред, чей якорь протянут через границу
+    абзаца, по-прежнему защищён.
+
+    С 0.17 отказ приходит от более ранней и более строгой гвардии. Запись
+    идёт по индексам, поэтому такая правка физически удалила бы перевод
+    строки: два абзаца слились бы в один, а оформление второго пропало.
+    Защита самого якоря от полного покрытия никуда не делась и проверяется
+    на правках внутри одного абзаца."""
     _crossing_case(engine, monkeypatch)
     ops = tmp_path / "ops.json"
     ops.write_text(json.dumps([
@@ -2516,7 +2522,7 @@ def test_a_replace_covering_a_crossing_anchor_is_still_refused(engine,
         engine.patch_doc("doc1", str(ops))
     assert exc.value.code == 3
     out = json.loads(capsys.readouterr().out)
-    assert "накрывает целиком последний якорь" in out["refused"][0]["error"]
+    assert "удаляет границу абзаца" in out["refused"][0]["error"]
 
 
 def test_a_ghost_is_named_in_the_receipt_and_the_patch_goes_on(engine,

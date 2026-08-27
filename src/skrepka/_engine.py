@@ -5533,6 +5533,12 @@ def _range_style(doc_tab, start, end):
     the honest way is to state the style rather than hope for it. Callers
     only reach here for a range that `_match_style_signature` called uniform,
     so the first intersecting run speaks for all of them.
+
+    The dict is deliberately allowed to be empty. It is always sent with a
+    mask over EVERY style field, so an absent field means «switch this off»
+    rather than «leave whatever was inherited». Without that, plain text
+    written next to a link keeps the link: stating only the fields that are
+    set can never take a field away (codex P1).
     """
     body = doc_tab.get("body", {}) or {}
     for s, e, tr in _extract_runs_full(body.get("content", [])):
@@ -5543,7 +5549,8 @@ def _range_style(doc_tab, start, end):
 
 
 def _execute_index_replace(docs_service, file_id, tid, start, end, new_text,
-                           style, revision_id, extra_requests_before=None):
+                           style, revision_id, extra_requests_before=None,
+                           paragraph_safe=True):
     """Replace [start, end) by absolute index — no text search involved.
 
     This is what lets a repeated paragraph be addressed at all: the range is
@@ -5558,17 +5565,27 @@ def _execute_index_replace(docs_service, file_id, tid, start, end, new_text,
     """
     requests = list(extra_requests_before or [])
     if start < end:
+        if paragraph_safe is False:
+            raise PatchOpError(
+                "internal: index replace asked to delete a paragraph "
+                "boundary — refused before the write",
+                state="not_applied")
         requests.append({"deleteContentRange": {"range": {
             "startIndex": start, "endIndex": end}}})
     if new_text:
         requests.append({"insertText": {
             "location": {"index": start}, "text": new_text}})
-        if style:
+        if style is not None:
+            # The mask covers every style field, always. A field the source
+            # range did not have is then actively cleared on the new text
+            # instead of being inherited from whatever sat next to the
+            # insertion point — the case that would otherwise hand a plain
+            # word the link of its neighbour (codex P1).
             requests.append({"updateTextStyle": {
                 "range": {"startIndex": start,
                           "endIndex": start + _utf16_len(new_text)},
-                "textStyle": style,
-                "fields": ",".join(sorted(style)),
+                "textStyle": dict(style),
+                "fields": ",".join(_STYLE_FIELDS),
             }})
     docs_service.documents().batchUpdate(
         documentId=file_id,
@@ -5685,6 +5702,18 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
                                     r["source"])
         search_text = _resolve_replace_target(op, doc_tab, r,
                                               check_style=False)
+        # A quote is allowed to span a paragraph break, and until 0.17 that
+        # was harmless: `replaceAllText` kept the boundary. The index writer
+        # really deletes the range, so the `\n` would go with it — merging two
+        # paragraphs and dropping the second one's paragraphStyle. Nothing
+        # measures that (M24-0 did not), so it is refused until it does. A
+        # newline in the NEW text is a different thing and stays allowed: it
+        # adds a paragraph rather than destroying one.
+        if "\n" in search_text:
+            _error(
+                f"эта правка удаляет границу абзаца — два абзаца слились бы "
+                f"в один, а оформление второго пропало. Разделите её на "
+                f"правки внутри каждого абзаца. ({r['source']})")
         body_content = (doc_tab.get("body", {}) or {}).get("content", [])
         body_end = body_content[-1]["endIndex"] if body_content else 2
         named_intervals = _named_range_intervals(doc_tab)
@@ -5822,8 +5851,7 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
                 _execute_index_replace(
                     docs_service, file_id, tid, start_at, end_at,
                     applied_text,
-                    _range_style(doc_tab, start_at, end_at)
-                    if applied_text else None,
+                    _range_style(doc_tab, start_at, end_at),
                     snap["r1"],
                     extra_requests_before=[_canary_delete_request(canary)])
         except PatchOpError:

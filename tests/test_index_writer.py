@@ -258,3 +258,55 @@ def test_the_free_copy_stays_untouched_while_the_commented_one_changes(
         rng = r.get("deleteContentRange", {}).get("range")
         if rng and rng["endIndex"] <= 1 + len(DUP) + 1:
             raise AssertionError(f"правка задела первую копию: {rng}")
+
+
+# ---------------------------------------------------------------------------
+# ревью консилиума: оформление и граница абзаца
+# ---------------------------------------------------------------------------
+
+def test_plain_text_next_to_a_link_does_not_inherit_it(engine, monkeypatch):
+    """Замечание консилиума. `insertText` берёт оформление у соседа, а маска
+    из одних лишь заданных полей ссылку снять не может — её там нет. Поэтому
+    маска покрывает все поля стиля всегда: отсутствующее поле означает
+    «выключить», а не «оставить унаследованное»."""
+    doc = _doc_runs([[("Ссылка", LINK), (" обычный хвост", {})],
+                     "Второй абзац"])
+    docs, drive = _stand(engine, monkeypatch, doc,
+                         ["Ссылка обычный хвост", "Второй абзац"], 1, (0, 6))
+    engine._apply_op_anchor_safe(docs, drive, "doc1", {
+        "op": "replace_quote", "quote": "обычный", "with": "простой"}, None)
+    main = semantic_batch(docs)
+    style = next(r["updateTextStyle"] for r in main if "updateTextStyle" in r)
+    assert "link" in style["fields"]              # ссылка входит в маску
+    assert "link" not in style["textStyle"]       # и, значит, снимается
+
+
+def test_a_replacement_that_would_eat_a_paragraph_break_is_refused(
+        engine, monkeypatch):
+    """Цитата вправе идти через границу абзаца, и при `replaceAllText` это
+    было безобидно — граница сохранялась. Индексный писатель диапазон
+    действительно удаляет, поэтому перевод строки ушёл бы вместе с ним:
+    абзацы слились бы, оформление второго пропало. Никем не замерено —
+    значит отказ."""
+    docs, drive = _stand(engine, monkeypatch,
+                         make_doc(["Первый", "Второй", "Третий"]),
+                         ["Первый", "Второй", "Третий"], 2, (0, 6))
+    with pytest.raises(SystemExit):
+        engine._apply_op_anchor_safe(docs, drive, "doc1", {
+            "op": "replace_quote", "quote": "Первый\nВторой",
+            "with": "Слитно"}, None)
+    assert docs.batches == [] or not any(
+        len(b) > 1 for b in docs.batches)
+
+
+def test_a_newline_in_the_new_text_is_still_allowed(engine, monkeypatch):
+    """Обратная сторона: перевод строки В НОВОМ тексте добавляет абзац, а не
+    разрушает существующий, и остаётся разрешённым."""
+    docs, drive = _stand(engine, monkeypatch,
+                         make_doc(["Первый", "Второй"]),
+                         ["Первый", "Второй"], 1, (0, 6))
+    engine._apply_op_anchor_safe(docs, drive, "doc1", {
+        "op": "replace_quote", "quote": "Первый", "with": "Начало\nКонец"},
+        None)
+    main = semantic_batch(docs)
+    assert written_text(main) == "Начало\nКонец"
