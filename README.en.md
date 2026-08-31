@@ -8,7 +8,7 @@ An AI co-author in Google Docs. The agent works from your terminal inside the do
 
 Working on text with an AI usually means two windows: the document and a chat with the agent. Copy a paragraph into the chat, paste the answer back, fix the formatting by hand. While the text travels back and forth, edits and comments get lost.
 
-skrepka removes the copying. You leave ordinary comments in the text about structure, logic, and wording. Then you point the agent at the document; it reads the threads, replies, and edits the text in place. Your client shows up, comments in the same document, and the work continues the same way. The comments survive — even when a commented paragraph is rewritten from scratch, the thread stays and moves onto the new text. Only a human closes a thread.
+skrepka removes the copying. You leave ordinary comments in the text about structure, logic, and wording. Then you point the agent at the document; it reads the threads, replies, and edits the text in place. Your client shows up, comments in the same document, and the work continues the same way. The comments survive: even when a commented paragraph is rewritten from scratch, the thread stays and moves onto the new text. Where that cannot be done safely, skrepka refuses that one operation, names the reason, and edits the rest of the document — see [what it does not do](https://github.com/slvfmts/skrepka/blob/main/docs/LIMITATIONS.md). Only a human closes a thread.
 
 ## Who it is for
 

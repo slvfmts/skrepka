@@ -357,7 +357,7 @@ def test_a_soft_break_may_be_written_into_an_anchored_fragment(engine):
     assert got is not None
     requests, _tail = got
     assert [next(iter(r)) for r in requests] == [
-        "insertText", "replaceAllText", "deleteContentRange"]
+        "insertText", "deleteContentRange", "deleteContentRange"]
     assert requests[0]["insertText"]["text"] == "Заголовок\vподзаголовок"
 
 

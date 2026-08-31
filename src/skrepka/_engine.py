@@ -76,19 +76,88 @@ class PatchOpError(Exception):
     "unknown"     — the write (or part of it) may have landed.
     """
 
-    def __init__(self, msg, state="not_applied"):
+    def __init__(self, msg, state="not_applied", reason=None, details=None):
         super().__init__(msg)
         self.state = state
+        # Машиночитаемый диагноз рядом со строкой, а не вместо неё: строка
+        # остаётся первичным значением исключения, поэтому всё, что читало
+        # квитанции до #51, продолжает работать, а разбирающий по коду
+        # подключается по желанию.
+        self.reason = reason
+        self.details = details
 
 
 _RAISE_ERRORS = False  # per-op mode: _error raises PatchOpError instead of exiting
 
 
-def _error(msg):
+# Устойчивые коды причин. Меняются как публичный контракт: код может
+# появиться, но существующий не переименовывается и не меняет смысла —
+# иначе агент, который на него смотрит, начнёт молча ошибаться.
+_REASON_CODES = frozenset((
+    "quote_not_found",              # цитаты нет в целевой вкладке
+    "quote_ambiguous",              # цитата встречается больше раза
+    "suggestion_overlap",           # правка задевает непринятое предложение
+    "named_range_overlap",          # правка задевает машинную пометку
+    "comment_anchor_would_be_lost",  # последний якорь треда исчез бы
+    "anchor_identity_collision",    # два треда неразличимы в выгрузке
+    "unsupported_structure",        # конструкция, которую skrepka не правит
+    "concurrent_edit",              # документ изменился под правкой
+    "comment_thread_unresolvable",  # тред не адресуется: закрыт, удалён,
+                                    # без якоря или его якорь не размещён
+    "comment_thread_has_multiple_anchors",  # у треда несколько якорей, и
+                                    # выбирать копию за человека нельзя
+    "unknown_write_outcome",        # исход записи неизвестен
+))
+
+_DETAILS_CAP = 200  # длинная цитата в квитанции — это шум, а не диагностика
+
+
+def _with_diag(entry, code, details):
+    """Дописать диагноз к записи об отказе, если он есть.
+
+    Один сборщик на все пути квитанции. Их три — ранний отказ на чистом
+    документе, ранний отказ на комментированном и отказ в цикле записи, — и
+    первая редакция #51 заполняла только третий: машинный контракт молча
+    зависел от того, есть ли в документе комментарии (codex, ревью r19).
+    """
+    if code:
+        entry["reason"] = code
+    if details:
+        entry["details"] = details
+    return entry
+
+
+def _bound_details(details):
+    """Обрезать значения деталей: квитанция читается человеком и агентом."""
+    if not isinstance(details, dict):
+        return None
+    out = {}
+    for k, v in details.items():
+        if isinstance(v, str) and len(v) > _DETAILS_CAP:
+            v = v[:_DETAILS_CAP] + "…"
+        elif isinstance(v, list):
+            v = [(x[:_DETAILS_CAP] + "…") if isinstance(x, str)
+                 and len(x) > _DETAILS_CAP else x for x in v[:10]]
+        out[k] = v
+    return out or None
+
+
+def _error(msg, *, reason=None, details=None):
     """Print JSON error to stdout and exit (or raise in per-op mode)."""
+    if reason is not None and reason not in _REASON_CODES:
+        # Не assert: под `python -O` он исчезает, и опечатка в коде уехала бы
+        # наружу к агенту, который на этот код смотрит. Контракт должен
+        # падать в любом режиме.
+        raise ValueError(f"unknown reason code {reason!r}")
+    details = _bound_details(details)
     if _RAISE_ERRORS:
-        raise PatchOpError(msg)
-    print(json.dumps({"error": msg}))
+        raise PatchOpError(msg, reason=reason, details=details)
+    payload = {"error": msg}
+    if reason is not None:
+        payload["reason"] = reason
+    if details is not None:
+        payload["details"] = details
+    print(json.dumps(payload, ensure_ascii=False))
     sys.exit(1)
 
 
@@ -591,7 +660,6 @@ def _select_tab(doc, tab_id=None):
 # that act on a whole tab, otherwise the sub-objects one of which must be
 # present and gets a `tabId`.
 _TAB_SCOPE = {
-    "replaceAllText": ("tabsCriteria",),
     "deleteNamedRange": ("tabsCriteria",),
     "insertText": ("location", "endOfSegmentLocation"),
     "insertInlineImage": ("location", "endOfSegmentLocation"),
@@ -733,16 +801,15 @@ def _count_quote_occurrences(doc_tab, quote):
     return _count_in_buffer(buf, quote)
 
 
-def _count_text_outside_body(doc_tab, text):
+def _count_text_in_aux_segments(doc_tab, text):
     """Occurrences of `text` in the tab's headers, footers and footnotes.
 
-    `replaceAllText` is not confined to the body: it replaces everywhere in
-    the document. The uniqueness precondition therefore has to look outside
-    the body too, or a search string that is unique in the body but repeated
-    in a running header would change two places, and skrepka would only learn
-    that from `occurrencesChanged` — after the write, with the outcome
-    unknown. Long quotes made this unlikely; narrowing (r8) makes short
-    search strings ordinary, so the check moved here.
+    Nothing to do with the writer any more: since 0.17.0 an edit is addressed
+    by absolute range, so where else a string occurs cannot affect it. What
+    still needs this is ghost accounting, which asks a different question —
+    «is the old quote still SOMEWHERE in this tab». `_text_buffer` walks the
+    body only, so a quote surviving in a running header would otherwise read
+    as gone, and a live thread would be declared a ghost.
     """
     if not text or "\x00" in text:
         return 0
@@ -755,10 +822,14 @@ def _count_text_outside_body(doc_tab, text):
     return total
 
 
-def _replace_all_match_count(doc_tab, text):
-    """How many matches `replaceAllText` would find in this tab."""
+def _count_quote_in_tab(doc_tab, text):
+    """How many times `text` occurs in the tab, body and aux segments alike.
+
+    Used by ghost accounting to answer «is this quote still present», never
+    as a precondition for a write: the index writer does not search.
+    """
     return (_count_quote_occurrences(doc_tab, text)
-            + _count_text_outside_body(doc_tab, text))
+            + _count_text_in_aux_segments(doc_tab, text))
 
 
 def _write_control(revision_id):
@@ -1549,7 +1620,7 @@ def _comment_anchor_export_status(comment, *, records, universe, tabs,
     if read_problem or not tabs:
         return {**base, "status": "unknown",
                 "reason": read_problem or "document_tabs_unavailable"}
-    if any(_replace_all_match_count(doc_tab, quote)
+    if any(_count_quote_in_tab(doc_tab, quote)
            for _tab_id, _title, doc_tab in tabs):
         return {**base, "status": "unknown",
                 "reason": "record_missing_but_quote_still_present"}
@@ -1776,6 +1847,11 @@ def _resolve_op(op, doc_tab, tab_id):
       {"op": "insert_before_quote", "quote": "...", "text": "...", "occurrence": N?}
       {"op": "insert_after_quote",  "quote": "...", "text": "...", "occurrence": N?}
 
+    Есть ещё одна форма, которая СЮДА НЕ ПОПАДАЕТ и попасть не может:
+      {"op": "replace_anchor", "comment_id": "...", "with": "..."}
+    Её адрес — тред, а не текст, и координат у него до карты выгрузки не
+    существует. Она разрешается позже, в `_resolve_anchor_target`.
+
     Returns a dict:
       {"op": ..., "start": int, "end": int, "text": str, "kind": "replace"|"insert",
        "affect_start": int, "affect_end": int, "source": "..."}
@@ -1798,6 +1874,7 @@ def _resolve_op(op, doc_tab, tab_id):
                 f"shift+enter). {op}")
 
     # Resolve target
+    quote_total = None
     if "range" in op:
         found = _resolve_named_range(doc_tab, op["range"])
         if not found:
@@ -1815,7 +1892,8 @@ def _resolve_op(op, doc_tab, tab_id):
         occurrence = int(op.get("occurrence", 1))
         total = _count_quote_occurrences(doc_tab, quote)
         if total == 0:
-            _error(f"quote not found: {quote!r}")
+            _error(f"quote not found: {quote!r}",
+                   reason="quote_not_found", details={"quote": quote})
         if total > 1 and "occurrence" not in op:
             # Ambiguity is still a refusal — skrepka must not pick a copy on
             # the person's behalf. What changed is that the refusal now names
@@ -1828,7 +1906,9 @@ def _resolve_op(op, doc_tab, tab_id):
                 f"comments as well. A longer quote also disambiguates, but "
                 f"not when the paragraph itself repeats word for word. Do "
                 f"not guess a copy: if it is not clear which one the person "
-                f"meant, ask."
+                f"meant, ask.",
+                reason="quote_ambiguous",
+                details={"quote": quote, "matches": total},
             )
         if occurrence > total:
             _error(
@@ -1836,9 +1916,11 @@ def _resolve_op(op, doc_tab, tab_id):
             )
         found = _find_quote_in_doctab(doc_tab, quote, occurrence=occurrence)
         if not found:
-            _error(f"quote not found: {quote!r}")
+            _error(f"quote not found: {quote!r}",
+                   reason="quote_not_found", details={"quote": quote})
         t_start, t_end = found
         source = f"quote={quote!r} (#{occurrence}/{total})"
+        quote_total = total
     else:
         _error(f"op must have 'range' or 'quote': {op}")
 
@@ -1857,6 +1939,7 @@ def _resolve_op(op, doc_tab, tab_id):
             "affect_end": t_end,
             "source": source,
             "tab_id": tab_id,
+            "quote_total": quote_total,
         }
     elif kind_name in ("insert_before_range", "insert_before_quote"):
         text = op.get("text", "")
@@ -1870,6 +1953,7 @@ def _resolve_op(op, doc_tab, tab_id):
             "affect_end": t_start,
             "source": source,
             "tab_id": tab_id,
+            "quote_total": quote_total,
         }
     elif kind_name in ("insert_after_range", "insert_after_quote"):
         text = op.get("text", "")
@@ -1883,6 +1967,7 @@ def _resolve_op(op, doc_tab, tab_id):
             "affect_end": t_end,
             "source": source,
             "tab_id": tab_id,
+            "quote_total": quote_total,
         }
     else:
         _error(f"unknown op: {kind_name!r}")
@@ -3824,9 +3909,9 @@ def _ghost_verdict(c, records, doc_tab, file_id=None, other_tabs=(),
     # vanished while its protection is quietly dropped (r12, round 2).
     for other in other_tabs:
         if (_count_quote_occurrences(other, quote)
-                or _count_text_outside_body(other, quote)):
+                or _count_text_in_aux_segments(other, quote)):
             return None
-    if _count_text_outside_body(doc_tab, quote):
+    if _count_text_in_aux_segments(doc_tab, quote):
         # The old text survives in a header, a footer or a footnote, where the
         # fence cannot reach — `_text_buffer` walks the body only, while
         # `replaceAllText` does not. Nothing to fence with, so fail closed
@@ -3981,10 +4066,10 @@ def _account_anchored_comments(anchored, records, spans, *, universe,
             # from THIS tab entirely — if it stands here, the anchor may be
             # here too, and then the refusal is the honest answer.
             quote = (c.get("quotedFileContent") or {}).get("value")
-            if quote and other_tabs and not _replace_all_match_count(
+            if quote and other_tabs and not _count_quote_in_tab(
                     doc_tab, quote):
                 if any(_count_quote_occurrences(o, quote)
-                       or _count_text_outside_body(o, quote)
+                       or _count_text_in_aux_segments(o, quote)
                        for o in other_tabs):
                     in_other_tabs += 1
                     continue
@@ -4288,6 +4373,20 @@ def _anchor_map_remedy(shown):
                 "поэтому неясно, к какой копии он относится. Различите копии "
                 "в интерфейсе Google Docs — хватит одного слова — и повторите "
                 "команду.")
+    if "shares every" in shown:
+        # Замерено M27 на живом документе: два ответа ОДНОГО автора, ушедшие
+        # в РАЗНЫЕ треды в одну и ту же секунду, делают эти треды
+        # неразличимыми в выгрузке, и замены останавливаются во всём файле —
+        # включая абзацы без комментариев. Совет про призраков, который
+        # стоял здесь раньше, к этому случаю не относится вовсе: разбор
+        # уходил в их поиск, а искать было нечего (пост-мортем 20 августа).
+        return ("Ответы ушли в разные треды в одну и ту же секунду, и "
+                "различить эти треды в выгрузке теперь нечем. Ответьте ещё "
+                "раз в КАЖДЫЙ из названных выше тредов, по одному, дожидаясь "
+                "смены секунды: своя секунда становится приметой треда, и "
+                "одному треду чужая примета не помогает. Потом повторите "
+                "команду. Отвечать пачкой без пауз нельзя — ответы снова "
+                "попадут в одну секунду.")
     if "missing from the export" in shown:
         # A thread the export does not carry AND we could not prove harmless.
         # «Переоткрыть» is nonsense for it (it was never closed), and telling
@@ -4303,8 +4402,23 @@ def _anchor_map_remedy(shown):
                 "комментарий оставлен не через интерфейс Google Docs, он к "
                 "тексту не привязан вовсе — тогда его можно удалить, и он "
                 "перестанет мешать.")
-    return ("Разрулите комментарии-призраки в UI (удалить/переоткрыть тред) "
-            "или правьте документ в UI.")
+    if any(m in shown for m in ("no comments.xml entry", "unknown to the API",
+                                "stale export", "without a w:id",
+                                "anchor spans in document.xml")):
+        # Две половины выгрузки разошлись: в тексте есть отметка комментария,
+        # которой нет в списке, или наоборот. Почти всегда это гонка между
+        # двумя чтениями одного документа, и лечится она повтором, а не
+        # разбором комментариев — которых человек, скорее всего, не трогал.
+        return ("Выгрузка документа пришла несогласованной: разметка "
+                "комментариев в тексте и их список не сходятся. Обычно это "
+                "гонка двух чтений — повторите команду через минуту.")
+    # Раньше здесь стояло «разрулите комментарии-призраки в UI» — один совет
+    # на все оставшиеся причины сразу. Он был верен для одной из них и
+    # уводил в сторону на остальных, а просьба к редактору сделать
+    # техническую работу запрещена продуктовой рамкой. Причина названа выше;
+    # запасной вариант говорит, что известно, и не выдумывает выхода.
+    return ("Что именно не сошлось — сказано выше. Вставки при этом "
+            "работают: они ничего не удаляют.")
 
 
 def _fence_off_ambiguous(ambiguous, attribution=None, file_id=None):
@@ -4406,6 +4520,33 @@ def _attribute_records_to_threads(anchored, records, universe):
         for r in records:
             if (r["author"], r["date_sec"]) in witnesses:
                 out[r["docx_id"]] = cid
+    return out
+
+
+def _table_of_contents_intervals(doc_tab):
+    """Structural intervals of every table of contents in the tab body.
+
+    Google builds a table of contents from the headings and rebuilds it
+    itself; its text is not something an editor writes, and none of the text
+    walkers read it — `_extract_text_runs` knows only paragraphs and tables.
+    So a quote can never resolve inside one, and a named range spanning one
+    is already refused as non-contiguous.
+
+    These intervals exist to keep that true by geometry rather than by luck:
+    an address that does reach a table of contents is refused by place, and
+    only that address. Until 0.18 the mere PRESENCE of a table of contents
+    switched off rewriting a commented fragment in the whole document — a
+    global refusal for a local reason, and the reason itself (a text search
+    that reached where the uniqueness count could not look) went away with
+    `replaceAllText`.
+    """
+    out = []
+    for el in (doc_tab.get("body", {}) or {}).get("content", []):
+        if "tableOfContents" not in el:
+            continue
+        s, e = el.get("startIndex"), el.get("endIndex")
+        if isinstance(s, int) and isinstance(e, int) and s < e:
+            out.append((s, e, "оглавление"))
     return out
 
 
@@ -4627,13 +4768,13 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
     except Exception as e:
         return _canary_insert_ambiguous(docs_service, file_id, canary,
                                         str(e))
-    def _abort(msg):
+    def _abort(msg, reason=None, details=None):
         cleaned = _cleanup_canary(docs_service, file_id, canary)
         if not cleaned:
             msg += (f" ВНИМАНИЕ: в конце документа осталась служебная "
                     f"строка «{canary_text}» — удалите её вручную "
                     f"(данные не потеряны).")
-        _error(msg)
+        _error(msg, reason=reason, details=details)
 
     # From here on the canary EXISTS in the doc: every exit — including an
     # unexpected exception (even a structurally odd insert RESPONSE) —
@@ -4726,6 +4867,22 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
             doc_tab, mapped_spans)
         attribution = _attribute_records_to_threads(anchored, records,
                                                     universe)
+        # Сколько РАЗНЫХ физических мест занимает каждый тред во всём
+        # документе. Считается по ПОЛНОМУ списку спанов, до сведения к
+        # выбранной вкладке: тред с якорем здесь и вторым якорем в соседней
+        # вкладке после сведения выглядит как тред с одним якорем, и
+        # адресация по треду молча выбрала бы этот один (ревью codex).
+        # Записи-дубли от ответов несут физически то же место и схлопываются
+        # сами: ключ — положение, а не номер записи.
+        places = {}
+        for sp in spans:
+            cid_of = attribution.get(sp["docx_id"])
+            if not cid_of:
+                continue
+            places.setdefault(cid_of, set()).add((
+                tuple(sp.get("path") or ()), sp["para_index"],
+                sp["start_off"], sp["end_para_index"], sp["end_off"]))
+        thread_places = {c: len(v) for c, v in places.items()}
         # An anchor that matches several identical paragraphs is not placed —
         # every place it could be is fenced instead, so the document stays
         # editable everywhere else (#26).
@@ -4769,7 +4926,10 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
             _abort(
                 "anchor accounting/mapping failed — paragraph "
                 "replaces/deletes are blocked (fail closed): "
-                + shown + ". " + _anchor_map_remedy(shown))
+                + shown + ". " + _anchor_map_remedy(shown),
+                reason=("anchor_identity_collision"
+                        if "shares every" in shown else None),
+                details={"problems": [str(p) for p in global_problems[:4]]})
         # Fenced ranges are checked too, not only placed anchors: an anchor at
         # the very end of the document is exactly what this guard is for, and
         # an ambiguous one is invisible to `anchors` (found in review).
@@ -4808,6 +4968,7 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
     return ({"anchors": anchors, "fp1": fp1, "canary": canary,
              "r1": canary["r1"], "metrics": metrics, "blocked": blocked,
              "attribution": attribution, "cell_anchor_tables": cell_tables,
+             "thread_places": thread_places,
              "ghosts": metrics.get("ghosts") or []}, None)
 
 
@@ -4902,7 +5063,9 @@ def _refuse_on_suggestion_at(doc_tab, index, source):
             _error(
                 f"вставка попадает внутрь предложенной правки ({label}, "
                 f"диапазон [{s}, {e})) — примите или отклоните её в интерфейсе "
-                f"Google Docs. Остальной документ правится. ({source})")
+                f"Google Docs. Остальной документ правится. ({source})",
+                reason="suggestion_overlap",
+                details={"label": label, "range": [s, e]})
 
 
 def _refuse_on_suggestion_range(doc_tab, start, end, source):
@@ -4925,7 +5088,9 @@ def _refuse_on_suggestion_range(doc_tab, start, end, source):
             _error(
                 f"замена задевает предложенную правку ({label}, диапазон "
                 f"[{s}, {e})) — примите или отклоните её в интерфейсе Google "
-                f"Docs. Остальной документ правится. ({source})")
+                f"Docs. Остальной документ правится. ({source})",
+                reason="suggestion_overlap",
+                details={"label": label, "range": [s, e]})
 
 
 def _ops_overlap_conflicts(indexed):
@@ -4968,6 +5133,8 @@ def _op_source_label(op, resolved=None):
             return f"range={op['range']!r}"
         if "quote" in op:
             return f"quote={op['quote']!r}"
+        if "comment_id" in op:
+            return f"comment={op['comment_id']!r}"
     return json.dumps(op, ensure_ascii=False)[:80]
 
 
@@ -5099,15 +5266,179 @@ def _blocked_hits(start, end, blocked):
             if start < be and bs < end]
 
 
+_ANCHOR_EFFECTS = frozenset(("extended", "edited", "dropped", "rewritten"))
+
+
+def _utf16_cut(text, at):
+    """Разрезать `text` по смещению `at` в единицах UTF-16.
+
+    Возвращает (голова, хвост) либо None, если разрез пришёлся внутрь
+    суррогатной пары или за конец строки. Срез по code points здесь не
+    годится: индексы Docs считаются в единицах UTF-16, и одна эмодзи — две
+    единицы, то есть смещения в тексте якоря и в документе расходятся ровно
+    там, где ошибка тише всего.
+    """
+    if at < 0:
+        return None
+    n = 0
+    for i, ch in enumerate(text):
+        if n == at:
+            return text[:i], text[i:]
+        n += 2 if ord(ch) > 0xFFFF else 1
+    return (text, "") if n == at else None
+
+
+def _anchor_effects(anchors, attribution, *, del_start, del_end, new_text,
+                    rewritten_cid=None):
+    """Что правка сделала с текстом под каждым задетым комментарием.
+
+    Считается арифметикой по одному замеренному правилу (M28): **сначала
+    схлопывается удаление, потом вставка судится по сжавшемуся якорю** — она
+    входит в него тогда и только тогда, когда её точка оказалась СТРОГО
+    внутри остатка. Этим правилом объясняются все пятнадцать геометрий M26 и
+    M28 без исключений, поэтому второй выгрузки после записи не нужно.
+
+    Задет тот якорь, чьё пересечение с удаляемым диапазоном непусто. Для
+    чистой вставки (`del_start == del_end`) то же условие вырождается в
+    «точка строго внутри», что и измерено: на обеих границах якорь остаётся
+    дословно прежним.
+
+    `quotedFileContent` здесь не участвует ни в одном поле: он показывает
+    текст на момент, когда комментарий писали, и ровно на нём в 0.10
+    построили автоматические записи в треды, которые говорили неправду и
+    были удалены (#22).
+
+    Возвращает (effects, affected_comment_ids).
+    """
+    delta = _utf16_len(new_text) - (del_end - del_start)
+    effects, affected = [], []
+    for a_s, a_e, a_text, a_id in anchors:
+        if not (del_start < a_e and a_s < del_end):
+            continue  # правка прошла мимо этого якоря
+        cid = (attribution or {}).get(a_id)
+        entry = {"comment_id": cid, "range_before": [a_s, a_e],
+                 "text_before": a_text}
+        if rewritten_cid is not None and cid == rewritten_cid:
+            # M26-C: три запроса оставляют якорь ровно на вписанном тексте.
+            entry.update(range_after=[del_start,
+                                      del_start + _utf16_len(new_text)],
+                         text_after=new_text, effect="rewritten")
+        else:
+            head_len = max(0, min(a_e, del_start) - a_s)
+            tail_len = max(0, a_e - max(a_s, del_end))
+            if not head_len and not tail_len:
+                # Якорь накрыт целиком. Тред при этом жив — иначе правка была
+                # бы отклонена как губительная (C1) — но ЭТОТ якорь исчез, и
+                # разговор держится на другом своём якоре.
+                entry.update(range_after=None, text_after=None,
+                             effect="dropped")
+            else:
+                # Вставка попадает внутрь якоря только когда обе стороны
+                # пережили удаление: иначе её точка оказывается ровно на
+                # границе сжавшегося якоря, а граница не поглощает (M28).
+                absorbed = bool(head_len and tail_len and new_text)
+                entry.update(
+                    range_after=[
+                        a_s if head_len else del_start + _utf16_len(new_text),
+                        a_e + delta if tail_len else del_start],
+                    text_after=_anchor_text_after(
+                        a_text, a_e - a_s, head_len, tail_len,
+                        new_text if absorbed else ""),
+                    # Ни один исходный символ не пропал — значит якорь только
+                    # вырос. Сегодня сюда приходит лишь заякоренная вставка,
+                    # а её путь карты не строит; ветка живёт ради того, чтобы
+                    # правило M28 было записано целиком и проверялось.
+                    effect=("extended"
+                            if head_len + tail_len == a_e - a_s
+                            else "edited"))
+        effects.append(entry)
+        if cid and cid not in affected:
+            affected.append(cid)
+    return effects, affected
+
+
+def _anchor_text_after(a_text, span_len, head_len, tail_len, inserted):
+    """Текст якоря после правки, или None, если посчитать его дословно нельзя.
+
+    Дословно нельзя ровно тогда, когда текст якоря и его геометрия не
+    сходятся — внутри якоря сидит инлайновый объект, — либо разрез пришёлся
+    внутрь суррогатной пары. Назвать в этом случае приблизительный текст
+    хуже, чем не назвать никакого: на приблизительном тексте и построили
+    автоответы, удалённые в 0.10.
+    """
+    if _utf16_len(a_text) != span_len:
+        return None
+    head = _utf16_cut(a_text, head_len)
+    tail = _utf16_cut(a_text, span_len - tail_len)
+    if head is None or tail is None:
+        return None
+    return head[0] + inserted + tail[1]
+
+
+def _effect_receipt(source, applied_as, *, start, end, old_text, new_text,
+                    anchors=None, attribution=None, rewritten_cid=None,
+                    unknown_ids=None, note=None, **extra):
+    """Квитанция одной успешно применённой операции.
+
+    Диапазоны и тексты здесь — фактически выполненные, а не заказанные:
+    после сужения стоит сужённый диапазон, после перезаписи — вычисленный
+    новый. Это предусловие любых автоматических ответов: в 0.10 их удалили
+    (#22) не за саму идею, а за то, что они срабатывали по устаревшей цитате
+    и называли текст, которого правка не касалась.
+    """
+    entry = {"source": source, "applied_as": applied_as,
+             "range_before": [start, end],
+             "range_after": [start, start + _utf16_len(new_text)],
+             "text_before": old_text, "text_after": new_text}
+    if anchors is None:
+        # Путь без экспортной карты: вставка ничего не удаляет и потому карту
+        # не строит (C5). Промолчать здесь нельзя — пустой список эффектов
+        # прочитался бы как «ни один комментарий не задет», а это не то же
+        # самое, что «мы не смотрели».
+        entry["effects_basis"] = "not-mapped"
+    else:
+        effects, affected = _anchor_effects(
+            anchors, attribution, del_start=start, del_end=end,
+            new_text=new_text, rewritten_cid=rewritten_cid)
+        # Закрытый тред в выгрузку не попадает вовсе — ни записи в
+        # `comments.xml`, ни разметки в тексте (M13). Значит карта знает
+        # только открытые треды, и правка могла пройти ровно по якорю
+        # закрытого. Промолчать о нём — это то самое утверждение «не задет»,
+        # которое запрещено: своё незнание надо называть (ревью codex).
+        entry["effects_basis"] = ("export-map-open-threads-only"
+                                  if unknown_ids else "export-map")
+        entry["affected_comment_ids"] = affected
+        entry["anchor_effects"] = effects
+        if unknown_ids:
+            entry["unknown_effect_comment_ids"] = list(unknown_ids)
+    if note:
+        entry["note"] = note
+    entry.update(extra)
+    return entry
+
+
 def _narrow_replace(doc_tab, search_text, new_text, start, end,
-                    anchors, blocked, attribution=None):
+                    anchors, blocked, attribution=None, interior_only=False):
     """Shrink a replace to the part that actually changes, so a thread lives.
 
-    Not "cut the whole common affix": that collapses the core to a word and
-    loses uniqueness exactly in the typical case (a long quote with one word
-    changed). It is enough that the left border moves PAST the anchor's first
-    character or the right border BEFORE its last one, so the cuts considered
-    are only the critical ones, and the core stays nearly the whole quote.
+    The BIGGEST safe cut wins, that is: the smallest edit. Until 0.18 it was
+    the other way round — the smallest cut, keeping the core nearly the whole
+    quote — and the reason was uniqueness: a search-based writer needed the
+    core to occur once in the tab, and cutting the whole common affix
+    collapsed it to a word that repeated. The index writer does not search,
+    so that reason is gone, and keeping it would now actively harm: shaving
+    one character off a replace that covers a whole commented paragraph
+    leaves the thread alive but anchored to a single letter. An author who
+    edits by hand changes what changed, not everything but one character.
+
+    `interior_only` keeps only cuts that leave original text on BOTH sides.
+    Such a cut puts the insertion strictly inside what is left of the anchor,
+    and by M28 the anchor then absorbs it — so afterwards the comment covers
+    exactly the new text. A cut that touches either border leaves the
+    insertion on the boundary, where the anchor does NOT take it: the
+    document reads right and the comment ends up on a fragment of what was
+    asked for. `replace_anchor` promises the whole of it, so it asks for
+    interior cuts only (ревью codex).
 
     Returns (search, new, start, end) for a variant that conflicts with
     nothing, or None — in which case the caller refuses exactly as it did
@@ -5142,10 +5473,22 @@ def _narrow_replace(doc_tab, search_text, new_text, start, end,
             l_cand.add(re_ - start)
         if start < rs < end:
             r_cand.add(end - rs)
+    # The whole common affix is a candidate too, and it is the one an author
+    # would pick: change what changed. It was NOT in this set until 0.18,
+    # because a search-based writer needed the core to stay long enough to be
+    # unique. The index writer addresses a range, so the natural cut is
+    # available again — and without it a replace covering a whole commented
+    # paragraph gets shaved by one character and leaves the thread anchored
+    # to a single letter.
+    l_cand.add(l_max)
+    r_cand.add(r_max)
     l_cand = sorted(c for c in l_cand if 0 <= c <= l_max)
     r_cand = sorted(c for c in r_cand if 0 <= c <= r_max)
 
-    for total in sorted({a + b for a in l_cand for b in r_cand}):
+    # descending: the largest cut is the smallest edit, and it leaves the
+    # anchor the most of its own text
+    for total in sorted({a + b for a in l_cand for b in r_cand},
+                        reverse=True):
         for L in l_cand:
             R = total - L
             if R not in r_cand:
@@ -5161,13 +5504,18 @@ def _narrow_replace(doc_tab, search_text, new_text, start, end,
             start2 = start + _utf16_len(search_text[:pl])
             end2 = end - _utf16_len(search_text[len(search_text) - sl:]
                                     if sl else "")
+            if interior_only and not (start2 > start and end2 < end):
+                continue
             if _doomed_threads(start2, end2, anchors, attribution):
                 continue
             if _blocked_hits(start2, end2, blocked):
                 continue
-            if _replace_all_match_count(doc_tab, core) != 1:
-                continue
-            if _find_quote_in_doctab(doc_tab, core) != (start2, end2):
+            # Uniqueness used to be required here because the write was a
+            # text search. The index writer addresses the range directly, so
+            # the honest check is the direct one: does that range still hold
+            # the text we narrowed to. A document whose format REQUIRES
+            # identical paragraphs used to lose narrowing entirely on this.
+            if _extract_exact_text_range(doc_tab, start2, end2) != core:
                 continue
             uniform, _differing = _match_style_signature(doc_tab, start2, end2)
             if not uniform:
@@ -5183,9 +5531,9 @@ def _style_refusal(doc_tab, start, end, source):
         return None
     return (
         f"replace target spans mixed text styles ({', '.join(differing)}) "
-        f"— replaceAllText would flatten them (confirmed, C2). Split the "
-        f"replacement into uniformly-styled pieces or edit in the UI. "
-        f"({source})")
+        f"— the new text can only carry one of them, and choosing which is "
+        f"not the program's call. Narrow the replacement to a uniformly "
+        f"styled piece. ({source})")
 
 
 # Control characters — a newline among them, it starts a new paragraph —
@@ -5288,12 +5636,9 @@ def _rewrite_anchor_requests(doc_tab, search_text, new_text, start, end,
     # not its words, and that is exactly what happens when a person edits the
     # same text by hand. Everything else in the batch is `replaceAllText`,
     # which is measured not to hurt closed threads even at full coverage.
-    if any("tableOfContents" in el for el in
-           (doc_tab.get("body", {}) or {}).get("content", [])):
-        # The text walkers do not read a table of contents, so the local
-        # uniqueness count would not see a match hiding there while
-        # replaceAllText may well rewrite it (#23).
-        return None
+    for ts, te, _label in _table_of_contents_intervals(doc_tab):
+        if _ranges_overlap(start, end, ts, te):
+            return None  # the edit reaches into a table of contents
     for ns, ne, _label in named_intervals:
         if _ranges_overlap(start, end, ns, ne):
             return None  # the deletion would cut a machine-owned mark
@@ -5346,37 +5691,32 @@ def _rewrite_anchor_requests(doc_tab, search_text, new_text, start, end,
         # of by a raw API error further down.
         return None
 
-    # Project the document as it will read between request 1 and request 2 and
-    # verify there that the search string is unique AND lands where we think.
-    # It cannot be checked against the live document: it does not exist yet.
-    buf, index_map = _text_buffer(doc_tab)
     ins_at = end - tail_len
-    try:
-        pos = index_map.index(ins_at)
-        at = index_map.index(start)
-    except ValueError:
-        # A position with no place in the text buffer. Refusing is the whole
-        # answer here: raising would escape a PRECONDITION check as an
-        # exception, and `patch` would read that as an unknown document state
-        # and stop every remaining operation.
+    head_len = _utf16_len(head)
+    new_len = _utf16_len(new_text)
+    if ins_at != start + head_len:
+        # The anchor is not contiguous in index space — an inline object sits
+        # inside it — so the arithmetic below would address the wrong places.
         return None
-    projected = buf[:pos] + new_text + buf[pos:]
-    needle = head + new_text
-    if _count_in_buffer(projected, needle) != 1:
-        return None
-    if projected.find(needle) != at:
-        return None
-    if _count_text_outside_body(doc_tab, needle):
-        return None
-
+    # Every request addresses an absolute range, so nothing here depends on
+    # the text being unique anywhere. Until 0.18 request 2 was a
+    # `replaceAllText` over `head + new_text`, and it dragged a whole family
+    # of preconditions behind it: a projection of the document as it would
+    # read BETWEEN requests, a uniqueness count on that projection, and a
+    # separate count over headers and footnotes, which `replaceAllText` also
+    # rewrites. All three went away with it (M26, block C).
     requests = [
+        # 1. new text lands STRICTLY inside the anchor, which grows over it
         {"insertText": {"location": {"index": ins_at}, "text": new_text}},
-        {"replaceAllText": {"containsText": {"text": needle,
-                                             "matchCase": True},
-                            "replaceText": new_text}},
+        # 2. the old head, still in its original coordinates: the insert
+        #    happened to its right and did not move it
+        {"deleteContentRange": {"range": {"startIndex": start,
+                                          "endIndex": ins_at}}},
+        # 3. the surviving tail character, now right after the new text
+        #    because deleting the head pulled everything left
         {"deleteContentRange": {"range": {
-            "startIndex": start + _utf16_len(new_text),
-            "endIndex": start + _utf16_len(new_text) + tail_len}}},
+            "startIndex": start + new_len,
+            "endIndex": start + new_len + tail_len}}},
     ]
     return requests, tail_len
 
@@ -5417,11 +5757,11 @@ def _why_no_rewrite(doc_tab, search_text, new_text, start, end, anchors,
                 f"перезапись считает позиции по трём запросам, и новый абзац "
                 f"посреди неё ломает счёт. Мягкий перенос (shift+enter) в этом "
                 f"тексте разрешён — остальное разбейте на отдельные операции.")
-    if any("tableOfContents" in el for el in
-           (doc_tab.get("body", {}) or {}).get("content", [])):
-        return ("В документе есть оглавление, а его текст skrepka не читает — "
-                "поэтому переписать прокомментированный фрагмент целиком она "
-                "здесь не берётся. Правьте этот фрагмент в интерфейсе.")
+    for ts, te, _label in _table_of_contents_intervals(doc_tab):
+        if _ranges_overlap(start, end, ts, te):
+            return ("Этот фрагмент попадает в оглавление, а его Google строит "
+                    "сам по заголовкам. Поправьте заголовок — оглавление "
+                    "обновится следом.")
     for ns, ne, label in named_intervals:
         if _ranges_overlap(start, end, ns, ne):
             return (f"На этом фрагменте стоит {label} — перезапись задела бы "
@@ -5437,6 +5777,18 @@ def _why_no_rewrite(doc_tab, search_text, new_text, start, end, anchors,
         return ("На этом же фрагменте есть ещё один комментарий, и переписать "
                 "его целиком, не задев соседний, нельзя. Правьте фрагмент в "
                 "интерфейсе.")
+    if len(search_text) < 2:
+        # Замерено (M29): у протокола есть нижняя граница по длине, и она
+        # ровно здесь. Обе формы обхода — вставить рядом и снести символ —
+        # убивают тред, потому что вставка на границе якорем не поглощается
+        # (M28), а якорь, схлопнувшийся в ноль, становится призраком.
+        # Совет тут редакторский, а не про интерфейс: человеку есть что
+        # сделать, и это его работа, а не техническая.
+        return ("Под комментарием один символ, а перевесить разговор на "
+                "новый текст можно только изнутри старого: новый текст "
+                "вписывается ВНУТРЬ выделения, и внутри одного символа "
+                "места нет. Выделите комментарием чуть больше текста — "
+                "хотя бы слово целиком, — и правка пройдёт.")
     if len(search_text) >= 2 and _splits_grapheme_cluster(search_text[:-1],
                                                           search_text[-1]):
         return ("Фрагмент кончается символом, который нельзя отделить от "
@@ -5452,13 +5804,13 @@ def _why_no_rewrite(doc_tab, search_text, new_text, start, end, anchors,
 
 def _execute_anchor_rewrite(docs_service, file_id, tid, requests, revision_id,
                             source, extra_requests_before=None):
-    """Send the rewrite batch and read its verdict.
+    """Send the rewrite batch.
 
-    Unlike `_execute_replace_all`, `occurrencesChanged` here is diagnosis
-    AFTER the write, never a precondition: the insert and the deletion land
-    whatever the replace matched, so anything other than exactly one match
-    means the document has been changed in a way nobody planned. There is no
-    `not_applied` outcome to report.
+    Since 0.18 every request in it addresses an absolute range, so there is
+    no match count to read back and no verdict to derive from the reply: the
+    batch is pinned to a revision and either applies whole or fails whole.
+    The `occurrencesChanged` check that used to stand here belonged to the
+    `replaceAllText` in request 2 and went away with it (M26).
     """
     # `extra_requests_before` goes through the same white list as the rest:
     # it used to be concatenated AFTER the scoping loop, which is how the
@@ -5466,18 +5818,8 @@ def _execute_anchor_rewrite(docs_service, file_id, tid, requests, revision_id,
     body = {"requests": _scope_requests(
                 list(extra_requests_before or []) + list(requests), tid),
             "writeControl": _write_control(revision_id)}
-    result = docs_service.documents().batchUpdate(
+    docs_service.documents().batchUpdate(
         documentId=file_id, body=body).execute()
-    occ = next((rep.get("replaceAllText", {}) for rep in
-                (result.get("replies") or []) if "replaceAllText" in rep),
-               {}).get("occurrencesChanged")
-    if occ != 1:
-        raise PatchOpError(
-            f"перезапись якоря: replaceAllText сообщил {occ!r} совпадений "
-            f"вместо одного ({source}). Вставка и удаление в этом батче "
-            f"выполняются в любом случае, поэтому документ изменён — "
-            f"проверьте его состояние глазами, повторять вслепую нельзя",
-            state="unknown")
 
 
 def _resolve_replace_target(op, doc_tab, r, check_style=True):
@@ -5517,7 +5859,9 @@ def _resolve_replace_target(op, doc_tab, r, check_style=True):
     if here != search_text:
         _error(
             f"text at the resolved range changed since it was addressed "
-            f"({here!r} vs {search_text!r}) for {r['source']} — refused"
+            f"({here!r} vs {search_text!r}) for {r['source']} — refused",
+            reason="concurrent_edit",
+            details={"expected": search_text, "found": here},
         )
     if check_style:
         problem = _style_refusal(doc_tab, r["start"], r["end"], r["source"])
@@ -5564,6 +5908,16 @@ def _execute_index_replace(docs_service, file_id, tid, start, end, new_text,
     the word next to it.
     """
     requests = list(extra_requests_before or [])
+    if end < start:
+        # Перевёрнутый диапазон никогда не приходит от разрешения операции, но
+        # если однажды придёт — молча пропустить удаление и записать квитанцию
+        # по этим координатам хуже, чем отказать: арифметика эффекта построит
+        # на нём правдоподобный текст, которого в документе нет. Проверка
+        # стоит ДО записи, потому что после неё отказывать уже поздно.
+        raise PatchOpError(
+            "internal: index replace got an inverted range — refused "
+            "before the write",
+            state="not_applied")
     if start < end:
         if paragraph_safe is False:
             raise PatchOpError(
@@ -5594,36 +5948,204 @@ def _execute_index_replace(docs_service, file_id, tid, start, end, new_text,
     ).execute()
 
 
-def _execute_replace_all(docs_service, file_id, tid, search_text, new_text,
-                         revision_id, source, extra_requests_before=None):
-    req = {"replaceAllText": {
-        "containsText": {"text": search_text, "matchCase": True},
-        "replaceText": new_text,
-    }}
-    requests = _scope_requests(
-        list(extra_requests_before or []) + [req], tid)
-    result = docs_service.documents().batchUpdate(
-        documentId=file_id,
-        body={"requests": requests,
-              "writeControl": _write_control(revision_id)},
-    ).execute()
-    # the reply is located by TYPE, not position: a canary delete prepended
-    # to the batch shifts positional indices (codex sync-anchors r3 #2)
-    occ = next((r.get("replaceAllText", {}) for r in
-                (result.get("replies") or []) if "replaceAllText" in r),
-               {}).get("occurrencesChanged", 0)
-    if occ != 1:
-        # occ == 0: nothing changed; occ > 1: the doc HAS been modified in
-        # multiple places — the report must not invite a blind retry.
-        raise PatchOpError(
-            f"replaceAllText changed {occ} occurrences (expected exactly "
-            f"1) for {source} — stopping; verify the doc state",
-            state="not_applied" if occ == 0 else "unknown",
-        )
+def _check_occurrence_stability(r, expected):
+    """Номер вхождения имеет смысл только вместе с их числом.
+
+    Операция с явным `occurrence` адресует N-ю копию среди M одинаковых. Если
+    предыдущая правка того же файла убрала одну из копий, N-я стала другой —
+    а проверка «в этом диапазоне та самая цитата» на близнецах тавтологична и
+    промолчит. Так правка уезжает в чужую копию, и обе операции числятся
+    применёнными (ревью codex).
+
+    Требование одно: число совпадений на момент записи такое же, каким его
+    видела плановая фаза. Операция БЕЗ `occurrence` этой проверки не знает и
+    не нуждается в ней — её защищает уникальность: одно совпадение и есть
+    доказательство цели, сколько бы их ни было раньше. Именно поэтому
+    операция, ставшая однозначной благодаря соседке, по-прежнему проходит
+    (#36).
+    """
+    if expected is None:
+        return
+    now = r.get("quote_total")
+    if now != expected:
+        _error(
+            f"число одинаковых мест изменилось под этой правкой: было "
+            f"{expected}, стало {now}. Номер вхождения теперь показывает на "
+            f"другую копию, чем когда его выбирали, — правка отклонена, "
+            f"пока адрес не назван заново. ({r['source']})",
+            reason="concurrent_edit",
+            details={"expected_matches": expected, "found_matches": now})
+
+
+# Операции, чья цель по построению разрешается ПОЗДНО: их координаты
+# существуют только в свежей карте выгрузки, а она строится под самой
+# записью. Плановая фаза их не резолвит и не может — это свойство задачи, а
+# не ошибка входа, и путать одно с другим нельзя (ревью codex).
+_LATE_BOUND_OPS = frozenset(("replace_anchor",))
+
+
+def _validate_anchor_op(op):
+    """Схема `replace_anchor`, проверяемая до карты и до всякой записи.
+
+    Разбирается в плановой фазе: ошибка схемы обязана выглядеть ошибкой
+    схемы, а не «цель не разрешилась». Иначе настоящие опечатки в
+    `comment_id` терялись бы среди нормального для этой операции позднего
+    разрешения.
+
+    Возвращает (comment_id, new_text).
+    """
+    cid = op.get("comment_id")
+    if not isinstance(cid, str) or not cid.strip():
+        _error(f"replace_anchor: нужен непустой строковый 'comment_id' — "
+               f"id треда из выдачи `comments`. {op}")
+    new_text = op.get("with") if "with" in op else op.get("text")
+    if not isinstance(new_text, str) or not new_text:
+        _error(
+            f"replace_anchor: нужен непустой 'with'. Чтобы убрать текст "
+            f"из-под комментария целиком, у правки должен быть текст, "
+            f"который займёт его место: якорь, схлопнувшийся в ноль, уносит "
+            f"разговор в историю комментариев. {op}",
+            reason="unsupported_structure",
+            details={"construct": "empty_replacement"})
+    if "\n" in new_text:
+        # Протокол перезаписи вписывает новый текст внутрь якоря и запрещает
+        # там перевод строки (`_REWRITE_FORBIDDEN`). Сказать это прямо
+        # дешевле, чем дать операции дойти до конца и отказать словами
+        # «переписать не вышло»: контракт и поведение обязаны совпадать.
+        _error(
+            f"replace_anchor: новый текст с переводом строки пока не "
+            f"поддержан — абзац под комментарием разделить нечем. Разбейте "
+            f"правку на части внутри абзаца. {op}",
+            reason="unsupported_structure",
+            details={"construct": "paragraph_in_replacement"})
+    bad = _OP_TEXT_FORBIDDEN.search(new_text)
+    if bad:
+        _error(
+            f"op text holds a character Docs does not keep as written "
+            f"({bad.group()!r} = U+{ord(bad.group()):04X}), so what would "
+            f"land is not what the positions were computed for. {op}")
+    return cid, new_text
+
+
+def _resolve_anchor_target(op, doc_tab, snap, tid, file_id):
+    """Разрешить `replace_anchor` в диапазон по свежей карте выгрузки.
+
+    Адрес — тред, а не текст. Поэтому здесь два условия, и оба обязательны:
+    во ВСЁМ документе у треда ровно одно физическое место (иначе выбирать
+    копию пришлось бы за человека), и это место размещено в выбранной
+    вкладке доказанно, то есть попало в `snap["anchors"]`. Второе условие
+    не следует из первого: маппер не размещает якорь, чью копию он не смог
+    отличить от близнеца, и такой якорь физически один, но координат у него
+    нет.
+
+    Номер `w:id` адресом не является нигде: Google назначает его сам, и
+    смерть чужого якоря сдвигает нумерацию остальных (замерено, M28-E).
+    """
+    cid, new_text = _validate_anchor_op(op)
+    source = f"comment={cid!r}"
+    places = (snap.get("thread_places") or {}).get(cid)
+    link = _thread_link(file_id, cid)
+    where = f" {link}" if link else ""
+    if not places:
+        _error(
+            f"тред {cid}{where} не адресуется: у него нет живого якоря в "
+            f"выгрузке. Так выглядит закрытый, удалённый или потерявший "
+            f"привязку комментарий — а ещё комментарий из другого "
+            f"документа. Прочитайте `comments` заново и возьмите id оттуда. "
+            f"({source})",
+            reason="comment_thread_unresolvable",
+            details={"comment_id": cid})
+    if places > 1:
+        _error(
+            f"у треда {cid}{where} несколько якорей ({places}), и выбирать "
+            f"за вас, какой из них переписать, скрепка не станет. Адресуйте "
+            f"нужное место цитатой или пометкой. ({source})",
+            reason="comment_thread_has_multiple_anchors",
+            details={"comment_id": cid, "anchors": places})
+    attribution = snap.get("attribution") or {}
+    spans = [a for a in snap["anchors"] if attribution.get(a[3]) == cid]
+    ranges = _distinct_anchor_ranges(spans)
+    if len(ranges) != 1:
+        _error(
+            f"якорь треда {cid}{where} не размещён в этой вкладке: его "
+            f"место в документе известно, а координаты — нет. Так бывает, "
+            f"когда абзац повторяется дословно и отличить копии нечем, и "
+            f"когда якорь стоит в другой вкладке. Адресуйте правку цитатой "
+            f"с номером вхождения. ({source})",
+            reason="comment_thread_unresolvable",
+            details={"comment_id": cid, "placed_ranges": len(ranges)})
+    start, end = ranges[0]
+    here = _extract_exact_text_range(doc_tab, start, end)
+    if here is None:
+        _error(
+            f"под комментарием {cid}{where} не сплошной текст — внутри "
+            f"якоря объект или структурный элемент, и переписать его как "
+            f"текст нельзя. ({source})",
+            reason="unsupported_structure",
+            details={"construct": "non_contiguous_anchor"})
+    if here != spans[0][2]:
+        # Выгрузка это R0 плюс канарейка, снимок Docs это R0: тексты обязаны
+        # сойтись. Расхождение значит, что документ правят прямо сейчас.
+        _error(
+            f"текст под комментарием {cid} в выгрузке и в документе разный "
+            f"({spans[0][2]!r} против {here!r}) — документ правят прямо "
+            f"сейчас. Повторите через минуту. ({source})",
+            reason="concurrent_edit",
+            details={"expected": spans[0][2], "found": here})
+    if "\n" in here:
+        _error(
+            f"комментарий {cid}{where} растянут через границу абзаца — "
+            f"переписать такой фрагмент значит слить два абзаца в один и "
+            f"потерять оформление второго. Правьте абзацы по отдельности. "
+            f"({source})",
+            reason="unsupported_structure",
+            details={"construct": "paragraph_boundary"})
+    return {"op": "replace_anchor", "start": start, "end": end,
+            "text": new_text, "kind": "replace",
+            "affect_start": start, "affect_end": end,
+            "source": source, "tab_id": tid, "comment_id": cid,
+            "quote_total": None}
+
+
+def _anchor_target_gate(doc_tab, start, end, source, named_intervals):
+    """Ограды, которые новый адрес обязан пройти сам.
+
+    У адресации цитатой недостижимость оглавления и именованных диапазонов
+    доказывалась СПОСОБОМ АДРЕСАЦИИ: буфер тела оглавление не читает вовсе,
+    а именованный диапазон, задевающий его, отклоняется раньше как
+    несплошной. Адрес по треду это доказательство отменяет — координаты
+    приходят прямо из карты, — поэтому обе ограды здесь стоят явно, и на
+    ИСХОДНОМ якоре, до всякого сужения (ревью codex).
+
+    Проверка на исходном якоре, а не на записываемом куске, сознательно
+    строгая: `replace_anchor` никогда не адресует именованный диапазон по
+    имени, значит любое пересечение с ним побочное, и резать чужую пометку
+    ради правки по треду не за что.
+    """
+    _refuse_on_suggestion_range(doc_tab, start, end, source)
+    for ts, te, label in _table_of_contents_intervals(doc_tab):
+        if _ranges_overlap(start, end, ts, te):
+            _error(
+                f"комментарий стоит в оглавлении (диапазон [{ts}, {te})) — "
+                f"его строит Google по заголовкам и перестраивает сам, "
+                f"поэтому правка тут не удержится. Поправьте заголовок, "
+                f"оглавление обновится следом. ({source})",
+                reason="unsupported_structure",
+                details={"construct": "table_of_contents",
+                         "range": [ts, te]})
+    for ns, ne, label in named_intervals:
+        if _ranges_overlap(start, end, ns, ne):
+            _error(
+                f"правка по треду задевает {label} (диапазон [{ns}, {ne})) "
+                f"— это машинная пометка, и резать её ради правки по треду "
+                f"скрепка не станет. Снимите пометку или адресуйте правку "
+                f"через неё. ({source})",
+                reason="named_range_overlap",
+                details={"label": label, "range": [ns, ne]})
 
 
 def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
-                          warnings=None):
+                          warnings=None, expect_occurrences=None):
     """Apply ONE op on a commented doc.
 
     Inserts: fresh read, re-resolve, pinned batch (C5 verified safe).
@@ -5634,16 +6156,24 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
     A replacement fully covering a live anchor is refused (C1 verified:
     it would ghost the comment). Partial overlap is safe — the anchor
     shrinks to the surviving original characters.
+
+    `replace_anchor` идёт тем же путём записи и теми же оградами, но её
+    цель разрешается ПОЗЖЕ — после карты, потому что раньше её координат не
+    существует. Всё, что для прочих операций проверяется до канарейки, для
+    неё проверяется после, и каждый такой выход обязан канарейку убрать.
     """
     kind_name = op.get("op", "")
+    by_anchor = kind_name in _LATE_BOUND_OPS
     if not kind_name.startswith("replace"):
         # ---- insert path ----
         doc = _safe_get_doc(docs_service, file_id)
         tid, doc_tab = _select_tab(doc, tab_id=tab_id)
         r = _resolve_op(op, doc_tab, tid)
+        _check_occurrence_stability(r, expect_occurrences)
         _refuse_on_suggestion_at(doc_tab, r["start"], r["source"])
         if not r["text"]:
-            return
+            return {"source": r["source"], "applied_as": "no-op",
+                    "note": "вставлять нечего — ничего не записано"}
         docs_service.documents().batchUpdate(
             documentId=file_id,
             body={"requests": _scope_requests([{"insertText": {
@@ -5651,7 +6181,9 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
                       "text": r["text"]}}], tid),
                   "writeControl": _write_control(doc.get("revisionId"))},
         ).execute()
-        return
+        return _effect_receipt(r["source"], "insert", start=r["start"],
+                               end=r["start"], old_text="",
+                               new_text=r["text"])
 
     # ---- replace path (W8 mapping + freshness canary, plan v4) ----
     last_reason = "unknown"
@@ -5673,9 +6205,11 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
         # proven ⇒ refuse», which is a condition about this document
         # rather than about tabs as such.
         tid, doc_tab = _select_tab(doc, tab_id=tab_id)
-        r = _resolve_op(op, doc_tab, tid)
+        r = None if by_anchor else _resolve_op(op, doc_tab, tid)
+        if r is not None:
+            _check_occurrence_stability(r, expect_occurrences)
 
-        if _op_is_noop(op, doc_tab, r):
+        if r is not None and _op_is_noop(op, doc_tab, r):
             return {"source": r["source"], "applied_as": "no-op",
                     "note": "текст уже такой — ничего не записано"}
 
@@ -5683,7 +6217,14 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
         # character, so no anchor can be ghosted by it and none of the export
         # machinery below is needed (r8). This is the common «допиши фразу к
         # прокомментированному предложению», which used to be refused.
-        insertion = _op_pure_insertion(op, doc_tab, r)
+        # Для правки по треду короткий путь чистой вставки НЕ берётся, и
+        # это не оптимизация, а смысл операции. Вставка на границе якоря им
+        # не поглощается (M28), значит «допиши фразу» оставило бы разговор
+        # на старой части, а дописанное снаружи — документ верный, а
+        # операция сделала не то, что просили. Расширяющая замена идёт
+        # общим путём и кончается перезаписью, после которой комментарий
+        # покрывает весь новый текст (M26-C).
+        insertion = None if by_anchor else _op_pure_insertion(op, doc_tab, r)
         if insertion:
             where, text = insertion
             point = r["end"] if where == "after" else r["start"]
@@ -5695,13 +6236,17 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
                           "text": text}}], tid),
                       "writeControl": _write_control(doc.get("revisionId"))},
             ).execute()
-            return {"source": r["source"], "applied_as": "insert",
-                    "note": "замена ничего не удаляла — применена как вставка"}
+            return _effect_receipt(
+                r["source"], "insert", start=point, end=point,
+                old_text="", new_text=text,
+                note="замена ничего не удаляла — применена как вставка")
 
-        _refuse_on_suggestion_range(doc_tab, r["start"], r["end"],
-                                    r["source"])
-        search_text = _resolve_replace_target(op, doc_tab, r,
-                                              check_style=False)
+        search_text = None
+        if not by_anchor:
+            _refuse_on_suggestion_range(doc_tab, r["start"], r["end"],
+                                        r["source"])
+            search_text = _resolve_replace_target(op, doc_tab, r,
+                                                  check_style=False)
         # A quote is allowed to span a paragraph break, and until 0.17 that
         # was harmless: `replaceAllText` kept the boundary. The index writer
         # really deletes the range, so the `\n` would go with it — merging two
@@ -5709,16 +6254,30 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
         # measures that (M24-0 did not), so it is refused until it does. A
         # newline in the NEW text is a different thing and stays allowed: it
         # adds a paragraph rather than destroying one.
-        if "\n" in search_text:
+        if search_text is not None and "\n" in search_text:
             _error(
                 f"эта правка удаляет границу абзаца — два абзаца слились бы "
                 f"в один, а оформление второго пропало. Разделите её на "
-                f"правки внутри каждого абзаца. ({r['source']})")
+                f"правки внутри каждого абзаца. ({r['source']})",
+                reason="unsupported_structure",
+                details={"construct": "paragraph_boundary"})
+        # Ограды по оглавлению здесь нет намеренно, и это не забывчивость.
+        # Адрес сюда попасть не может: цитата ищется по буферу тела, а он
+        # оглавление не читает вовсе (`_extract_text_runs` знает абзацы и
+        # таблицы), именованный же диапазон, задевающий оглавление,
+        # отклоняется раньше как несплошной по текстовым ранам. Проверка,
+        # которую нечем вызвать, — не защита, а обещание защиты: она
+        # пережила бы любую мутацию и убедила бы следующего читателя, что
+        # место закрыто. Закрыто оно геометрией.
         body_content = (doc_tab.get("body", {}) or {}).get("content", [])
         body_end = body_content[-1]["endIndex"] if body_content else 2
         named_intervals = _named_range_intervals(doc_tab)
         _, anchored_now, fp1, universe = _census_comments(
             drive_service, file_id)
+        # Закрытые треды видны переписи, но не выгрузке: их якоря невидимы, и
+        # карта эффектов их не покрывает. Список нужен каждой квитанции этого
+        # пути, чтобы она ограничила область своего знания вслух.
+        closed_ids = [c.get("id") for c in anchored_now if c.get("resolved")]
 
         snap, retry_reason = _fresh_anchor_snapshot(
             docs_service, drive_service, file_id, doc, doc_tab,
@@ -5741,6 +6300,67 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
                         f"строка «{canary['text']}» — удалите её вручную "
                         f"(данные не потеряны).")
             return msg
+
+        def _owning_canary(fn):
+            """Выполнить ПОЗДНЕЕ разрешение цели, владея канарейкой.
+
+            Владение здесь ровно одно и названо точно: весь шаг позднего
+            адреса — резолвер, его ограды, чтение текста и распознавание
+            no-op. Раньше в это окно попадали только явные отказы, и каждый
+            чистил канарейку руками; поздний адрес приводит сюда целую
+            функцию, и оставить это на дисциплину вызывающего значит однажды
+            забыть служебную строку в чужом документе.
+
+            Что этим НЕ покрыто и не покрывалось никогда: общий расчёт
+            стоимости правки ниже — он один на оба пути, и его окно ровно
+            такое же, каким было до появления поздних адресов.
+
+            Неудачную уборку нельзя проглатывать: для отказа она уходит в
+            текст ошибки, для всего остального — предупреждением, иначе
+            человек не узнает, что в документе осталась служебная строка
+            (ревью codex).
+            """
+            try:
+                return fn()
+            except PatchOpError as exc:
+                cleaned = _cleanup_canary(docs_service, file_id, canary)
+                raise PatchOpError(_canary_msg(str(exc), cleaned),
+                                   state=exc.state, reason=exc.reason,
+                                   details=exc.details) from None
+            except BaseException:
+                if not _cleanup_canary(docs_service, file_id, canary):
+                    _warn(f"в конце документа осталась служебная строка "
+                          f"«{canary['text']}» — удалите её вручную "
+                          f"(данные не потеряны)")
+                raise
+
+        def _late_target():
+            """Цель поздней операции существует только здесь: карта
+            построена, свежесть доказана канарейкой.
+
+            Равенство текста проверяется СРАЗУ после разрешения цели, до
+            оград. Иначе `replace_anchor`, которому писать нечего, получал бы
+            отказ по предложению или пометке, тогда как равная ему обычная
+            замена возвращает честный ноль: записи в обоих случаях нет вовсе
+            (ревью codex).
+            """
+            found = _resolve_anchor_target(op, doc_tab, snap, tid, file_id)
+            here = _extract_exact_text_range(doc_tab, found["start"],
+                                             found["end"])
+            if here == found["text"]:
+                return found, here, True
+            _anchor_target_gate(doc_tab, found["start"], found["end"],
+                                found["source"], named_intervals)
+            return found, here, False
+
+        if by_anchor:
+            r, search_text, nothing_to_do = _owning_canary(_late_target)
+            if nothing_to_do:
+                cleaned = _cleanup_canary(docs_service, file_id, canary)
+                return {"source": r["source"], "applied_as": "no-op",
+                        "note": _canary_msg(
+                            "текст под комментарием уже такой — ничего не "
+                            "записано", cleaned)}
 
         # What this operation would cost as written. Blocked ranges: an anchor
         # the accounting could not vouch for but WHOSE POSITION is known — any
@@ -5766,8 +6386,9 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
         if hits or doomed or style_problem:
             narrowed = _narrow_replace(
                 doc_tab, search_text, r["text"], start_at, end_at,
-                snap["anchors"], snap["blocked"], attribution)
-        rewrite = None
+                snap["anchors"], snap["blocked"], attribution,
+                interior_only=by_anchor)
+        rewrite, rewritten_cid = None, None
         if narrowed:
             # everything was re-checked inside the narrowing, on the range
             # that will actually be written
@@ -5783,6 +6404,7 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
                 snap["anchors"], attribution, named_intervals,
                 closed_present=any(c.get("resolved") for c in anchored_now))
             if rewrite:
+                rewritten_cid = doomed[0][0]
                 doomed = []
         if style_problem:
             cleaned = _cleanup_canary(docs_service, file_id, canary)
@@ -5793,7 +6415,9 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
             _error(_canary_msg(
                 f"эта замена задевает {label} (диапазон [{bs}, {be})) — "
                 f"отклонена ИМЕННО ЭТА операция, остальной документ "
-                f"правится. ({r['source']})", cleaned))
+                f"правится. ({r['source']})", cleaned),
+                reason="named_range_overlap",
+                details={"label": label, "range": [bs, be]})
         if doomed:
             cid, spans = doomed[0]
             atext = spans[0][2]
@@ -5818,7 +6442,9 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
                 f"замена накрывает целиком последний якорь {who} "
                 f"(текст якоря «{atext[:60]}») — тред станет призраком (C1), "
                 f"и сузить её не получилось: меняется весь якорный текст."
-                f"{why} ({r['source']})", cleaned))
+                f"{why} ({r['source']})", cleaned),
+                reason="comment_anchor_would_be_lost",
+                details={"comment_id": cid, "anchor_text": atext})
         try:
             fp2 = _comments_fingerprint(drive_service, file_id)
         except Exception as e:
@@ -5878,16 +6504,29 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
         if narrowed:
             # the operation that ran is textually not the one that was asked
             # for — the receipt has to say so
-            return {"source": r["source"], "applied_as": "narrowed",
-                    "narrowed_to": search_text,
-                    "note": "замена сужена до изменённого фрагмента, чтобы "
-                            "сохранить тред"}
+            return _effect_receipt(
+                r["source"], "narrowed", start=start_at, end=end_at,
+                old_text=search_text, new_text=applied_text,
+                anchors=snap["anchors"], attribution=attribution,
+                unknown_ids=closed_ids,
+                narrowed_to=search_text,
+                note="замена сужена до изменённого фрагмента, чтобы "
+                     "сохранить тред")
         if rewrite:
-            return {"source": r["source"], "applied_as": "rewritten",
-                    "note": "фрагмент переписан целиком; тред перевешен на "
-                            "новый текст и теперь относится к тексту, "
-                            "которого не было, когда комментарий писали"}
-        return None
+            return _effect_receipt(
+                r["source"], "rewritten", start=start_at, end=end_at,
+                old_text=search_text, new_text=applied_text,
+                anchors=snap["anchors"], attribution=attribution,
+                unknown_ids=closed_ids,
+                rewritten_cid=rewritten_cid,
+                note="фрагмент переписан целиком; тред перевешен на новый "
+                     "текст и теперь относится к тексту, которого не было, "
+                     "когда комментарий писали")
+        return _effect_receipt(
+            r["source"], "replace", start=start_at, end=end_at,
+            old_text=search_text, new_text=applied_text,
+            anchors=snap["anchors"], attribution=attribution,
+            unknown_ids=closed_ids)
     _error(
         f"anchor-mapped replace kept failing preflight after 3 attempts "
         f"({last_reason}) — the doc is being edited concurrently; retry later"
@@ -5965,9 +6604,29 @@ def patch_doc(file_id, ops_path, tab_id=None):
     global _RAISE_ERRORS
     resolved, insertions, noops = [], [], []
     deferred, early_refusals = {}, {}
+    # Поздние операции: цель разрешается только под записью, по свежей карте
+    # комментариев. Держим их отдельно от `deferred` — там операции, чья цель
+    # не разрешилась СЛУЧАЙНО, а здесь так устроена сама операция, и путать
+    # архитектуру с ошибкой схемы значит прятать настоящие опечатки.
+    late_bound = set()
+    # Код и подробности для тех отказов, что рождаются ДО цикла записи:
+    # иначе машинный контракт зависел бы от того, есть ли в документе
+    # комментарии, и от состояния ошибки (codex, ревью r19).
+    early_diag = {}
     _RAISE_ERRORS = True
     try:
         for i, op in enumerate(ops):
+            if str(op.get("op", "")) in _LATE_BOUND_OPS:
+                resolved.append(None)
+                insertions.append(None)
+                noops.append(False)
+                late_bound.add(i)
+                try:
+                    _validate_anchor_op(op)
+                except PatchOpError as e:
+                    early_refusals[i] = str(e)
+                    early_diag[i] = (e.reason, e.details)
+                continue
             try:
                 r = _resolve_op(op, doc_tab, tid)
                 ins = _op_pure_insertion(op, doc_tab, r)
@@ -5977,6 +6636,7 @@ def patch_doc(file_id, ops_path, tab_id=None):
                 insertions.append(None)
                 noops.append(False)
                 deferred[i] = str(e)
+                early_diag[i] = (e.reason, e.details)
                 continue
             resolved.append(r)
             insertions.append(ins)
@@ -5990,6 +6650,41 @@ def patch_doc(file_id, ops_path, tab_id=None):
     # are refused: applying either one moves the other's target.
     early_refusals.update(_ops_overlap_conflicts(
         {i: r for i, r in enumerate(resolved) if r and not noops[i]}))
+    # Отложенная операция живёт уникальностью: на момент записи цель у неё
+    # ровно одна, и это и есть доказательство адреса. С ЯВНЫМ номером
+    # вхождения доказательства нет: номер осмыслен только вместе с числом
+    # копий, а плановая фаза его не видела — она эту операцию отвергла.
+    # Пропустить такую значит применить голый порядковый номер к состоянию
+    # документа, которого человек не видел.
+    for i in list(deferred):
+        if "occurrence" in (ops[i] if isinstance(ops[i], dict) else {}):
+            early_refusals[i] = (
+                f"на исходном снимке эта правка не разрешилась "
+                f"({deferred[i]}), а номер вхождения имеет смысл только "
+                f"вместе с числом копий — примерить его к документу, "
+                f"который человек не видел, нельзя. Прочитайте документ "
+                f"заново и назовите адрес ещё раз.")
+            early_diag[i] = ("concurrent_edit",
+                             {"occurrence": ops[i].get("occurrence")})
+
+    # Две правки по одному треду в одном файле — почти наверняка описка, и
+    # разобрать её за человека нечем: какую из них он имел в виду, знает
+    # только он. Отклоняются обе, как и пересекающиеся диапазоны.
+    by_thread = {}
+    for i in sorted(late_bound):
+        if i in early_refusals:
+            continue
+        by_thread.setdefault(ops[i].get("comment_id"), []).append(i)
+    for cid, group in by_thread.items():
+        if len(group) < 2:
+            continue
+        for i in group:
+            early_refusals[i] = (
+                f"в файле {len(group)} правки по одному треду {cid!r} — "
+                f"отклонены все: какую из них применить, скрепка за вас не "
+                f"решит. Оставьте одну.")
+            early_diag[i] = ("unsupported_structure",
+                             {"comment_id": cid, "ops": group})
 
     # Suggestions are judged by position, not by their existence anywhere in
     # the tab (r8, after the export was measured). An op that removes nothing
@@ -6010,6 +6705,7 @@ def patch_doc(file_id, ops_path, tab_id=None):
                                                 r["source"])
             except PatchOpError as e:
                 early_refusals[i] = str(e)
+                early_diag[i] = (e.reason, e.details)
     finally:
         _RAISE_ERRORS = False
 
@@ -6030,6 +6726,17 @@ def patch_doc(file_id, ops_path, tab_id=None):
         # it against later. It joins the refusals, and the batch carries the
         # rest.
         skipped = dict(deferred)
+        for i in sorted(late_bound):
+            # На документе без заякоренных комментариев адресовать по треду
+            # нечего по определению: карты не существует, потому что не
+            # существует якорей.
+            skipped.setdefault(i, (
+                f"в документе нет заякоренных комментариев — правку по "
+                f"треду адресовать не к чему. "
+                f"({_op_source_label(ops[i], None)})"))
+            early_diag.setdefault(i, ("comment_thread_unresolvable",
+                                      {"comment_id":
+                                       ops[i].get("comment_id")}))
         skipped.update(early_refusals)
         ordered = sorted((i for i in range(len(resolved)) if i not in skipped),
                          key=lambda i: resolved[i]["affect_start"],
@@ -6083,11 +6790,21 @@ def patch_doc(file_id, ops_path, tab_id=None):
             "tab_id": tid,
             "ops_applied": len(resolved) - len(skipped),
             "revision_id_before": revision_id,
+            # Заякоренных комментариев в документе нет вовсе — этим путём он
+            # сюда и попал, — значит задевать нечего. Пустой список стоит
+            # здесь явно: молчание прочиталось бы как «этот путь про эффекты
+            # ничего не сообщает», и вызывающему пришлось бы догадываться по
+            # названию стратегии.
+            "affected_comment_ids": [],
         }
         if skipped:
             result["refused"] = [
-                {"op": i, "source": _op_source_label(ops[i], resolved[i]),
-                 "error": skipped[i]} for i in sorted(skipped)]
+                _with_diag(
+                    {"op": i,
+                     "source": _op_source_label(ops[i], resolved[i]),
+                     "error": skipped[i]},
+                    *early_diag.get(i, (None, None)))
+                for i in sorted(skipped)]
             print(json.dumps(result, ensure_ascii=False, indent=2))
             sys.exit(3)
         print(json.dumps(result, ensure_ascii=False))
@@ -6114,21 +6831,66 @@ def patch_doc(file_id, ops_path, tab_id=None):
 
     applied, op_notes, refused = [], [], []
     ghosts = {}
+    # Треды, которых уже коснулись правки этого прогона. Правка по треду,
+    # чей разговор уже сдвинут соседней операцией, отклоняется: её адрес —
+    # тред, и любой текст под ним для неё законен, так что она молча накрыла
+    # бы результат предыдущей и обе числились бы применёнными (ревью codex).
+    # У обычной замены этой беды нет: `_resolve_replace_target` сверяет
+    # текст в разрешённом диапазоне с тем, по которому адресовались.
+    touched_threads = set()
+    # Правка, писавшая БЕЗ карты комментариев, оставляет вопрос без ответа:
+    # задела она чей-то якорь или нет, неизвестно (`effects_basis:
+    # "not-mapped"` — так пишут вставки, они карту не строят). Список задетых
+    # тредов после такой правки неполон по построению, и опираться на него
+    # больше нельзя (ревью codex).
+    unmapped_write = False
     failed_at, failure, app_state = None, None, None
+    failed_code, failed_details = None, None
     for i, op in enumerate(ops):
         if i in early_refusals:
             # rejected by a gate that judged it on the planning snapshot and
             # will judge it the same way on any other — no reason to send it
-            refused.append({"op": i,
-                            "source": _op_source_label(op, resolved[i]),
-                            "error": early_refusals[i]})
+            refused.append(_with_diag(
+                {"op": i, "source": _op_source_label(op, resolved[i]),
+                 "error": early_refusals[i]},
+                *early_diag.get(i, (None, None))))
+            continue
+        if i in late_bound and op.get("comment_id") in touched_threads:
+            refused.append(_with_diag(
+                {"op": i, "source": _op_source_label(op, resolved[i]),
+                 "error": (
+                     f"тред {op.get('comment_id')!r} уже задет правкой из "
+                     f"этого же файла — текст под ним теперь не тот, для "
+                     f"которого писали эту правку. Прочитайте документ "
+                     f"заново и адресуйте её ещё раз.")},
+                "concurrent_edit", {"comment_id": op.get("comment_id")}))
+            continue
+        if i in late_bound and unmapped_write:
+            # Вставка карту комментариев не строит и потому не может сказать,
+            # попала ли она внутрь чьего-то якоря. Пропустить правку по треду
+            # после такой значит позволить ей молча накрыть результат
+            # соседки: список задетых тредов после вставки неполон.
+            refused.append(_with_diag(
+                {"op": i, "source": _op_source_label(op, resolved[i]),
+                 "error": (
+                     "раньше в этом же файле прошла правка, которая карту "
+                     "комментариев не строила (вставка), — задела она текст "
+                     "под этим тредом или нет, неизвестно. Поставьте правки "
+                     "по тредам ПЕРЕД вставками или разнесите их на два "
+                     "вызова.")},
+                "concurrent_edit", {"comment_id": op.get("comment_id")}))
             continue
         try:
             _RAISE_ERRORS = True  # nested preflight errors must not exit
             try:
-                note = _apply_op_anchor_safe(docs_service, drive_service,
-                                             file_id, op, tab_id,
-                                             warnings=ghosts)
+                note = _apply_op_anchor_safe(
+                    docs_service, drive_service, file_id, op, tab_id,
+                    warnings=ghosts,
+                    # Номер вхождения осмыслен только вместе с числом копий,
+                    # а копию мог унести любой сосед по файлу.
+                    expect_occurrences=(
+                        resolved[i]["quote_total"]
+                        if resolved[i] and "occurrence" in op else None))
             finally:
                 _RAISE_ERRORS = False
             applied.append(_op_source_label(op, resolved[i]))
@@ -6148,30 +6910,46 @@ def patch_doc(file_id, ops_path, tab_id=None):
                     f"({deferred[i]}); операция разрешена по живому документу "
                     "и в проверке пересечений с другими правками не "
                     "участвовала")
+            if i in late_bound:
+                note = dict(note or
+                            {"source": _op_source_label(op, resolved[i])})
+                note["late_bound"] = (
+                    "цель этой правки — тред, а не текст, и её координаты "
+                    "существуют только в свежей карте комментариев; в "
+                    "проверке пересечений с другими правками файла она не "
+                    "участвовала")
             if note:
+                if note.get("effects_basis") == "not-mapped":
+                    unmapped_write = True
+                touched_threads.update(note.get("affected_comment_ids") or ())
                 op_notes.append(note)
             continue
         except PatchOpError as e:
             reason, state = str(e), e.state
+            code, details = e.reason, e.details
         except HttpError as e:
             reason = e.reason if hasattr(e, "reason") else str(e)
             # 5xx/transport after send: the write may or may not have landed
             status = getattr(getattr(e, "resp", None), "status", None)
             state = "unknown" if (status is None or status >= 500) else "not_applied"
+            code = "unknown_write_outcome" if state == "unknown" else None
+            details = {"http_status": status} if status else None
         except Exception as e:  # network timeouts etc. — state unknown
             reason, state = str(e), "unknown"
+            code, details = "unknown_write_outcome", None
         if state == "not_applied":
             # This operation provably wrote nothing, and the ops in one file
             # do not overlap (checked above), so the rest are independent of
             # it. Refusing THIS operation must not cost the person the other
             # nine (r8): the refusal is collected and the loop goes on.
-            refused.append({"op": i,
-                            "source": _op_source_label(op, resolved[i]),
-                            "error": reason})
+            refused.append(_with_diag(
+                {"op": i, "source": _op_source_label(op, resolved[i]),
+                 "error": reason}, code, details))
             continue
         # unknown state: what the document looks like is no longer known,
         # every later operation would be planned against a guess — stop.
         failed_at, failure, app_state = i, reason, state
+        failed_code, failed_details = code, details
         break
 
     # skrepka used to post an informational reply into every thread whose
@@ -6213,6 +6991,7 @@ def patch_doc(file_id, ops_path, tab_id=None):
         result["failed_at"] = failed_at
         result["error"] = failure
         result["failed_op_state"] = app_state
+        _with_diag(result, failed_code, failed_details)
         result["remaining"] = [_op_source_label(ops[j], resolved[j])
                                for j in range(failed_at, len(ops))]
     if failed_at is not None or refused:

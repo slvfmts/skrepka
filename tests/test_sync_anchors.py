@@ -1695,10 +1695,12 @@ def test_patch_full_anchor_coverage_is_rewritten(engine, monkeypatch):
     assert "deleteContentRange" in main[0]           # canary first
     assert main[1]["insertText"] == {"location": {"index": 11},
                                      "text": "Zulu"}  # inside the anchor
-    assert main[2]["replaceAllText"]["containsText"]["text"] == "BravZulu"
-    assert main[2]["replaceAllText"]["replaceText"] == "Zulu"
+    # голова старого текста уходит по индексу, в исходных координатах
+    assert main[2]["deleteContentRange"]["range"] == {"startIndex": 7,
+                                                      "endIndex": 11}
     assert main[3]["deleteContentRange"]["range"] == {"startIndex": 11,
                                                       "endIndex": 12}
+    assert not any("replaceAllText" in r for r in main)
 
 
 def test_a_closed_thread_no_longer_switches_the_rewrite_off(
@@ -1844,11 +1846,13 @@ def _tab_body_and_cell(engine, body_text, cell_text):
     return tab, 1, b_end, (c_start, p_end)
 
 
-def test_narrowing_refuses_when_the_same_text_lives_in_a_fenced_cell(engine):
-    """The target is in the body and the fenced cell holds the same words.
-    `replaceAllText` acts on the whole tab and DOES reach into cells (M16b),
-    so the narrowed core is not unique and the narrowing has to be dropped —
-    the cell fence alone would not have stopped this."""
+def test_narrowing_works_when_the_same_text_lives_in_a_fenced_cell(engine):
+    """Раньше сужение здесь отваливалось: `replaceAllText` действовал на всю
+    вкладку и заходил в ячейки (M16b), поэтому неуникальное ядро было
+    непригодно, и забор ячейки сам по себе этого не останавливал.
+
+    Индексный писатель адресует диапазон, а не ищет текст, поэтому до ячейки
+    он не дотягивается геометрически."""
     tab, start, end, cell = _tab_body_and_cell(
         engine, "Здесь слишком мало примеров", "слишком мало примеров")
     a_start = start + len("Здесь ")
@@ -1856,7 +1860,10 @@ def test_narrowing_refuses_when_the_same_text_lives_in_a_fenced_cell(engine):
     out = engine._narrow_replace(
         tab, "Здесь слишком мало примеров", "Здесь слишком мало образцов",
         start, end, anchors, [(cell[0], cell[1], "ячейка")], {"0": "c1"})
-    assert out is None
+    assert out is not None
+    _core, _repl, start2, end2 = out
+    assert start <= start2 < end2 <= end
+    assert not (start2 < cell[1] and cell[0] < end2)
 
 
 def test_narrowing_never_crosses_into_a_fenced_cell(engine):
@@ -1901,22 +1908,53 @@ def test_narrowing_gives_up_when_the_anchor_is_inside_the_change(engine):
     assert out is None
 
 
-def test_narrowing_refuses_a_core_that_is_not_unique(engine):
-    """The narrowed core repeats elsewhere in the tab: replaceAllText would
-    rewrite both places, so this narrowing is unusable and we fall back to
-    the refusal instead of quietly changing two paragraphs."""
+def test_narrowing_keeps_away_from_a_fence_inside_the_target(engine):
+    """Ограда внутри самой цели — единственное, что осталось решать за
+    геометрию после снятия уникальности. Ни один срез не имеет права её
+    задеть, поэтому когда огорожено ровно изменившееся, сужения нет."""
+    text = "Здесь слишком мало примеров"
+    tab, start, end = _one_para(engine, text)
+    a_start = start + len("Здесь ")
+    anchors = [(a_start, a_start + len("слишком мало"), "слишком мало", "0")]
+    # огораживаем «примеров» — ровно то, что меняется
+    fence_s = start + len("Здесь слишком мало ")
+    blocked = [(fence_s, end, "чужой якорь")]
+    out = engine._narrow_replace(tab, text, "Здесь слишком мало образцов",
+                                 start, end, anchors, blocked, {"0": "c1"})
+    assert out is None
+
+
+def test_narrowing_refuses_when_the_range_no_longer_holds_its_text(engine):
+    """Снимок может отстать от документа. Уникальность это ловила косвенно;
+    после её снятия остаётся прямая сверка: держит ли этот диапазон ровно тот
+    текст, до которого мы сузились."""
+    text = "Здесь слишком мало примеров"
+    tab, start, end = _one_para(engine, text)
+    a_start = start + len("Здесь ")
+    anchors = [(a_start, a_start + len("слишком мало"), "слишком мало", "0")]
+    # сдвигаем весь абзац на два знака: координаты те же, текст под ними иной
+    out = engine._narrow_replace(tab, text, "Здесь слишком мало образцов",
+                                 start + 2, end + 2, anchors, [], {"0": "c1"})
+    assert out is None
+
+
+def test_narrowing_works_on_a_core_that_repeats_elsewhere(engine):
+    """Ядро повторяется в соседнем абзаце. При writer'е на поиске это
+    переписало бы оба места, поэтому сужение отбрасывалось. Теперь адрес —
+    сам диапазон, и повтор ни на что не влияет."""
     tab = make_doc(["Xмало примеров", "мало примеров"])
     text, start, end = "Xмало примеров", 1, 15
     anchors = [(start, start + 1, "X", "0")]
     out = engine._narrow_replace(tab, text, "Xмало образцов", start, end,
                                  anchors, [], {"0": "c1"})
-    assert out is None
+    assert out is not None
+    _core, _repl, start2, end2 = out
+    assert start <= start2 < end2 <= end
 
 
-def test_narrowing_counts_headers_when_checking_uniqueness(engine):
-    """replaceAllText is not confined to the body. A core that is unique in
-    the body but repeated in a running header must not be used — otherwise
-    the mismatch only surfaces after the write, as occurrencesChanged."""
+def test_narrowing_ignores_a_twin_in_a_running_header(engine):
+    """`replaceAllText` не был ограничен телом, поэтому близнец в колонтитуле
+    делал ядро непригодным. Индексная запись в колонтитул не попадает вовсе."""
     text = "Здесь слишком мало примеров"
     tab, start, end = _one_para(engine, text)
     # NO startIndex anywhere: that is how the API really returns a header —
@@ -1930,7 +1968,7 @@ def test_narrowing_counts_headers_when_checking_uniqueness(engine):
     anchors = [(a_start, a_start + len("слишком мало"), "слишком мало", "0")]
     out = engine._narrow_replace(tab, text, "Здесь слишком мало образцов",
                                  start, end, anchors, [], {"0": "c1"})
-    assert out is None
+    assert out is not None
 
 
 def test_narrowing_survives_a_non_bmp_char_in_the_affix(engine):
@@ -2050,8 +2088,10 @@ def test_narrowed_replace_reaches_the_api_and_is_reported(engine, monkeypatch):
     note = engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
     assert note["applied_as"] == "narrowed"
     main = semantic_batch(docs)
-    # minimal cut: only what the anchor needs is rewritten
-    assert written_text(main) == "лишком мало образцов"
+    # минимальная правка: меняется ровно то, что изменилось. До 0.18 писалось
+    # «лишком мало образцов» — срез брался наименьший, потому что writer искал
+    # текст и длинному ядру нужна была уникальность.
+    assert written_text(main) == "образц"
 
 
 # ---------------------------------------------------------------------------
@@ -2078,17 +2118,54 @@ def test_rewrite_builds_the_three_requests(engine):
     kw = _rewrite_case(engine)
     requests, tail_len = engine._rewrite_anchor_requests(**kw)
     assert tail_len == 1
-    ins, rep, dele = requests
-    # insert lands strictly inside the anchor, before its last character
+    ins, head, tail = requests
+    # 1. вставка строго внутрь якоря, перед его последним символом
     assert ins["insertText"]["location"]["index"] == kw["end"] - 1
-    # the match leaves that last character alone, so it never covers the whole
-    assert rep["replaceAllText"]["containsText"]["text"] == \
-        kw["search_text"][:-1] + kw["new_text"]
-    assert rep["replaceAllText"]["replaceText"] == kw["new_text"]
-    # and the leftover original character goes last
+    # 2. голова старого текста — по индексу, в нетронутых координатах
+    assert head["deleteContentRange"]["range"] == {
+        "startIndex": kw["start"], "endIndex": kw["end"] - 1}
+    # 3. и уцелевший последний символ якоря — последним
     tail_at = kw["start"] + engine._utf16_len(kw["new_text"])
-    assert dele["deleteContentRange"]["range"] == {"startIndex": tail_at,
+    assert tail["deleteContentRange"]["range"] == {"startIndex": tail_at,
                                                    "endIndex": tail_at + 1}
+    # ни одного поиска по тексту в батче (M26, блок C)
+    assert not any("replaceAllText" in r for r in requests)
+
+
+def test_rewrite_puts_the_tail_delete_at_the_shifted_index(engine):
+    """Хвост удаляется ПОСЛЕ того, как удаление головы утянуло всё влево,
+    поэтому его адрес считается от нового текста, а не от старых координат.
+    В штатной фикстуре длины совпадали случайно, и мутация «считать по
+    исходным индексам» проходила незамеченной."""
+    kw = _rewrite_case(engine, text="Старый длинный текст", new="Крошка")
+    requests, tail_len = engine._rewrite_anchor_requests(**kw)
+    tail_at = kw["start"] + engine._utf16_len("Крошка")
+    assert requests[2]["deleteContentRange"]["range"] == {
+        "startIndex": tail_at, "endIndex": tail_at + tail_len}
+    # и это НЕ исходные координаты хвоста
+    assert tail_at != kw["end"] - tail_len
+
+
+def test_rewrite_refuses_a_range_that_does_not_match_its_text(engine):
+    """Арифметика трёх запросов верна только когда якорь занимает в индексном
+    пространстве ровно столько, сколько в тексте. Иначе — вставка легла бы не
+    туда, а удаления срезали бы чужое."""
+    kw = _rewrite_case(engine)
+    kw["end"] = kw["end"] + 3          # в диапазоне есть что-то, чего нет в тексте
+    kw["anchors"] = [(kw["start"], kw["end"], kw["search_text"], "0")]
+    assert engine._rewrite_anchor_requests(**kw) is None
+
+
+def test_rewrite_refuses_when_two_threads_are_doomed(engine):
+    """Перезапись умеет спасти ОДИН тред: новый текст ложится внутрь его
+    якоря. Двум якорям на одном фрагменте одного носителя не хватает, и это
+    отдельный отказ, а не догадка (задача #33)."""
+    kw = _rewrite_case(engine)
+    s, e = kw["start"], kw["end"]
+    kw["anchors"] = [(s, e, kw["search_text"], "0"),
+                     (s, e, kw["search_text"], "1")]
+    kw["attribution"] = {"0": "c1", "1": "c2"}
+    assert engine._rewrite_anchor_requests(**kw) is None
 
 
 def test_rewrite_counts_a_non_bmp_tail_in_utf16(engine):
@@ -2142,10 +2219,24 @@ def test_rewrite_refuses_when_a_named_range_covers_the_target(engine):
     assert engine._rewrite_anchor_requests(**kw) is None
 
 
-def test_rewrite_refuses_when_a_table_of_contents_is_present(engine):
+def test_a_table_of_contents_elsewhere_does_not_block_the_rewrite(engine):
+    """До 0.18 само НАЛИЧИЕ оглавления выключало перезапись во всём
+    документе — глобальный отказ по локальной причине. Причина была в поиске
+    по тексту, который доставал туда, куда не смотрел счёт вхождений; поиска
+    больше нет."""
     kw = _rewrite_case(engine)
     kw["doc_tab"]["body"]["content"].append(
         {"startIndex": 900, "endIndex": 950, "tableOfContents": {}})
+    assert engine._rewrite_anchor_requests(**kw) is not None
+
+
+def test_a_rewrite_reaching_into_a_table_of_contents_is_refused(engine):
+    """А вот правка, чей диапазон попадает В оглавление, отклоняется — и
+    только она. Google строит его сам по заголовкам, и писать туда нечего."""
+    kw = _rewrite_case(engine)
+    kw["doc_tab"]["body"]["content"].append(
+        {"startIndex": kw["start"], "endIndex": kw["end"],
+         "tableOfContents": {}})
     assert engine._rewrite_anchor_requests(**kw) is None
 
 
@@ -2218,51 +2309,57 @@ def test_rewrite_survives_a_thread_with_replies(engine):
     assert engine._rewrite_anchor_requests(**kw) is not None
 
 
-def test_rewrite_refuses_a_projected_string_that_is_not_unique(engine):
-    """The needle exists only after the insert, so uniqueness is checked on
-    the projected text — and here the same pair already sits in the document
-    next door."""
+def test_rewrite_works_when_the_projected_string_repeats(engine):
+    """Уникальность проверялась на ПРОЕКЦИИ документа между первым и вторым
+    запросом — потому что вторым был поиск по тексту. Проекции больше нет."""
     text, new = "аб", "вг"
     tab = make_doc([text, "а" + new])   # «авг» already contains «а» + «вг»
     kw = _rewrite_case(engine, text=text, new=new)
     kw["doc_tab"] = tab
-    assert engine._rewrite_anchor_requests(**kw) is None
+    got = engine._rewrite_anchor_requests(**kw)
+    assert got is not None
+    assert not any("replaceAllText" in r for r in got[0])
 
 
-def test_rewrite_refuses_when_the_needle_also_sits_in_a_header(engine):
+def test_rewrite_batch_is_pinned_and_sent_as_given(engine):
+    """Разбирать в ответе больше нечего: каждый запрос адресует абсолютный
+    диапазон, счётчика совпадений нет, исход решает закрепление по ревизии.
+    Проверка `occurrencesChanged` принадлежала `replaceAllText` из второго
+    запроса и ушла вместе с ним (M26)."""
+    class Svc:
+        def __init__(self):
+            self.body = None
+
+        def documents(self):
+            return self
+
+        def batchUpdate(self, documentId=None, body=None):
+            self.body = body
+            return self
+
+        def execute(self):
+            return {"replies": [{}, {}, {}]}
+
+    svc = Svc()
+    reqs = [
+        {"insertText": {"location": {"index": 11}, "text": "нов"}},
+        {"deleteContentRange": {"range": {"startIndex": 7, "endIndex": 11}}},
+        {"deleteContentRange": {"range": {"startIndex": 10, "endIndex": 11}}},
+    ]
+    engine._execute_anchor_rewrite(svc, "doc1", None, reqs, "R1", "quote='a'")
+    assert svc.body["writeControl"] == {"requiredRevisionId": "R1"}
+    assert svc.body["requests"] == reqs
+
+
+def test_rewrite_ignores_the_same_string_in_a_running_header(engine):
+    """Колонтитул перестал что-либо решать: индексная запись туда не
+    попадает, а `replaceAllText`, который попадал, из этого пути убран."""
     kw = _rewrite_case(engine)
     kw["doc_tab"]["headers"] = {"h1": {"content": [
         {"paragraph": {"elements": [
             {"textRun": {"content": kw["search_text"][:-1] + kw["new_text"]}}
         ]}}]}}
-    assert engine._rewrite_anchor_requests(**kw) is None
-
-
-def test_rewrite_response_without_one_match_is_unknown(engine):
-    """occurrencesChanged here is diagnosis after the write: the insert and
-    the deletion land whatever the replace matched, so anything but one means
-    the document changed in a way nobody planned."""
-    class Svc:
-        def documents(self):
-            return self
-
-        def batchUpdate(self, **kw):
-            return self
-
-        def execute(self):
-            return {"replies": [{}, {}, {"replaceAllText":
-                                         {"occurrencesChanged": 0}}]}
-
-    with pytest.raises(engine.PatchOpError) as exc:
-        engine._execute_anchor_rewrite(Svc(), "doc1", None, [
-            {"insertText": {"location": {"index": 1}, "text": "x"}},
-            {"replaceAllText": {"containsText": {"text": "a"},
-                                "replaceText": "b"}},
-            {"deleteContentRange": {"range": {"startIndex": 1,
-                                              "endIndex": 2}}},
-        ], "R1", "quote='a'")
-    assert exc.value.state == "unknown"
-    assert "документ изменён" in str(exc.value)
+    assert engine._rewrite_anchor_requests(**kw) is not None
 
 
 def test_narrowing_wins_over_rewriting(engine, monkeypatch):
@@ -2282,10 +2379,12 @@ def test_narrowing_wins_over_rewriting(engine, monkeypatch):
         "with": "Здесь слишком мало образцов"}, None)
     assert note["applied_as"] == "narrowed"
     main = semantic_batch(docs)
-    # narrowing writes the shortened range directly; the anchor rewrite would
-    # instead do its sentinel dance through `replaceAllText`
+    # сужение пишет укороченный диапазон напрямую, поиска по тексту в батче
+    # нет вовсе — ни у сужения, ни у перезаписи якоря (M26)
     assert not any("replaceAllText" in r for r in main)
-    assert written_text(main) == "лишком мало образцов"
+    # и правка ужимается до реально изменившегося куска, а не до наименьшего
+    # среза: до 0.18 писалось «лишком мало образцов»
+    assert written_text(main) == "образц"
 
 
 # ---------------------------------------------------------------------------
@@ -2643,10 +2742,13 @@ def test_an_op_made_unique_by_its_predecessor_goes_through(engine, monkeypatch,
     assert texts == ["Один Копия", "Два Финал", "Три"]
     # and the receipt does not pretend the overlap check covered it — in the
     # operation's OWN note, not a second entry that would read as a second
-    # operation
+    # operation. Since r19 every applied op carries a receipt, so the count to
+    # check is one entry PER OPERATION: two ops, two entries, and the deferred
+    # note inside the entry of the op it belongs to.
     notes = [n for n in out["op_notes"] if "deferred" in n]
     assert len(notes) == 1
-    assert len(out["op_notes"]) == 1
+    assert len(out["op_notes"]) == 2
+    assert notes[0]["source"].startswith("quote='Дубль'")
     assert "в проверке пересечений" in notes[0]["deferred"]
 
 
@@ -2656,12 +2758,13 @@ def test_patch_refuses_one_op_and_applies_the_rest(engine, monkeypatch,
     Alpha and Charlie have nothing to do with it. Before r8 the loop broke on
     the first refusal and the other operations never ran."""
     doc = make_doc(BASE_TEXTS)
-    # a table of contents keeps the rewrite path out of this document (the
-    # text walkers do not read one, so the uniqueness count would miss a match
-    # hiding there), so covering the anchor whole is still a refusal. A closed
-    # thread used to serve that purpose and no longer does — see M13.
-    doc["body"]["content"].append({"startIndex": 100, "endIndex": 101,
-                                   "tableOfContents": {}})
+    # Перезапись надо чем-то выключить, иначе накрывающая замена пройдёт и
+    # отказа не будет вовсе. Оглавление для этого больше не годится: с 0.18
+    # оно отклоняет только правку, которая в него попадает. Берём машинную
+    # пометку ровно на «Bravo» — перезапись срезала бы её.
+    doc["namedRanges"] = {"mark1": {"namedRanges": [
+        {"ranges": [{"startIndex": 1 + len("Alpha") + 1,
+                     "endIndex": 1 + len("Alpha") + 1 + len("Bravo")}]}]}}
     docs = DocsStub(doc)
     drive = DriveStub(
         [api_comment("c1", "A", CREATED)],
@@ -2686,27 +2789,6 @@ def test_patch_refuses_one_op_and_applies_the_rest(engine, monkeypatch,
     assert "накрывает целиком последний якорь" in out["refused"][0]["error"]
     # nothing halted: no failed_at, the doc state is known throughout
     assert "failed_at" not in out
-
-
-def test_replace_all_reply_found_by_type_not_position(engine):
-    class OneShot:
-        def __init__(self):
-            self.body = None
-
-        def documents(self):
-            return self
-
-        def batchUpdate(self, documentId=None, body=None):
-            self.body = body
-            return _Req({"replies": [{}, {"replaceAllText":
-                                          {"occurrencesChanged": 1}}]})
-
-    svc = OneShot()
-    engine._execute_replace_all(
-        svc, "doc1", None, "a", "b", "R1", "quote='a'",
-        extra_requests_before=[_del(5, 9)])
-    assert "deleteContentRange" in svc.body["requests"][0]
-    # no PatchOpError raised: occurrencesChanged found in reply #2
 
 
 # ---------------------------------------------------------------------------
@@ -3402,8 +3484,16 @@ def test_the_refusal_names_the_real_reason_the_rewrite_did_not_fire(engine):
 
     toc = dict(base)
     toc["doc_tab"] = {"body": {"content": list(
-        kw["doc_tab"]["body"]["content"]) + [{"tableOfContents": {}}]}}
+        kw["doc_tab"]["body"]["content"]) + [
+            {"startIndex": kw["start"], "endIndex": kw["end"],
+             "tableOfContents": {}}]}}
     assert "оглавление" in engine._why_no_rewrite(**toc)
+    # а оглавление в стороне причиной больше не является
+    far = dict(base)
+    far["doc_tab"] = {"body": {"content": list(
+        kw["doc_tab"]["body"]["content"]) + [
+            {"startIndex": 900, "endIndex": 950, "tableOfContents": {}}]}}
+    assert "оглавление" not in engine._why_no_rewrite(**far)
 
     named = dict(base)
     named["named_intervals"] = [(kw["start"], kw["end"], "метка mark1")]
@@ -3501,7 +3591,8 @@ def test_patch_writes_a_soft_break_into_a_commented_paragraph(engine,
     assert note["applied_as"] == "rewritten"
     main = semantic_batch(docs)
     assert main[1]["insertText"]["text"] == "Заголовок\vНиз"
-    assert main[2]["replaceAllText"]["replaceText"] == "Заголовок\vНиз"
+    assert "deleteContentRange" in main[2]
+    assert not any("replaceAllText" in r for r in main)
 
 
 def _archived_replies(engine, tmp_path, first, second):

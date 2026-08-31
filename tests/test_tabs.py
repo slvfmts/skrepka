@@ -75,13 +75,23 @@ def test_scope_puts_the_tab_where_each_kind_carries_it(engine):
     scoped = engine._scope_requests([
         {"insertText": {"location": {"index": 5}, "text": "х"}},
         {"deleteContentRange": {"range": {"startIndex": 5, "endIndex": 7}}},
-        {"replaceAllText": {"containsText": {"text": "а"},
-                            "replaceText": "б"}},
+        {"updateTextStyle": {"range": {"startIndex": 5, "endIndex": 7},
+                             "textStyle": {}, "fields": "bold"}},
     ], "t.втор")
     assert scoped[0]["insertText"]["location"]["tabId"] == "t.втор"
     assert scoped[1]["deleteContentRange"]["range"]["tabId"] == "t.втор"
-    assert (scoped[2]["replaceAllText"]["tabsCriteria"]
-            == {"tabIds": ["t.втор"]})
+    assert scoped[2]["updateTextStyle"]["range"]["tabId"] == "t.втор"
+
+
+def test_a_request_kind_outside_the_white_list_is_refused(engine):
+    """Белый список — не удобство, а ограда: запрос без известного места для
+    идентификатора вкладки ушёл бы в ПЕРВУЮ вкладку молча (M19-9). После
+    уборки `replaceAllText` из писателя он выпал и из списка, и попытка
+    отправить его теперь останавливается, а не проходит незамеченной."""
+    with pytest.raises((SystemExit, engine.PatchOpError)):
+        engine._scope_requests([
+            {"replaceAllText": {"containsText": {"text": "а"},
+                                "replaceText": "б"}}], "t.втор")
 
 
 def test_an_unknown_request_kind_is_refused_before_writing(engine):
@@ -137,26 +147,11 @@ def test_the_delete_prepended_to_the_rewrite_batch_is_scoped_too(engine):
                                               "endIndex": 20}}}
     engine._execute_anchor_rewrite(
         docs, "F", "t.втор",
-        [{"replaceAllText": {"containsText": {"text": "а"},
-                             "replaceText": "б"}}],
+        [{"insertText": {"location": {"index": 30}, "text": "нов"}}],
         "R1", "источник", extra_requests_before=[naked])
     sent = docs.requests
     assert sent[0]["deleteContentRange"]["range"]["tabId"] == "t.втор"
-    assert (sent[1]["replaceAllText"]["tabsCriteria"]
-            == {"tabIds": ["t.втор"]})
-
-
-def test_the_single_replace_scopes_its_prepended_delete_too(engine):
-    docs = Recorder()
-    naked = {"deleteContentRange": {"range": {"startIndex": 10,
-                                              "endIndex": 20}}}
-    engine._execute_replace_all(
-        docs, "F", "t.втор", "было", "стало", "R1", "источник",
-        extra_requests_before=[naked])
-    sent = docs.requests
-    assert sent[0]["deleteContentRange"]["range"]["tabId"] == "t.втор"
-    assert (sent[1]["replaceAllText"]["tabsCriteria"]
-            == {"tabIds": ["t.втор"]})
+    assert sent[1]["insertText"]["location"]["tabId"] == "t.втор"
 
 
 def test_cleanup_looks_for_the_canary_in_its_own_tab(engine, two_tabs):

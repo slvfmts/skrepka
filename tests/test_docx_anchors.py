@@ -1060,8 +1060,22 @@ def test_the_refusal_names_a_remedy_that_fits_the_reason(engine):
         "cannot read (a smart chip) could be its home too")
     assert "чип" in chip and "Различите копии" not in chip
 
-    ghost = engine._anchor_map_remedy("anchor span 7 has no comments.xml entry")
-    assert "призрак" in ghost
+    broken = engine._anchor_map_remedy(
+        "anchor span 7 has no comments.xml entry")
+    assert "повторите команду" in broken.lower()
+    assert "призрак" not in broken
+
+    # M27: два ответа в одну секунду — свой случай и свой выход. Совет про
+    # призраков сюда не относится вовсе, а раньше приезжал именно он.
+    collision = engine._anchor_map_remedy(
+        "comment AAA (без цитаты) shares every (author, second) key with "
+        "another thread")
+    assert "секунду" in collision and "призрак" not in collision
+
+    # и запасной вариант больше не просит редактора работать руками
+    fallback = engine._anchor_map_remedy("something nobody has a name for")
+    for forbidden in ("в UI", "в интерфейсе", "Разрулите"):
+        assert forbidden not in fallback
 
 
 # ---------------------------------------------------------------------------

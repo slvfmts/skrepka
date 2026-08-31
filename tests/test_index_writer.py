@@ -170,13 +170,15 @@ def test_non_empty_replacement_narrows_to_one_style_when_it_can(engine,
     note = engine._apply_op_anchor_safe(docs, drive, "doc1", {
         "op": "replace_quote", "quote": " | Бриф", "with": " и Бриф"}, None)
     assert note["applied_as"] == "narrowed"
-    assert note["narrowed_to"] == " | "
+    # правка ужимается до реально изменившегося символа, а не до всего
+    # однородного куска: ссылка рядом по-прежнему не задета
+    assert note["narrowed_to"] == "|"
     main = semantic_batch(docs)
-    assert written_text(main) == " и "
+    assert written_text(main) == "и"
     cut = next(r["deleteContentRange"]["range"] for r in main[1:]
                if "deleteContentRange" in r)
-    assert cut == {"startIndex": 1 + len("Задача"),
-                   "endIndex": 1 + len("Задача | ")}
+    assert cut == {"startIndex": 1 + len("Задача "),
+                   "endIndex": 1 + len("Задача |")}
 
 
 def test_non_empty_replacement_across_styles_refuses_when_narrowing_cannot(
@@ -221,15 +223,22 @@ def test_the_commented_copy_itself_is_editable(engine, monkeypatch):
     отработали, отработать нельзя».
 
     Теперь можно. Копия, на которой стоит якорь, доказывается местом в
-    выгрузке, а сам якорь переписывается изнутри, поэтому тред переезжает на
-    новый текст вместо того, чтобы стать призраком."""
+    выгрузке, и правка адресуется по месту.
+
+    Исход — `narrowed`, а не `rewritten`, и это лучший из двух. Сужение
+    стоит в очереди раньше перезаписи, но до уборки `replaceAllText` (T3)
+    оно на таком документе всегда отваливалось: сокращённый кусок повторялся
+    во второй копии, а поиск по тексту переписал бы обе. Индексный писатель
+    ищет не текст, а адрес, поэтому правка схлопывается до различающегося
+    хвоста, а якорь не задет вовсе — вместо того чтобы переезжать на новый
+    текст."""
     docs, drive = _stand(engine, monkeypatch,
                          make_doc(["Заголовок", DUP, "Хвост", DUP]),
                          ["Заголовок", DUP, "Хвост", DUP], 3, (0, len(DUP)))
     note = engine._apply_op_anchor_safe(docs, drive, "doc1", {
         "op": "replace_quote", "quote": DUP, "with": NEW,
         "occurrence": 2}, None)
-    assert note["applied_as"] == "rewritten"
+    assert note["applied_as"] == "narrowed"
     main = semantic_batch(docs)
     # правка идёт по второй копии: она начинается после «Заголовок», первой
     # копии и «Хвост»
@@ -237,12 +246,16 @@ def test_the_commented_copy_itself_is_editable(engine, monkeypatch):
     assert any(r.get("insertText", {}).get("location", {}).get("index",
                                                                -1) >= second
                for r in main)
-    # промежуточный поиск склеивает старый текст с новым, поэтому в нетронутой
-    # первой копии такой строки нет и она не может быть задета
-    probe = next(r["replaceAllText"]["containsText"]["text"] for r in main
-                 if "replaceAllText" in r)
-    assert NEW in probe and probe not in DUP
-    assert probe.count(DUP[:20]) >= 1
+    # поиска по тексту в батче нет вовсе, поэтому нетронутая первая копия
+    # не может быть задета ничем
+    assert not any("replaceAllText" in r for r in main)
+    # правка уехала на различающийся хвост, а не на весь абзац
+    ins = next(r["insertText"] for r in main if "insertText" in r)
+    assert ins["text"] == " и обувь"
+    dels = [r["deleteContentRange"]["range"] for r in main
+            if "deleteContentRange" in r
+            and r["deleteContentRange"]["range"]["startIndex"] >= second]
+    assert dels and all(d["startIndex"] > second for d in dels)
 
 
 def test_the_free_copy_stays_untouched_while_the_commented_one_changes(
