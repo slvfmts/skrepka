@@ -5266,7 +5266,13 @@ def _blocked_hits(start, end, blocked):
             if start < be and bs < end]
 
 
-_ANCHOR_EFFECTS = frozenset(("extended", "edited", "dropped", "rewritten"))
+_ANCHOR_EFFECTS = frozenset((
+    "extended", "edited", "dropped", "rewritten",
+    # Якорь пересажен на соседнее слово, потому что прокомментированного
+    # слова больше нет (#33). Замерено M30: якорь ложится ровно на
+    # носителя, не поглощая ни левую вставку, ни правую.
+    "reseated",
+))
 
 
 def _utf16_cut(text, at):
@@ -5289,7 +5295,7 @@ def _utf16_cut(text, at):
 
 
 def _anchor_effects(anchors, attribution, *, del_start, del_end, new_text,
-                    rewritten_cid=None):
+                    rewritten_cid=None, shift=0):
     """Что правка сделала с текстом под каждым задетым комментарием.
 
     Считается арифметикой по одному замеренному правилу (M28): **сначала
@@ -5308,6 +5314,12 @@ def _anchor_effects(anchors, attribution, *, del_start, del_end, new_text,
     построили автоматические записи в треды, которые говорили неправду и
     были удалены (#22).
 
+    `shift` — сдвиг, который добавят к результату ДРУГИЕ части того же
+    батча, стоящие левее этой (T9: левая часть пишется последней и двигает
+    всё правее себя, ничего там не пересекая). Он входит только в
+    `range_after`: голова и хвост считаются по пересечению, а оно живёт в
+    одном координатном пространстве с якорями.
+
     Возвращает (effects, affected_comment_ids).
     """
     delta = _utf16_len(new_text) - (del_end - del_start)
@@ -5320,8 +5332,9 @@ def _anchor_effects(anchors, attribution, *, del_start, del_end, new_text,
                  "text_before": a_text}
         if rewritten_cid is not None and cid == rewritten_cid:
             # M26-C: три запроса оставляют якорь ровно на вписанном тексте.
-            entry.update(range_after=[del_start,
-                                      del_start + _utf16_len(new_text)],
+            entry.update(range_after=[del_start + shift,
+                                      del_start + shift
+                                      + _utf16_len(new_text)],
                          text_after=new_text, effect="rewritten")
         else:
             head_len = max(0, min(a_e, del_start) - a_s)
@@ -5339,8 +5352,9 @@ def _anchor_effects(anchors, attribution, *, del_start, del_end, new_text,
                 absorbed = bool(head_len and tail_len and new_text)
                 entry.update(
                     range_after=[
-                        a_s if head_len else del_start + _utf16_len(new_text),
-                        a_e + delta if tail_len else del_start],
+                        (a_s if head_len
+                         else del_start + _utf16_len(new_text)) + shift,
+                        (a_e + delta if tail_len else del_start) + shift],
                     text_after=_anchor_text_after(
                         a_text, a_e - a_s, head_len, tail_len,
                         new_text if absorbed else ""),
@@ -5377,7 +5391,7 @@ def _anchor_text_after(a_text, span_len, head_len, tail_len, inserted):
 
 def _effect_receipt(source, applied_as, *, start, end, old_text, new_text,
                     anchors=None, attribution=None, rewritten_cid=None,
-                    unknown_ids=None, note=None, **extra):
+                    unknown_ids=None, note=None, effects=None, **extra):
     """Квитанция одной успешно применённой операции.
 
     Диапазоны и тексты здесь — фактически выполненные, а не заказанные:
@@ -5390,7 +5404,12 @@ def _effect_receipt(source, applied_as, *, start, end, old_text, new_text,
              "range_before": [start, end],
              "range_after": [start, start + _utf16_len(new_text)],
              "text_before": old_text, "text_after": new_text}
-    if anchors is None:
+    if effects is not None:
+        # Разбор посчитан вызывающим: у правки вокруг якоря батч не сводится к
+        # одной паре «удаление и вставка», и считать его здесь значило бы
+        # повторять геометрию операции в общем месте (#33).
+        entry.update(effects)
+    elif anchors is None:
         # Путь без экспортной карты: вставка ничего не удаляет и потому карту
         # не строит (C5). Промолчать здесь нельзя — пустой список эффектов
         # прочитался бы как «ни один комментарий не задет», а это не то же
@@ -5981,7 +6000,8 @@ def _check_occurrence_stability(r, expected):
 # существуют только в свежей карте выгрузки, а она строится под самой
 # записью. Плановая фаза их не резолвит и не может — это свойство задачи, а
 # не ошибка входа, и путать одно с другим нельзя (ревью codex).
-_LATE_BOUND_OPS = frozenset(("replace_anchor",))
+_LATE_BOUND_OPS = frozenset(("replace_anchor",
+                             "replace_around_anchor"))
 
 
 def _validate_anchor_op(op):
@@ -6043,6 +6063,34 @@ def _resolve_anchor_target(op, doc_tab, snap, tid, file_id):
     """
     cid, new_text = _validate_anchor_op(op)
     source = f"comment={cid!r}"
+    start, end, here = _locate_thread_anchor(cid, doc_tab, snap, file_id,
+                                             source)
+    return {"op": "replace_anchor", "start": start, "end": end,
+            "text": new_text, "kind": "replace",
+            "affect_start": start, "affect_end": end,
+            "source": source, "tab_id": tid, "comment_id": cid,
+            "quote_total": None}
+
+
+def _locate_thread_anchor(cid, doc_tab, snap, file_id, source):
+    """Место треда в этой вкладке: (start, end, текст под комментарием).
+
+    Общая часть всех операций, чей адрес — тред, а не текст. Выделена из
+    `_resolve_anchor_target` под T9: дублировать ограды в самом опасном месте
+    проекта значит однажды поправить одну копию.
+
+    Два условия, и оба обязательны: во ВСЁМ документе у треда ровно одно
+    физическое место (иначе выбирать копию пришлось бы за человека), и это
+    место размещено в выбранной вкладке доказанно, то есть попало в
+    `snap["anchors"]`. Второе не следует из первого: маппер не размещает
+    якорь, чью копию он не смог отличить от близнеца, и такой якорь физически
+    один, но координат у него нет.
+
+    Номер `w:id` адресом не является нигде: Google назначает его сам, и смерть
+    чужого якоря сдвигает нумерацию остальных (замерено, M28-E; ещё раз видно
+    в пробе M30-E, где импорт трёх диапазонов дал три треда с переназначенными
+    номерами).
+    """
     places = (snap.get("thread_places") or {}).get(cid)
     link = _thread_link(file_id, cid)
     where = f" {link}" if link else ""
@@ -6100,11 +6148,7 @@ def _resolve_anchor_target(op, doc_tab, snap, tid, file_id):
             f"({source})",
             reason="unsupported_structure",
             details={"construct": "paragraph_boundary"})
-    return {"op": "replace_anchor", "start": start, "end": end,
-            "text": new_text, "kind": "replace",
-            "affect_start": start, "affect_end": end,
-            "source": source, "tab_id": tid, "comment_id": cid,
-            "quote_total": None}
+    return start, end, here
 
 
 def _anchor_target_gate(doc_tab, start, end, source, named_intervals):
@@ -6142,6 +6186,639 @@ def _anchor_target_gate(doc_tab, start, end, source, named_intervals):
                 f"через неё. ({source})",
                 reason="named_range_overlap",
                 details={"label": label, "range": [ns, ne]})
+
+
+# --------------------------------------------------------------------------
+# T9 (#33): `replace_around_anchor` — правка, СТИРАЮЩАЯ прокомментированное
+# слово и одновременно правящая текст вокруг него.
+#
+# `replace_anchor` переписывает якорь непустым текстом; если слово надо убрать
+# вовсе, якорь схлопывается в ноль и разговор уходит в историю комментариев.
+# Правило владельца: посадить якорь на СОСЕДНЕЕ слово и сказать об этом в
+# треде. Ответ в тред — забота T10, здесь только правка и честная квитанция.
+#
+# Контракт без единого числа: вызывающий называет видимый старый внешний текст
+# (`quote`) и новый по обе стороны (`with.before`, `with.after`). Итог внешнего
+# диапазона — `before + after`. Смещения, старый текст якоря и посадочную
+# позицию считает движок; композиция замерена в M30.
+# --------------------------------------------------------------------------
+
+# Дефисы и апострофы, которые СКЛЕИВАЮТ слово, когда стоят между двумя
+# словными символами: «из-за», «по‐русски», «3-летний», «l’esprit».
+_WORD_CONNECTORS = frozenset("-‐‑'’")
+
+# Письменности без пробельной сегментации. Максимальный ряд букв в них — не
+# слово, а предложение, и «носитель» вышел бы длиной с абзац. Пересадить на
+# такое комментарий хуже, чем отказать.
+_UNSEGMENTED_SCRIPTS = (
+    (0x0E00, 0x0EFF),    # тайская, лаосская
+    (0x1000, 0x109F),    # бирманская
+    (0x1780, 0x17FF),    # кхмерская
+    (0x2E80, 0x2FDF),    # ключи CJK
+    (0x3040, 0x30FF),    # хирагана, катакана
+    (0x3400, 0x4DBF),    # CJK расширение A
+    (0x4E00, 0x9FFF),    # CJK
+    (0xF900, 0xFAFF),    # CJK совместимость
+    (0x20000, 0x2FA1F),  # CJK расширения B+
+)
+
+# Знаки, вокруг которых наша проверка графемных кластеров неполна: keycap и
+# селекторы начертания. `_splits_grapheme_cluster` — перечень известных
+# продолжений, а не сегментация UAX #29 (сказано вслух в M30), поэтому
+# кандидат с ними отклоняется, а не разрезается на удачу.
+_CLUSTER_RISK = frozenset([0x20E3] + list(range(0xFE00, 0xFE10)))
+
+
+def _is_word_char(ch):
+    """Символ, который может стоять ВНУТРИ слова."""
+    return unicodedata.category(ch)[0] in ("L", "M", "N")
+
+
+def _is_word_core(ch):
+    """Символ, который делает ряд словом и может его открыть.
+
+    `Lm` исключён намеренно: одиночный модификатор вроде `U+02BC` иначе
+    оказался бы словом, и комментарий переехал бы на апостроф.
+    """
+    cat = unicodedata.category(ch)
+    return (cat[0] == "L" and cat != "Lm") or cat[0] == "N"
+
+
+def _in_unsegmented_script(ch):
+    o = ord(ch)
+    return any(lo <= o <= hi for lo, hi in _UNSEGMENTED_SCRIPTS)
+
+
+def _lexical_word_spans(text):
+    """Границы слов по правилу T9, в кодовых точках.
+
+    Ряд начинается со «стержня» (`L` кроме `Lm`, либо `N`), продолжается
+    любыми словными символами и склеивается соединителем, только когда с обеих
+    сторон от него стоят словные символы. `M*` входит в слово — это же держит
+    букву со знаком ударения вместе с буквой.
+    """
+    spans, i, n = [], 0, len(text)
+    while i < n:
+        if not _is_word_core(text[i]):
+            i += 1
+            continue
+        j = i + 1
+        while j < n:
+            if _is_word_char(text[j]):
+                j += 1
+                continue
+            # Слева от соединителя словный символ стоит ВСЕГДА: в этот цикл
+            # входят только после стержня, а каждый шаг кончается либо словным
+            # символом, либо стержнем после соединителя. Проверка на левого
+            # соседа тут стояла и была недостижима — мутационный стенд её
+            # пережил, потому что вызвать её нечем. Недостижимая проверка это
+            # не защита, а обещание защиты (тот же разбор, что в T4).
+            if (text[j] in _WORD_CONNECTORS and j + 1 < n
+                    and _is_word_core(text[j + 1])):
+                j += 2
+                continue
+            break
+        spans.append((i, j))
+        i = j
+    return spans
+
+
+def _carrier_span(text, first):
+    """Кандидат в носители: первое слово текста либо последнее.
+
+    Возвращает ((начало, конец), None) либо (None, причина). Причина —
+    машинный ярлык для отказа, человеческие слова собираются выше.
+    """
+    spans = _lexical_word_spans(text)
+    if not spans:
+        return None, "no_word"
+    cs, ce = spans[0] if first else spans[-1]
+    word = text[cs:ce]
+    if any(_in_unsegmented_script(ch) for ch in word):
+        return None, "unsegmented_script"
+    if any(ord(ch) in _CLUSTER_RISK for ch in word):
+        return None, "grapheme_cluster"
+    # Cf рядом с границей — это `Prepend` (арабский знак числа перед буквой)
+    # либо ZWJ/ZWNJ, продолжающий кластер наружу. Ни то, ни другое наша
+    # проверка не распознаёт, поэтому граница считается небезопасной.
+    if any(unicodedata.category(ch) == "Cf" for ch in word):
+        return None, "grapheme_cluster"
+    if cs > 0 and unicodedata.category(text[cs - 1]) == "Cf":
+        return None, "grapheme_cluster"
+    if ce < len(text) and unicodedata.category(text[ce]) == "Cf":
+        return None, "grapheme_cluster"
+    return (cs, ce), None
+
+
+def _around_carrier_split(before, after):
+    """Носитель и три новые части. Разрез ПОЗИЦИОННЫЙ, а не строковый.
+
+    Носитель не обязан стоять с краю своей вставки: `after` может начинаться с
+    пробела. Поэтому то, что стоит в `after` ДО носителя, уходит в левую
+    вставку, а не теряется, — и итог всегда ровно `before + after`.
+
+    Возвращает (план, None) либо (None, причина).
+    """
+    span, why_right = _carrier_span(after, first=True)
+    if span:
+        cs, ce = span
+        return {"carrier": after[cs:ce], "left": before + after[:cs],
+                "right": after[ce:], "side": "after"}, None
+    if why_right != "no_word":
+        # Слово справа ЕСТЬ, оно отклонено по безопасности — молча уехать на
+        # левое значит поставить разговор не с той стороны от правки и не
+        # сказать об этом. Контракт обещает запасное левое слово только когда
+        # справа слова нет (ревью кода).
+        return None, why_right
+    span, why_left = _carrier_span(before, first=False)
+    if span:
+        cs, ce = span
+        return {"carrier": before[cs:ce], "left": before[:cs],
+                "right": before[ce:] + after, "side": "before"}, None
+    return None, why_left
+
+
+_AROUND_NO_CARRIER = {
+    "no_word": "по обе стороны от него не осталось ни одного слова, на "
+               "которое можно посадить разговор. Оставьте рядом хотя бы одно "
+               "слово — комментарий переедет на него",
+    "unsegmented_script": "соседний текст написан письменностью без пробелов "
+                          "между словами, и отделить в нём одно слово нечем — "
+                          "правьте этот фрагмент вручную",
+    "grapheme_cluster": "соседнее слово нельзя отделить, не разрезав символ: "
+                        "рядом стоит эмодзи или служебный знак склейки. "
+                        "Выберите другое место правки",
+}
+
+
+def _validate_around_op(op):
+    """Схема `replace_around_anchor`, проверяемая до карты и до всякой записи.
+
+    Как и у `replace_anchor`, ошибка схемы обязана выглядеть ошибкой схемы, а
+    не «цель не разрешилась»: иначе опечатка в `comment_id` потерялась бы
+    среди нормального для этой операции позднего разрешения.
+
+    Возвращает (comment_id, quote, before, after).
+    """
+    cid = op.get("comment_id")
+    if not isinstance(cid, str) or not cid.strip():
+        _error(f"replace_around_anchor: нужен непустой строковый "
+               f"'comment_id' — id треда из выдачи `comments`. {op}")
+    quote = op.get("quote")
+    if not isinstance(quote, str) or not quote:
+        _error(f"replace_around_anchor: нужна непустая 'quote' — видимый "
+               f"текст вокруг комментария вместе с ним самим. {op}")
+    if "\x00" in quote:
+        _error(f"quote must not contain NUL characters: {op}")
+    with_ = op.get("with")
+    if not isinstance(with_, dict):
+        _error(
+            f"replace_around_anchor: 'with' — это объект с полями 'before' и "
+            f"'after': новый текст слева от комментария и справа. Итоговый "
+            f"текст фрагмента — before + after. {op}",
+            reason="unsupported_structure",
+            details={"construct": "with_not_object"})
+    before, after = with_.get("before", ""), with_.get("after", "")
+    if not isinstance(before, str) or not isinstance(after, str):
+        _error(f"replace_around_anchor: 'before' и 'after' — строки. {op}")
+    if not (before or after):
+        _error(
+            f"replace_around_anchor: обе стороны пусты — от фрагмента не "
+            f"осталось бы ничего, и разговору не на чем держаться. Чтобы "
+            f"убрать текст целиком, нужна отдельная правка. {op}",
+            reason="unsupported_structure",
+            details={"construct": "empty_replacement"})
+    for name, text in (("quote", quote), ("before", before), ("after", after)):
+        if "\n" in text:
+            _error(
+                f"replace_around_anchor: перевод строки в {name!r} — эта "
+                f"правка работает внутри одного абзаца. Разбейте её на "
+                f"правки по абзацам. {op}",
+                reason="unsupported_structure",
+                details={"construct": "paragraph_boundary"})
+        bad = _OP_TEXT_FORBIDDEN.search(text)
+        if bad:
+            _error(
+                f"op text holds a character Docs does not keep as written "
+                f"({bad.group()!r} = U+{ord(bad.group()):04X}), so what would "
+                f"land is not what the positions were computed for. {op}")
+    return cid, quote, before, after
+
+
+def _resolve_around_target(op, doc_tab, snap, tid, file_id):
+    """Разрешить `replace_around_anchor` в две пары координат.
+
+    Сначала место треда (общая часть с `replace_anchor`), затем ТАКОЕ
+    вхождение `quote`, которое содержит точный диапазон якоря. Глобальная
+    уникальность цитаты не требуется — её роль здесь не адрес, а свидетель
+    границ правки; адресом остаётся тред.
+    """
+    cid, quote, before, after = _validate_around_op(op)
+    source = f"comment={cid!r}"
+    a_s, a_e, anchor_text = _locate_thread_anchor(cid, doc_tab, snap, file_id,
+                                                  source)
+    buf, imap = _text_buffer(doc_tab)
+    hits, pos = [], 0
+    while True:
+        idx = buf.find(quote, pos)
+        if idx == -1:
+            break
+        o_s = imap[idx]
+        last = quote[-1]
+        o_e = imap[idx + len(quote) - 1] + (2 if ord(last) > 0xFFFF else 1)
+        if o_s <= a_s and a_e <= o_e:
+            hits.append((o_s, o_e))
+        pos = idx + 1
+    link = _thread_link(file_id, cid)
+    where = f" {link}" if link else ""
+    if not hits:
+        _error(
+            f"цитата не охватывает место комментария {cid}{where}: под ним "
+            f"стоит «{anchor_text[:60]}», и ни одно вхождение цитаты его не "
+            f"содержит. Возьмите текст вокруг комментария так, как он выглядит "
+            f"сейчас. ({source})",
+            reason="quote_not_found",
+            details={"quote": quote, "anchor_text": anchor_text})
+    if len(hits) > 1:
+        _error(
+            f"цитата охватывает место комментария {cid}{where} сразу "
+            f"{len(hits)} раз — скрепка не станет выбирать за вас, какой "
+            f"фрагмент править. Возьмите цитату длиннее. ({source})",
+            reason="quote_ambiguous",
+            details={"quote": quote, "matches": len(hits)})
+    o_s, o_e = hits[0]
+    here = _extract_exact_text_range(doc_tab, o_s, o_e)
+    if here != quote:
+        _error(
+            f"текст фрагмента в документе изменился под правкой "
+            f"({here!r} против {quote!r}) — повторите через минуту. "
+            f"({source})",
+            reason="concurrent_edit",
+            details={"expected": quote, "found": here})
+    return {"op": "replace_around_anchor", "start": o_s, "end": o_e,
+            "text": before + after, "kind": "replace",
+            "affect_start": o_s, "affect_end": o_e,
+            "source": source, "tab_id": tid, "comment_id": cid,
+            "quote_total": None,
+            "anchor_start": a_s, "anchor_end": a_e,
+            "anchor_text": anchor_text, "before": before, "after": after,
+            "file_id": file_id, "quote_text": here}
+
+
+def _around_parts(doc_tab, r, split):
+    """Три части правки как (вид, старый диапазон, старый текст, новый текст).
+
+    Часть, у которой старый текст равен новому, не попадает сюда вовсе. Это не
+    оптимизация: тождественная замена сначала удаляет, потом вставляет, и
+    удаление убило бы чужой тред внутри этой части ради записи того же самого
+    текста. Обычный случай «убери слово, остальное оставь» закрывается этим
+    сам собой.
+    """
+    o_s, o_e = r["start"], r["end"]
+    a_s, a_e = r["anchor_start"], r["anchor_end"]
+    old_left = _extract_exact_text_range(doc_tab, o_s, a_s) or ""
+    old_right = _extract_exact_text_range(doc_tab, a_e, o_e) or ""
+    out = []
+    for kind, (s, e), old, new in (
+            ("left", (o_s, a_s), old_left, split["left"]),
+            ("anchor", (a_s, a_e), r["anchor_text"], split["carrier"]),
+            ("right", (a_e, o_e), old_right, split["right"])):
+        if old != new:
+            out.append({"kind": kind, "start": s, "end": e,
+                        "old": old, "new": new})
+    return out
+
+
+def _write_footprint(parts):
+    """След записи: что реально удаляется и куда реально вставляется.
+
+    Возвращает (удаления, точки вставки) — и то и другое в ИСХОДНЫХ
+    координатах. Однородным списком интервалов это быть не может: запросы
+    живут в разных промежуточных координатах, а диапазоны стиля оформляют
+    только что вставленный текст, которого в исходной карте сущностей нет
+    вовсе (ревью плана, круг 3). Точка вставки — это точка, а не пустой
+    интервал: `[p, p)` не пересекает вообще ничего.
+    """
+    dels = [(p["start"], p["end"]) for p in parts if p["end"] > p["start"]]
+    points = sorted({p["start"] for p in parts if p["new"]})
+    return dels, points
+
+
+def _around_doomed(dels, anchors, attribution, own_cid):
+    """Чужие треды, гибнущие от ОБЪЕДИНЕНИЯ фактических удалений.
+
+    Настоящая композиционная дыра этой операции: один чужой тред с двумя
+    якорями — один целиком в левой части, другой целиком в правой. Каждая
+    часть по отдельности оставляет тред живым, вместе они убивают последний
+    якорь. Считать обречённость по частям значит её не увидеть.
+
+    Считать по всему внешнему диапазону тоже неверно: пропущенная часть
+    ничего не удаляет, и отказ пришёлся бы на документ, которому ничего не
+    грозит.
+
+    Смысл тот же, что у `_doomed_threads`: тред умирает от накрытия
+    ПОСЛЕДНЕГО своего якоря, а не любого. Геометрия «два якоря по разные
+    стороны» импортом docx не воспроизводится (проба M30-E: Google
+    перенумеровывает `w:id` и заводит отдельные треды), поэтому правило
+    опирается на прежний замер `_doomed_threads`, а не на живой стенд, и
+    держится юнит-тестом. Названо вслух, чтобы не читалось как замеренное.
+    """
+    covered = lambda s, e: any(ds <= s and e <= de for ds, de in dels)  # noqa: E731
+    by_thread, loose = {}, []
+    for span in anchors:
+        cid = (attribution or {}).get(span[3])
+        if cid == own_cid:
+            continue          # свой тред переписывается, а не гибнет
+        if cid:
+            by_thread.setdefault(cid, []).append(span)
+        else:
+            loose.append(span)
+    out = [(cid, spans) for cid, spans in by_thread.items()
+           if all(covered(s[0], s[1]) for s in spans)]
+    out += [(None, [sp]) for sp in loose if covered(sp[0], sp[1])]
+    return out
+
+
+def _around_style_for(doc_tab, start, end, fallback, source, why):
+    """Стиль одной части и отказ, когда его нет одного на всю часть.
+
+    Нулевая ширина старой стороны — не повод молчать: `_range_style` вернул бы
+    там пустой словарь, а он уходит с маской по ВСЕМ полям и означает «сними
+    оформление», а не «унаследуй». Поэтому у пустой стороны стиль берётся у
+    якоря — единственного, что заведомо есть внутри внешнего диапазона.
+    """
+    if end <= start:
+        return fallback()
+    problem = _style_refusal(doc_tab, start, end, source)
+    if problem:
+        _error(f"{problem} ({why})")
+    return _range_style(doc_tab, start, end)
+
+
+def _around_styles(doc_tab, r, split, parts):
+    """Стиль по частям: носитель наследует ТУ сторону, из чьего текста он взят.
+
+    Решение владельца (ревью плана, круг 3). Альтернатива «весь внешний
+    диапазон однороден, пёстрый — отказ» отвергнута: она отрезает обычный
+    случай «прокомментированное слово жирное, соседнее обычное», а типичный
+    документ заказчика пёстрый почти всегда.
+
+    Однородность стороны требуется по ДВУМ основаниям: она поставляет непустую
+    боковую вставку ЛИБО поставляет носитель. Одного первого мало — `after`
+    может состоять ровно из слова-носителя, тогда правая вставка пуста, а
+    стиль для носителя всё равно читается с правой стороны (ревью, круг 3).
+    """
+    o_s, o_e = r["start"], r["end"]
+    a_s, a_e = r["anchor_start"], r["anchor_end"]
+    src = (a_e, o_e) if split["side"] == "after" else (o_s, a_s)
+
+    def anchor_fallback():
+        """Стиль якоря — запасной, и спрашивать его молча нельзя.
+
+        `_range_style` берёт первый пересекающий ран и на пёстром якоре выдал
+        бы стиль его начала за стиль целого: ссылка или жирность расползлись
+        бы на всё новое слово. Однородность требуется ровно тогда, когда этот
+        стиль реально идёт в дело (ревью кода).
+        """
+        problem = _style_refusal(doc_tab, a_s, a_e, r["source"])
+        if problem:
+            _error(f"{problem} (оформление берётся с прокомментированного "
+                   f"слова: с той стороны, откуда взято новое, брать нечего)")
+        return _range_style(doc_tab, a_s, a_e)
+    by_kind = {p["kind"]: p for p in parts}
+    styles = {}
+    for kind, (s, e) in (("left", (o_s, a_s)), ("right", (a_e, o_e))):
+        part = by_kind.get(kind)
+        supplies_carrier = (s, e) == src and "anchor" in by_kind
+        if not (part and part["new"]) and not supplies_carrier:
+            continue
+        styles[kind] = _around_style_for(doc_tab, s, e, anchor_fallback,
+                                         r["source"], f"часть {kind}")
+    if "anchor" in by_kind:
+        styles["anchor"] = (styles.get("left" if split["side"] == "before"
+                                       else "right")
+                            if src[1] > src[0] else anchor_fallback())
+        if styles["anchor"] is None:
+            styles["anchor"] = anchor_fallback()
+    return styles
+
+
+def _around_effects(doc_tab, r, split, parts, anchors, attribution,
+                    unknown_ids):
+    """Что правка сделала с текстом под каждым задетым комментарием.
+
+    Геометрия сводит задачу к одной части на якорь: чужой якорь не может
+    пересекать якорную часть — `_rewrite_anchor_requests` отклоняет любое
+    пересечение с ней, — значит он лежит целиком слева от начала якоря либо
+    целиком справа от его конца и задет ровно ОДНОЙ боковой частью.
+
+    Правой части нужен сдвиг δ_A + δ_L, а не δ_A: левая часть пишется
+    ПОСЛЕДНЕЙ и двигает всё правее себя, ничего там не пересекая. Замерено на
+    M30-D: чужой якорь вернулся ровно там, где ждала эта формула, а ошибка
+    «только δ_A» оставила бы текст верным и промахнулась диапазоном.
+    """
+    o_s, a_s, a_e = r["start"], r["anchor_start"], r["anchor_end"]
+    l_new = _utf16_len(split["left"])
+    a_new = _utf16_len(split["carrier"])
+    d_l = l_new - (a_s - o_s)
+    d_a = a_new - (a_e - a_s)
+    effects, affected = [], []
+    for part in parts:
+        if part["kind"] == "anchor":
+            continue
+        shift = (d_a + d_l) if part["kind"] == "right" else 0
+        got, ids = _anchor_effects(
+            anchors, attribution, del_start=part["start"],
+            del_end=part["end"], new_text=part["new"], shift=shift)
+        effects.extend(got)
+        for cid in ids:
+            if cid not in affected:
+                affected.append(cid)
+    if any(p["kind"] == "anchor" for p in parts):
+        # Свой тред считается прямо, а не арифметикой по частям: его якорь
+        # переписан протоколом M26-C, и M30 показал, что он ложится ровно на
+        # носителя, не поглощая ни левую вставку, ни правую.
+        effects.append({
+            "comment_id": r["comment_id"],
+            "range_before": [a_s, a_e], "text_before": r["anchor_text"],
+            "range_after": [o_s + l_new, o_s + l_new + a_new],
+            "text_after": split["carrier"], "effect": "reseated"})
+        if r["comment_id"] not in affected:
+            affected.append(r["comment_id"])
+    entry = {"effects_basis": ("export-map-open-threads-only" if unknown_ids
+                               else "export-map"),
+             "affected_comment_ids": affected, "anchor_effects": effects}
+    if unknown_ids:
+        entry["unknown_effect_comment_ids"] = list(unknown_ids)
+    return entry
+
+
+def _replace_around_plan(doc_tab, r, snap, named_intervals, closed_present):
+    """Запросы одного батча для `replace_around_anchor` плюс разбор эффекта.
+
+    Порядок фиксирован как СЕМАНТИЧЕСКИЙ инвариант, а не деталь реализации:
+    вставка строго внутрь якоря им поглощается, на границе — нет (M28).
+    Порядок решает, где окажется разговор. Контроль в M30: тот же батч с
+    обратным порядком дал «Мы кратко обсудил подробноодробно» и убил якорь.
+
+    Возвращает (requests, split, parts) либо поднимает отказ.
+    """
+    source, cid = r["source"], r["comment_id"]
+    o_s = r["start"]
+    a_s, a_e = r["anchor_start"], r["anchor_end"]
+    anchors = snap["anchors"]
+    attribution = snap.get("attribution") or {}
+    link = _thread_link(r.get("file_id"), cid)
+    where = f" {link}" if link else ""
+
+    split, why = _around_carrier_split(r["before"], r["after"])
+    if split is None:
+        _error(
+            f"правка убирает слово «{r['anchor_text'][:40]}», на котором "
+            f"висит комментарий {cid}{where}, а {_AROUND_NO_CARRIER[why]}. "
+            f"({source})",
+            reason="unsupported_structure",
+            details={"construct": "no_carrier_word", "why": why})
+
+    parts = _around_parts(doc_tab, r, split)
+    if not parts:
+        return None, split, parts        # честный ноль: писать нечего
+
+    dels, points = _write_footprint(parts)
+    for s, e in dels:
+        _refuse_on_suggestion_range(doc_tab, s, e, source)
+    for p in points:
+        _refuse_on_suggestion_at(doc_tab, p, source)
+    # Оглавление проверяется ЯВНО: адрес по треду идёт мимо буфера тела, и
+    # доказательство недостижимости из T4 на этот путь не переносится.
+    for ts, te, label in (_table_of_contents_intervals(doc_tab)
+                          + list(named_intervals)):
+        touched = any(_ranges_overlap(s, e, ts, te) for s, e in dels)
+        # Точка вставки — точка: `[p, p)` не пересекает ничего вовсе. На
+        # границе сущности отказываем консервативно: включит ли Google
+        # вставленный там текст в сущность, зависит от affinity и НЕ замерено
+        # (M30, раздел «чего не отвечает»).
+        touched = touched or any(ts <= p <= te for p in points)
+        if touched:
+            _error(
+                f"правка задевает {label} (диапазон [{ts}, {te})) — "
+                f"отклонена ИМЕННО ЭТА операция, остальной документ правится. "
+                f"({source})",
+                reason=("unsupported_structure" if label == "оглавление"
+                        else "named_range_overlap"),
+                details=({"construct": "table_of_contents", "range": [ts, te]}
+                         if label == "оглавление"
+                         else {"label": label, "range": [ts, te]}))
+    hits = [h for s, e in dels for h in _blocked_hits(s, e, snap["blocked"])]
+    # Вставка ничего не удаляет, но СТРОГО ВНУТРИ якоря она меняет текст под
+    # ним (M28), а по огороженному якорю карта честного эффекта не посчитает —
+    # квитанция промолчала бы о реально изменённом комментарии. Границы
+    # остаются разрешёнными: на них якорь вставку не поглощает. Считается
+    # ОТДЕЛЬНО от удалений, а не внутри их цикла: у правки, которая только
+    # дописывает, удалений нет вовсе, и проверка внутри цикла не выполнилась
+    # бы ни разу (своя ошибка, поймана при написании теста к ревью).
+    hits += [(bs, be, label) for bs, be, label in snap["blocked"]
+             if any(bs < p < be for p in points)]
+    if hits:
+        bs, be, label = hits[0]
+        _error(
+            f"эта правка задевает {label} (диапазон [{bs}, {be})) — "
+            f"отклонена ИМЕННО ЭТА операция. ({source})",
+            reason="named_range_overlap",
+            details={"label": label, "range": [bs, be]})
+    # Довод «чужой якорь задет ровно одной частью» держится на ограде внутри
+    # `_rewrite_anchor_requests`, а её нет, когда якорная часть тождественна и
+    # не испускается вовсе: тогда чужой якорь может тянуться из левого
+    # удаления через нетронутую середину в правое. Композиция двух частичных
+    # удалений на ОДНОМ якоре не замерена, и арифметика эффекта выдала бы на
+    # него две записи с одним `text_before` и неверными промежуточными
+    # диапазонами. Отказ до записи (ревью кода).
+    for a_s_f, a_e_f, a_text, a_id in anchors:
+        if attribution.get(a_id) == cid:
+            continue
+        # Считаются ВОЗДЕЙСТВУЮЩИЕ части, а не пересекающие удаления. Первая
+        # редакция смотрела только на удаления и пропускала геометрию, где их
+        # нет вовсе: внешний диапазон равен якорю, носитель ему тождествен,
+        # обе стороны — чистые вставки, а чужой якорь охватывает обе точки. По
+        # M28 обе вставки войдут в него (ревью кода, круг 2). Удаление и
+        # вставка ОДНОЙ части — одно воздействие.
+        touched = sum(
+            1 for part in parts
+            if (part["end"] > part["start"]
+                and _ranges_overlap(a_s_f, a_e_f, part["start"], part["end"]))
+            or (part["new"] and a_s_f < part["start"] < a_e_f))
+        if touched > 1:
+            _error(
+                f"эта правка режет текст под чужим комментарием сразу в двух "
+                f"местах («{a_text[:60]}»), и что от него останется, скрепка "
+                f"честно посчитать не умеет. Разбейте её на две правки. "
+                f"({source})",
+                reason="comment_anchor_would_be_lost",
+                details={"comment_id": attribution.get(a_id),
+                         "anchor_text": a_text})
+    doomed = _around_doomed(dels, anchors, attribution, cid)
+    if doomed:
+        d_cid, spans = doomed[0]
+        atext = spans[0][2]
+        who = (f"треда {d_cid}" if d_cid
+               else f"комментария (docx id {spans[0][3]})")
+        _error(
+            f"эта правка стёрла бы весь текст, на котором держится {who} "
+            f"(«{atext[:60]}»), и разговор пропал бы из панели. Оставьте от "
+            f"него хотя бы слово или правьте фрагмент короче. ({source})",
+            reason="comment_anchor_would_be_lost",
+            details={"comment_id": d_cid, "anchor_text": atext})
+
+    styles = _around_styles(doc_tab, r, split, parts)
+    by_kind = {p["kind"]: p for p in parts}
+    reqs, d_a = [], 0
+    if "anchor" in by_kind:
+        rewrite = _rewrite_anchor_requests(
+            doc_tab, r["anchor_text"], split["carrier"], a_s, a_e,
+            anchors, attribution, named_intervals,
+            closed_present=closed_present)
+        if not rewrite:
+            why_text = _why_no_rewrite(
+                doc_tab, r["anchor_text"], split["carrier"], a_s, a_e,
+                anchors, attribution, named_intervals,
+                closed_present=closed_present)
+            _error(
+                f"комментарий {cid}{where} не переехать на соседнее слово: "
+                f"{why_text} ({source})",
+                reason="comment_anchor_would_be_lost",
+                details={"comment_id": cid, "anchor_text": r["anchor_text"]})
+        a_new = _utf16_len(split["carrier"])
+        d_a = a_new - (a_e - a_s)
+        reqs.extend(rewrite[0])
+        # Маска стиля — ТОЛЬКО после обоих удалений: раньше носитель ещё не
+        # лежит на [a_s, a_s + A_new), там сидит старая голова, и маска легла
+        # бы не на тот текст. Замерено M30-A2: якорь был жирным, носитель
+        # вышел простым.
+        reqs.append({"updateTextStyle": {
+            "range": {"startIndex": a_s, "endIndex": a_s + a_new},
+            "textStyle": dict(styles["anchor"]),
+            "fields": ",".join(_STYLE_FIELDS)}})
+    for kind, base in (("right", a_e + d_a), ("left", o_s)):
+        part = by_kind.get(kind)
+        if not part:
+            continue
+        # Удаление и вставка порождаются НЕЗАВИСИМО: старая сторона бывает
+        # пустой при непустой новой — якорь стоял с краю фрагмента (M30-B), — и
+        # одним условием по ширине старой стороны половина результата
+        # потерялась бы.
+        if part["end"] > part["start"]:
+            reqs.append({"deleteContentRange": {"range": {
+                "startIndex": base,
+                "endIndex": base + (part["end"] - part["start"])}}})
+        if part["new"]:
+            reqs.append({"insertText": {"location": {"index": base},
+                                        "text": part["new"]}})
+            reqs.append({"updateTextStyle": {
+                "range": {"startIndex": base,
+                          "endIndex": base + _utf16_len(part["new"])},
+                "textStyle": dict(styles[kind]),
+                "fields": ",".join(_STYLE_FIELDS)}})
+    return reqs, split, parts
 
 
 def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
@@ -6353,7 +7030,35 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
                                 found["source"], named_intervals)
             return found, here, False
 
-        if by_anchor:
+        def _late_around():
+            """Цель и весь батч правки вокруг якоря.
+
+            Разрешение, ограды и сборка запросов у неё неразделимы: батч
+            строится по ФАКТИЧЕСКОМУ следу записи, а след известен только
+            после того, как выбран носитель и отброшены части, где старый
+            текст равен новому. Возвращает (цель, запросы, разрез, части).
+            """
+            found = _resolve_around_target(op, doc_tab, snap, tid, file_id)
+            reqs, split, parts = _replace_around_plan(
+                doc_tab, found, snap, named_intervals,
+                closed_present=any(c.get("resolved") for c in anchored_now))
+            return found, reqs, split, parts
+
+        around = split = parts = None
+        if by_anchor and kind_name == "replace_around_anchor":
+            r, around, split, parts = _owning_canary(_late_around)
+            if around is None:
+                # Настоящий ноль: ни одна из трёх частей ничего не меняет —
+                # значит и якорь остаётся ровно там, где стоял. Текстового
+                # равенства для этого мало: тот же текст можно получить
+                # другим разрезом, и тогда комментарий переезжает, а это
+                # работа, а не ноль (ревью плана, круг 2).
+                cleaned = _cleanup_canary(docs_service, file_id, canary)
+                return {"source": r["source"], "applied_as": "no-op",
+                        "note": _canary_msg(
+                            "текст вокруг комментария уже такой — ничего не "
+                            "записано", cleaned)}
+        elif by_anchor:
             r, search_text, nothing_to_do = _owning_canary(_late_target)
             if nothing_to_do:
                 cleaned = _cleanup_canary(docs_service, file_id, canary)
@@ -6362,89 +7067,94 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
                             "текст под комментарием уже такой — ничего не "
                             "записано", cleaned)}
 
-        # What this operation would cost as written. Blocked ranges: an anchor
-        # the accounting could not vouch for but WHOSE POSITION is known — any
-        # overlap counts, unlike a healthy anchor its survival under a partial
-        # rewrite is not something we can reason about. Doomed threads: full
-        # coverage ghosts a comment (C1), partial overlap is verified safe.
-        # (Inserts never reach here; they cannot remove text.)
         attribution = snap.get("attribution") or {}
-        start_at, end_at, applied_text = r["start"], r["end"], r["text"]
-        hits = _blocked_hits(start_at, end_at, snap["blocked"])
-        doomed = _doomed_threads(start_at, end_at, snap["anchors"], attribution)
-        # A pure deletion has no style question at all: there is no new text
-        # to format. The old refusal came from `replaceAllText`, which would
-        # have flattened the surviving runs — `deleteContentRange` touches no
-        # style. This is the header case «убрать ссылку „Бриф“» from the
-        # постмортем 2026-08-25, refused for a reason that never applied.
-        # A non-empty replacement still needs one style to state, so a mixed
-        # range remains a reason to narrow, and then to refuse.
-        style_problem = (
-            None if not applied_text
-            else _style_refusal(doc_tab, start_at, end_at, r["source"]))
-        narrowed = None
-        if hits or doomed or style_problem:
-            narrowed = _narrow_replace(
-                doc_tab, search_text, r["text"], start_at, end_at,
-                snap["anchors"], snap["blocked"], attribution,
-                interior_only=by_anchor)
-        rewrite, rewritten_cid = None, None
-        if narrowed:
-            # everything was re-checked inside the narrowing, on the range
-            # that will actually be written
-            search_text, applied_text, start_at, end_at = narrowed
-            hits, doomed, style_problem = [], [], None
-        elif doomed and not hits and not style_problem:
-            # Narrowing could not save the thread, so try what a person does
-            # by hand: write the new text inside the comment's selection and
-            # take the old one out. Every precondition is inside; None here
-            # means the refusal below stands exactly as before.
-            rewrite = _rewrite_anchor_requests(
-                doc_tab, search_text, r["text"], start_at, end_at,
-                snap["anchors"], attribution, named_intervals,
-                closed_present=any(c.get("resolved") for c in anchored_now))
-            if rewrite:
-                rewritten_cid = doomed[0][0]
-                doomed = []
-        if style_problem:
-            cleaned = _cleanup_canary(docs_service, file_id, canary)
-            _error(_canary_msg(style_problem, cleaned))
-        if hits:
-            bs, be, label = hits[0]
-            cleaned = _cleanup_canary(docs_service, file_id, canary)
-            _error(_canary_msg(
-                f"эта замена задевает {label} (диапазон [{bs}, {be})) — "
-                f"отклонена ИМЕННО ЭТА операция, остальной документ "
-                f"правится. ({r['source']})", cleaned),
-                reason="named_range_overlap",
-                details={"label": label, "range": [bs, be]})
-        if doomed:
-            cid, spans = doomed[0]
-            atext = spans[0][2]
-            link = _thread_link(file_id, cid)
-            who = (f"треда {cid} {link}" if link
-                   else f"комментария (docx id {spans[0][3]})")
-            cleaned = _cleanup_canary(docs_service, file_id, canary)
-            # Since #21 a fully-covered anchor CAN be rewritten whole. When
-            # that did not happen, the refusal must say what stopped it —
-            # otherwise the agent reads «impossible» and goes looking for the
-            # destructive path (#24).
-            # A closed thread used to be the usual answer here and no longer
-            # is: the gate it held is gone (M13). What remains are the
-            # rewrite's own preconditions, and they need telling apart —
-            # «оставьте часть исходного текста» is sound advice for exactly
-            # one of them and misleading for the rest (found in review).
-            why = " " + _why_no_rewrite(
-                doc_tab, search_text, r["text"], start_at, end_at,
-                snap["anchors"], attribution, named_intervals,
-                closed_present=any(c.get("resolved") for c in anchored_now))
-            _error(_canary_msg(
-                f"замена накрывает целиком последний якорь {who} "
-                f"(текст якоря «{atext[:60]}») — тред станет призраком (C1), "
-                f"и сузить её не получилось: меняется весь якорный текст."
-                f"{why} ({r['source']})", cleaned),
-                reason="comment_anchor_would_be_lost",
-                details={"comment_id": cid, "anchor_text": atext})
+        # Правка вокруг якоря собрала свой батч сама: у неё три части,
+        # свои ограды по фактическому следу и своя обречённость по
+        # объединению удалений. Общий расчёт стоимости — про ОДНУ
+        # замену, и применённый к ней сузил бы её же до неузнаваемости.
+        if around is None:
+            # What this operation would cost as written. Blocked ranges: an anchor
+            # the accounting could not vouch for but WHOSE POSITION is known — any
+            # overlap counts, unlike a healthy anchor its survival under a partial
+            # rewrite is not something we can reason about. Doomed threads: full
+            # coverage ghosts a comment (C1), partial overlap is verified safe.
+            # (Inserts never reach here; they cannot remove text.)
+            start_at, end_at, applied_text = r["start"], r["end"], r["text"]
+            hits = _blocked_hits(start_at, end_at, snap["blocked"])
+            doomed = _doomed_threads(start_at, end_at, snap["anchors"], attribution)
+            # A pure deletion has no style question at all: there is no new text
+            # to format. The old refusal came from `replaceAllText`, which would
+            # have flattened the surviving runs — `deleteContentRange` touches no
+            # style. This is the header case «убрать ссылку „Бриф“» from the
+            # постмортем 2026-08-25, refused for a reason that never applied.
+            # A non-empty replacement still needs one style to state, so a mixed
+            # range remains a reason to narrow, and then to refuse.
+            style_problem = (
+                None if not applied_text
+                else _style_refusal(doc_tab, start_at, end_at, r["source"]))
+            narrowed = None
+            if hits or doomed or style_problem:
+                narrowed = _narrow_replace(
+                    doc_tab, search_text, r["text"], start_at, end_at,
+                    snap["anchors"], snap["blocked"], attribution,
+                    interior_only=by_anchor)
+            rewrite, rewritten_cid = None, None
+            if narrowed:
+                # everything was re-checked inside the narrowing, on the range
+                # that will actually be written
+                search_text, applied_text, start_at, end_at = narrowed
+                hits, doomed, style_problem = [], [], None
+            elif doomed and not hits and not style_problem:
+                # Narrowing could not save the thread, so try what a person does
+                # by hand: write the new text inside the comment's selection and
+                # take the old one out. Every precondition is inside; None here
+                # means the refusal below stands exactly as before.
+                rewrite = _rewrite_anchor_requests(
+                    doc_tab, search_text, r["text"], start_at, end_at,
+                    snap["anchors"], attribution, named_intervals,
+                    closed_present=any(c.get("resolved") for c in anchored_now))
+                if rewrite:
+                    rewritten_cid = doomed[0][0]
+                    doomed = []
+            if style_problem:
+                cleaned = _cleanup_canary(docs_service, file_id, canary)
+                _error(_canary_msg(style_problem, cleaned))
+            if hits:
+                bs, be, label = hits[0]
+                cleaned = _cleanup_canary(docs_service, file_id, canary)
+                _error(_canary_msg(
+                    f"эта замена задевает {label} (диапазон [{bs}, {be})) — "
+                    f"отклонена ИМЕННО ЭТА операция, остальной документ "
+                    f"правится. ({r['source']})", cleaned),
+                    reason="named_range_overlap",
+                    details={"label": label, "range": [bs, be]})
+            if doomed:
+                cid, spans = doomed[0]
+                atext = spans[0][2]
+                link = _thread_link(file_id, cid)
+                who = (f"треда {cid} {link}" if link
+                       else f"комментария (docx id {spans[0][3]})")
+                cleaned = _cleanup_canary(docs_service, file_id, canary)
+                # Since #21 a fully-covered anchor CAN be rewritten whole. When
+                # that did not happen, the refusal must say what stopped it —
+                # otherwise the agent reads «impossible» and goes looking for the
+                # destructive path (#24).
+                # A closed thread used to be the usual answer here and no longer
+                # is: the gate it held is gone (M13). What remains are the
+                # rewrite's own preconditions, and they need telling apart —
+                # «оставьте часть исходного текста» is sound advice for exactly
+                # one of them and misleading for the rest (found in review).
+                why = " " + _why_no_rewrite(
+                    doc_tab, search_text, r["text"], start_at, end_at,
+                    snap["anchors"], attribution, named_intervals,
+                    closed_present=any(c.get("resolved") for c in anchored_now))
+                _error(_canary_msg(
+                    f"замена накрывает целиком последний якорь {who} "
+                    f"(текст якоря «{atext[:60]}») — тред станет призраком (C1), "
+                    f"и сузить её не получилось: меняется весь якорный текст."
+                    f"{why} ({r['source']})", cleaned),
+                    reason="comment_anchor_would_be_lost",
+                    details={"comment_id": cid, "anchor_text": atext})
         try:
             fp2 = _comments_fingerprint(drive_service, file_id)
         except Exception as e:
@@ -6468,7 +7178,12 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
         # no other network calls between the final census and the write;
         # the batch deletes the canary FIRST (atomic with the replace)
         try:
-            if rewrite:
+            if around is not None:
+                _execute_anchor_rewrite(
+                    docs_service, file_id, tid, around, snap["r1"],
+                    r["source"],
+                    extra_requests_before=[_canary_delete_request(canary)])
+            elif rewrite:
                 _execute_anchor_rewrite(
                     docs_service, file_id, tid, rewrite[0], snap["r1"],
                     r["source"],
@@ -6501,6 +7216,24 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
                 *_ambiguous_batch_outcome(
                     docs_service, file_id, canary,
                     f"anchor-safe replace batch failed (transport): {e}"))
+        if around is not None:
+            # Пересадкой правка зовётся, только когда якорь ДЕЙСТВИТЕЛЬНО
+            # переписан. Слово под комментарием иногда остаётся на месте — тем
+            # же именем это называть нельзя: T10 сообщил бы заказчику
+            # событие, которого не было (ревью кода).
+            moved = any(p["kind"] == "anchor" for p in parts)
+            return _effect_receipt(
+                r["source"], "reseated" if moved else "replace",
+                start=r["start"], end=r["end"],
+                old_text=r["quote_text"], new_text=r["text"],
+                effects=_around_effects(doc_tab, r, split, parts,
+                                        snap["anchors"], attribution,
+                                        closed_ids),
+                note=("прокомментированное слово убрано, разговор перевешен "
+                      "на соседнее слово — в треде об этом надо сказать")
+                if moved else
+                ("прокомментированное слово осталось на месте, изменилось "
+                 "только окружение"))
         if narrowed:
             # the operation that ran is textually not the one that was asked
             # for — the receipt has to say so
@@ -6622,7 +7355,10 @@ def patch_doc(file_id, ops_path, tab_id=None):
                 noops.append(False)
                 late_bound.add(i)
                 try:
-                    _validate_anchor_op(op)
+                    if op.get("op") == "replace_around_anchor":
+                        _validate_around_op(op)
+                    else:
+                        _validate_anchor_op(op)
                 except PatchOpError as e:
                     early_refusals[i] = str(e)
                     early_diag[i] = (e.reason, e.details)

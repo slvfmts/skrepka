@@ -286,8 +286,14 @@ def test_utf16_cut_refuses_what_it_cannot_do(engine):
 def test_every_declared_effect_is_one_the_contract_knows(engine):
     """Список эффектов закрыт, и в нём нет ни одного значения, которого
     никто не производит: непроизводимое значение — это обещание, а не
-    контракт (ту же ошибку убирали в T4 из недостижимой ограды)."""
-    produced = {e[3] for e in MEASURED if e[3]} | {"rewritten"}
+    контракт (ту же ошибку убирали в T4 из недостижимой ограды).
+
+    `rewritten` производит перезапись якоря (M26-C), `reseated` — правка
+    вокруг якоря, которая убирает прокомментированное слово и сажает разговор
+    на соседнее (#33, замерено M30: якорь ложится ровно на носителя, не
+    поглощая ни левую вставку, ни правую). Остальные — таблица MEASURED.
+    """
+    produced = {e[3] for e in MEASURED if e[3]} | {"rewritten", "reseated"}
     assert produced == engine._ANCHOR_EFFECTS
 
 
