@@ -6760,8 +6760,8 @@ def _replace_around_plan(doc_tab, r, snap, named_intervals, closed_present):
     if doomed:
         d_cid, spans = doomed[0]
         atext = spans[0][2]
-        who = (f"треда {d_cid}" if d_cid
-               else f"комментария (docx id {spans[0][3]})")
+        who = (f"тред {d_cid}" if d_cid
+               else f"комментарий (docx id {spans[0][3]})")
         _error(
             f"эта правка стёрла бы весь текст, на котором держится {who} "
             f"(«{atext[:60]}»), и разговор пропал бы из панели. Оставьте от "
