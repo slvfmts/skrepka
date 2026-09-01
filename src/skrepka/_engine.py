@@ -5,6 +5,7 @@ import argparse
 import copy
 import datetime
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -107,6 +108,7 @@ _REASON_CODES = frozenset((
     "comment_thread_has_multiple_anchors",  # у треда несколько якорей, и
                                     # выбирать копию за человека нельзя
     "unknown_write_outcome",        # исход записи неизвестен
+    "reply_journal_mismatch",       # журнал рядом с файлом — от другого прогона
 ))
 
 _DETAILS_CAP = 200  # длинная цитата в квитанции — это шум, а не диагностика
@@ -419,9 +421,14 @@ def _scan_suggestions(node):
 _COMMENT_FIELDS = (
     # `content` on replies costs nothing extra here and is what makes the
     # archive of a closed thread a real record of the conversation (r8).
-    "nextPageToken,comments(id,content,author/displayName,author/me,createdTime,"
+    "nextPageToken,comments(id,content,author/displayName,author/me,"
+    # permissionId — запасной путь опознать свой аккаунт, когда
+    # `about()` недоступен: журналу `reply` аккаунты надо РАЗЛИЧАТЬ, а
+    # два аккаунта бывают с одним отображаемым именем (T6).
+    "author/permissionId,createdTime,"
     "quotedFileContent,resolved,deleted,anchor,"
-    "replies(id,content,createdTime,author/displayName,author/me,deleted,action))"
+    "replies(id,content,createdTime,author/displayName,author/me,"
+    "author/permissionId,deleted,action))"
 )
 
 
@@ -483,11 +490,12 @@ def _key_owners_universe(raw_comments):
     for c in raw_comments:
         cid = c.get("id")
         for entry in [c] + list(c.get("replies") or []):
-            author = (entry.get("author") or {}).get("displayName")
-            created = entry.get("createdTime")
-            if author and created:
-                out.setdefault((author, _trunc_seconds(created)),
-                               set()).add(cid)
+            # Ключ строится ОДНИМ сборщиком на всех, кто им пользуется: учёт,
+            # предзаписной шлюз пакетного `reply` и его пост-проверка. Считать
+            # по-разному значит однажды разойтись (T6).
+            key = _second_key(entry)
+            if key:
+                out.setdefault(key, set()).add(cid)
     return out
 
 
@@ -7820,7 +7828,724 @@ def mark_range(file_id, name, quote, tab_id=None, occurrence=1):
 # Reply / resolve / create comment
 # ---------------------------------------------------------------------------
 
-def reply_comment(file_id, comment_id, text, resolve=False, yes=False):
+# --------------------------------------------------------------------------
+# T6 (#M27): секундный шлюз и пакетный `reply`.
+#
+# Ключ учёта якорей — `(author.displayName, секунда)`. Тред, у которого не
+# осталось НИ ОДНОГО уникального такого ключа, перестаёт опознаваться в
+# выгрузке, и тогда отказывают ВСЕ замены в документе, включая абзацы без
+# комментариев. Замерено M31 напрямую: два треда с одинаковым ключом корня
+# запирают документ, не получив ни одного ответа.
+#
+# Формулировка «два ответа в одну секунду блокируют документ» неточна, и M31 её
+# поправил: коллизия опасна ровно тем, что МОЖЕТ отнять у треда последнего
+# свидетеля. Когда у треда есть свой корень в отдельной секунде, коллизия
+# ответов ничего не ломает (замерено, шесть тредов).
+#
+# Отсюда роль шлюза: он не расшивает запертые документы — на это есть решение
+# владельца, — а не даёт скрепке отнять последнего свидетеля самой. Это
+# единственный способ, которым она может запереть чужой документ.
+# --------------------------------------------------------------------------
+
+# Секунда с запасом. Ровно то число, что живёт в репозитории правилом с 31
+# июля. Меньше брать не на чем: миллисекундная точность `createdTime` говорит о
+# квантовании, а не о рассинхронизации бэкенда Google (ревью плана T6).
+_REPLY_GATE_SECONDS = 1.1
+_REPLY_JOURNAL_SCHEMA = 1
+
+
+def _second_key(entry):
+    """Ключ учёта одной записи: `(displayName, секунда)` либо None.
+
+    Один сборщик на всех, кто этим ключом пользуется: учёт, предзаписной шлюз и
+    пост-проверка. То же правило, что у `_text_buffer` — считать по-разному
+    значит однажды разойтись.
+
+    Секунда — СТРОКА, усечённая `_trunc_seconds`, а не epoch: учёт сравнивает
+    строку, и нормализация через epoch способна счесть равными строки, которые
+    он считает разными, и наоборот (ревью плана T6).
+    """
+    author = entry.get("author")
+    if not isinstance(author, dict):
+        return None
+    name, created = author.get("displayName"), entry.get("createdTime")
+    if not name or not created:
+        return None
+    return (name, _trunc_seconds(created))
+
+
+def _my_identity(drive_service, raw_comments=None):
+    """(displayName, permissionId) текущего аккаунта.
+
+    Два разных поля для двух разных задач, и путать их нельзя. Шлюзу нужно
+    ИМЯ — коллизия в выгрузке определяется по нему, и два аккаунта с одним
+    именем дают один ключ. Журналу нужен `permissionId` — ему аккаунты надо,
+    наоборот, РАЗЛИЧАТЬ.
+
+    Запасной путь — запись с доказанным `me: true` в свежей переписи. Если ни
+    один из путей не дал имени, шлюз не обеспечен, и вызывающий обязан сказать
+    это вслух, а не промолчать.
+    """
+    name = pid = None
+    try:
+        user = ((drive_service.about().get(
+            fields="user(displayName,permissionId)").execute() or {})
+            .get("user") or {})
+        name, pid = user.get("displayName"), user.get("permissionId")
+    except Exception:                                   # noqa: BLE001
+        pass
+    # Добираем недостающее из переписи, а не выходим на первом же непустом
+    # поле. Раньше `about()` без `permissionId` уводил отсюда сразу, журнал
+    # писался с `permission_id: null`, а следующий удачный `about()` давал
+    # настоящий id — и штатный запуск получал `reply_journal_mismatch`
+    # (ревью кода).
+    if name and pid:
+        return name, pid
+    for c in raw_comments or ():
+        for entry in [c] + list(c.get("replies") or []):
+            author = entry.get("author")
+            if isinstance(author, dict) and author.get("me") is True:
+                name = name or author.get("displayName")
+                pid = pid or author.get("permissionId")
+                if name and pid:
+                    return name, pid
+    return name, pid
+
+
+def _entries_by_author_elsewhere(raw_comments, name, target_cid):
+    """Записи того же автора в ДРУГИХ тредах — то, с чем можно столкнуться.
+
+    Смотрит на тот же набор, что и `_key_owners_universe`: корни и ответы,
+    включая удалённые и закрытые. Корень, resolve-запись и удалённый ответ
+    владеют ключом наравне с обычным ответом (ревью плана T6).
+
+    Запись того же автора в ТОМ ЖЕ треде безвредна: ключ по-прежнему
+    принадлежит одному треду и остаётся его свидетелем.
+    """
+    out = []
+    for c in raw_comments or ():
+        if c.get("id") == target_cid:
+            continue
+        for entry in [c] + list(c.get("replies") or []):
+            key = _second_key(entry)
+            if key and key[0] == name:
+                out.append((c.get("id"), key))
+    return out
+
+
+def _wait_reply_gate(since_monotonic):
+    """Додержать паузу шлюза от момента `since_monotonic`.
+
+    Ждём по МОНОТОННЫМ часам и не вычисляем серверную секунду: свежая перепись
+    говорит время прошлой записи, а не текущее время сервера, и сравнивать его
+    с локальным значило бы вернуть зависимость от часов машины.
+
+    Довод: предыдущая отметка проставлена сервером раньше, чем мы получили
+    ответ; если между записями прошло больше секунды РЕАЛЬНОГО времени, то и
+    серверные секунды разные. Нужна сходимость ХОДА часов, а не их значения.
+    Допущение, которое при этом остаётся: часы Google согласованы и не идут
+    назад. Замерено M31, стенды A и C.
+    """
+    left = _REPLY_GATE_SECONDS - (time.monotonic() - since_monotonic)
+    if left > 0:
+        time.sleep(left)
+
+
+def _reply_author_state(comment):
+    """`mine` | `foreign` | `authorship_unknown` по КОРНЮ треда.
+
+    Три состояния, а не два. Google опускает `author.me`, когда ему угодно, и
+    смешать такой тред с чужим — соврать: это не «чужой», а «Google не сказал».
+    Полностью отсутствующий `author` — та же неизвестность.
+
+    Единица — тред, а не реплика: ветка владельца остаётся своей, даже если в
+    ней отвечал клиент.
+    """
+    author = comment.get("author")
+    if not isinstance(author, dict) or author.get("me") is None:
+        return "authorship_unknown"
+    return "mine" if author.get("me") else "foreign"
+
+
+def _reply_plan_from_file(path):
+    """Разбор `replies.json`. Возвращает [(comment_id, text)] в порядке файла.
+
+    Строгость намеренная: файл описывает записи в чужой документ, и молча
+    понятое «примерно то» здесь дороже отказа.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as e:
+        _error(f"не прочитать {path}: {e}")
+    if not isinstance(data, dict) or set(data) != {"replies"}:
+        _error(f"{path}: ожидается объект с единственным полем 'replies' — "
+               f"{{\"replies\": [{{\"comment_id\": \"...\", \"text\": \"...\"}}]}}")
+    items = data["replies"]
+    if not isinstance(items, list) or not items:
+        _error(f"{path}: 'replies' — непустой список")
+    out, seen = [], set()
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            _error(f"{path}: элемент {i} — объект с 'comment_id' и 'text'")
+        extra = set(item) - {"comment_id", "text"}
+        if extra:
+            # `resolve`/`action` сюда попасть не могут в принципе: резолвит
+            # только человек, и правило не менялось с первого выпуска.
+            _error(f"{path}: элемент {i} несёт неизвестные поля "
+                   f"{sorted(extra)}. Пакетный ответ не резолвит треды и не "
+                   f"принимает 'resolve' или 'action' ни в каком виде.")
+        cid, text = item.get("comment_id"), item.get("text")
+        if not isinstance(cid, str) or not cid.strip():
+            _error(f"{path}: элемент {i} без 'comment_id'")
+        if not isinstance(text, str) or not text.strip():
+            _error(f"{path}: элемент {i} с пустым 'text' — пустой ответ в "
+                   f"чужом документе выглядит сбоем, а не ответом")
+        if cid in seen:
+            _error(f"{path}: 'comment_id' {cid} повторяется. Два ответа в один "
+                   f"тред одним файлом — почти наверняка ошибка входа; если "
+                   f"нужны оба, отправьте их отдельными запусками.")
+        seen.add(cid)
+        out.append((cid, text))
+    return out
+
+
+def _reply_input_hash(entries):
+    """Хеш входа: журнал возобновляется только на том же файле."""
+    return hashlib.sha256(
+        json.dumps(entries, ensure_ascii=False, sort_keys=True)
+        .encode("utf-8")).hexdigest()
+
+
+def _reply_journal_path(replies_path):
+    return replies_path + ".skrepka-reply-journal.json"
+
+
+def _read_reply_journal(path, doc_id, permission_id, input_hash,
+                        include_foreign):
+    """Журнал прошлого прогона, если он про ЭТУ же работу.
+
+    Заголовок связывает работу с документом, аккаунтом, режимом и содержимым
+    входа. Аккаунт опознаётся `permissionId`, а не именем: журналу аккаунты
+    надо различать, а два аккаунта бывают с одним `displayName`.
+
+    Единственная разрешённая смена режима — `include_foreign: false → true`:
+    человек посмотрел на пропущенных чужих и решил ответить и им.
+    Обратный переход и любое другое расхождение возобновление запрещают.
+
+    Возвращает (журнал, состояние): `"missing"` — журнала нет, работаем с
+    нуля; `"valid"` — тот же прогон; всё остальное — ЧЕЛОВЕЧЕСКОЕ имя того,
+    что разошлось. Разница существенная: «нет журнала» и «журнал не про эту
+    работу» — не одно и то же, и молча принять второе за первое значит
+    отправить всё заново и затереть свидетельство прошлого прогона (ревью
+    кода).
+    """
+    if not os.path.exists(path):
+        return None, "missing"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            journal = json.load(fh)
+    except (OSError, ValueError) as e:
+        return None, f"журнал не прочитать ({e})"
+    head = journal.get("header") or {}
+    for field, want, human in (
+            ("schema", _REPLY_JOURNAL_SCHEMA, "версия журнала"),
+            ("doc_id", doc_id, "документ"),
+            ("input_sha256", input_hash, "содержимое файла ответов"),
+            ("permission_id", permission_id, "аккаунт")):
+        if head.get(field) != want:
+            return None, human
+    if bool(head.get("include_foreign")) and not include_foreign:
+        return None, "режим (--include-foreign был включён, сейчас нет)"
+    return journal, "valid"
+
+
+def _threads_without_witness(raw_comments):
+    """Треды, у которых не осталось НИ ОДНОГО уникального ключа-свидетеля.
+
+    Это и есть условие, по которому движок отказывает во всех заменах —
+    замерено M31 напрямую: два треда с одинаковым ключом корня запирают
+    документ, не получив ни одного ответа. Коллизия сама по себе безвредна,
+    пока у треда есть другой уникальный ключ.
+    """
+    uni = _key_owners_universe(raw_comments)
+    naked = set()
+    for c in raw_comments or ():
+        cid = c.get("id")
+        keys = [k for k, owners in uni.items() if cid in owners]
+        if keys and not any(len(uni[k]) == 1 for k in keys):
+            naked.add(cid)
+    return naked
+
+
+def _document_lock_name(file_id):
+    """Имя блокировки — по ДОКУМЕНТУ, и только по нему.
+
+    Два процесса могут держать разные `replies.json` на один документ,
+    относительный путь против абсолютного или symlink; на первом запуске
+    журнала нет вовсе. Имя строится хешем, а не из пользовательского текста:
+    оно становится именем файла.
+
+    Аккаунта в имени НЕТ намеренно. Он ничего не добавляет к защите — ресурс
+    здесь документ, — зато создаёт настоящую дыру: если `about()` не ответил,
+    процесс взял бы блокировку «неизвестного аккаунта», а внутри неё узнал бы
+    настоящий `permissionId`, и правильную блокировку в этот момент держал бы
+    кто-то другой. Имя обязано быть известно ДО захвата и не меняться после
+    (ревью кода).
+    """
+    return "reply-" + hashlib.sha256(
+        file_id.encode("utf-8")).hexdigest()[:32]
+
+
+def _reply_verify(drive_service, file_id, cid, reply_id, naked_baseline):
+    """Появился ли наш ответ в переписи и не отнял ли он у треда свидетеля.
+
+    Два окна, из-за которых проверка обязана быть отдельным состоянием, а не
+    строкой в конце записи. Первое: свежий `comments.list` может ещё не
+    показывать только что созданный ответ — тогда «коллизии нет» было бы
+    ложью. Второе: процесс может умереть между записью и проверкой, и тогда
+    возобновление обязано проверить, а не пропустить.
+
+    `naked_baseline` — множество тредов БЕЗ свидетеля на момент, когда мы
+    решились писать. Сравнивать надо именно с ним, а не со свежей переписью:
+    при возобновлении наш прошлый ответ уже виден, повреждённый им тред уже
+    попал бы в «свежее до», разница вышла бы нулевой, и проверка сказала бы
+    «чисто» о том самом вреде, который ищет (ревью кода).
+
+    Возвращает ("clean" | "collision" | "pending", подробности). `pending` —
+    это «не выяснили»: вызывающий обязан остановиться, а не продолжать.
+    """
+    attempts, last = 4, {}
+    for attempt in range(attempts):
+        try:
+            raw = _list_comments_raw(drive_service, file_id)
+        except HttpError as e:
+            status = getattr(getattr(e, "resp", None), "status", None)
+            if status in (401, 403):
+                # Читать больше не дадут — повторять нечего.
+                return "pending", {"check_error": "нет доступа к переписи"}
+            last = {"check_error": str(e)[:200]}
+            raw = None
+        except Exception as e:                          # noqa: BLE001
+            last = {"check_error": str(e)[:200]}
+            raw = None
+        if raw is not None:
+            seen = any(r.get("id") == reply_id
+                       for c in raw if c.get("id") == cid
+                       for r in (c.get("replies") or []))
+            if seen:
+                naked_now = _threads_without_witness(raw)
+                gained = sorted(naked_now - set(naked_baseline or ()))
+                if gained:
+                    return "collision", {"threads_without_witness": gained}
+                # Свежий снимок отдаётся наружу и становится точкой отсчёта
+                # для СЛЕДУЮЩЕЙ записи. Иначе так: первый ответ попутно дал
+                # свидетеля уже запертому треду, второй снова его отнял — а
+                # тред был в исходном снимке, и потеря не заметилась бы
+                # (ревью кода).
+                return "clean", {"_naked_now": sorted(naked_now)}
+            last = {"check_error": "ответ ещё не виден в переписи"}
+        # После ПОСЛЕДНЕЙ попытки не спим: сон, за которым ничего не следует,
+        # только тратит время человека (ревью кода).
+        if attempt < attempts - 1:
+            time.sleep(0.7 * (attempt + 1))
+    return "pending", last
+
+
+def _reply_http_verdict(exc):
+    """Классификация ошибки записи: повтор, местная, глобальная, неизвестная.
+
+    Не всякий 4xx одинаков. 429 — «слишком часто», и это единственный случай,
+    где повтор УМЕСТЕН: запись не состоялась, а значит дубля не будет. 404 на
+    конкретный тред и 400 на конкретный текст — местные: остальные ответы того
+    же файла пройдут. 401 и 403 глобальные: следующие записи тоже не пройдут,
+    и продолжать значит перебирать файл впустую. 5xx и транспорт ПОСЛЕ
+    отправки — неизвестный исход, и автоповтора у него нет: повтор породил бы
+    дубль в чужом документе.
+
+    Возвращает (вид, состояние записи, причина, пауза-до-повтора).
+    """
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    reason = exc.reason if hasattr(exc, "reason") else str(exc)
+    if status == 429:
+        after = None
+        for holder in (getattr(exc, "resp", None), getattr(exc, "headers", None)):
+            try:
+                after = (holder or {}).get("retry-after")
+            except AttributeError:
+                after = None
+            if after:
+                break
+        try:
+            after = float(after)
+        except (TypeError, ValueError):
+            after = None
+        return "retry", None, reason, after
+    if status in (401, 403):
+        return "auth_failed", "not_applied", reason, None
+    if status is not None and 400 <= status < 500:
+        return "local", "not_applied", reason, None
+    return "unknown_write_outcome", "unknown", reason, None
+
+
+def _reply_journal_write(path, header, records, stopped):
+    """Журнал пишется атомарно и БЕЗ него ответы не отправляются.
+
+    Отказ записи — не мелочь и не повод продолжить: журнал и есть защита от
+    второго ответа в чужом документе. Поэтому он превращается в честный отказ,
+    а не в сырой трейсбек.
+
+    Живой прогон нашёл этот путь сразу: `/tmp` на macOS — символическая
+    ссылка, а `safeio` их не следует намеренно (та же ограда, что у `--output`
+    и у журнала `sync`). Первая запись журнала происходит ДО первой отправки,
+    так что отказ здесь никого не оставляет с половиной работы.
+    """
+    payload = {"header": header,
+               "stopped_because": stopped,
+               "replies": [records[k] for k in records]}
+    try:
+        return safeio.atomic_write(
+            path, json.dumps(payload, ensure_ascii=False, indent=1) + "\n")
+    except (OSError, safeio.SafeIOError) as e:
+        #  поднимает СВОЙ класс, а не OSError: ловить только второй
+        # значило бы пропустить ровно тот случай, ради которого он заведён.
+        _error(
+            f"не записать журнал {path}: {e}. Без журнала ответы не "
+            f"отправляются — он и защищает от второго ответа в чужом "
+            f"документе. Обычная причина: файл ответов лежит в каталоге, к "
+            f"которому путь идёт через символическую ссылку (на macOS это "
+            f"`/tmp`). Положите его в обычный каталог.",
+            reason="reply_journal_mismatch",
+            details={"journal": path, "error": str(e)[:120]})
+
+
+def batch_reply(file_id, replies_path, dry_run=False, include_foreign=False,
+                output=None):
+    """Ответить в несколько тредов одного документа, разводя их по секундам.
+
+    Зачем команда вообще есть: агент отрабатывает комментарии пачкой, и цикл
+    одиночных вызовов — не редкость, а нормальный режим. Каждый ответ обязан
+    попасть в СВОЮ секунду, иначе он может отнять у треда последнего
+    свидетеля, и тогда документ перестаёт правиться целиком (M27, M31).
+
+    Резолв здесь невозможен ни в каком виде: закрывает тред только человек.
+    """
+    file_id = _extract_doc_id(file_id)
+    entries = _reply_plan_from_file(replies_path)
+    input_hash = _reply_input_hash(entries)
+    try:
+        creds = get_creds()
+        drive_service = get_drive_service(creds)
+    except Exception as e:                              # noqa: BLE001
+        _error(f"auth failed: {e}")
+    my_name, my_pid = _my_identity(drive_service)
+
+    def classify(raw):
+        by_id = {c.get("id"): c for c in raw}
+        out = []
+        for cid, text in entries:
+            c = by_id.get(cid)
+            if c is None or c.get("deleted"):
+                state = "missing"
+            elif c.get("resolved"):
+                state = "resolved"
+            else:
+                who = _reply_author_state(c)
+                if who == "mine" or (who == "foreign" and include_foreign):
+                    state = "would_reply"
+                elif who == "foreign":
+                    state = "skipped_foreign"
+                else:
+                    state = "skipped_authorship_unknown"
+            out.append({"comment_id": cid, "text": text, "state": state,
+                        "link": _thread_link(file_id, cid)})
+        return out
+
+    if dry_run:
+        # Писателя на этом пути нет: `_reply_send_one` не вызывается вовсе, и
+        # ни один объект записи здесь не создаётся. Проверку флага можно
+        # снять правкой, отсутствующий вызов — нельзя.
+        raw = _list_comments_raw(drive_service, file_id)
+        if my_name is None:
+            my_name, my_pid = _my_identity(drive_service, raw)
+        plan = classify(raw)
+        first = next((p for p in plan if p["state"] == "would_reply"), None)
+        would_wait = bool(
+            my_name is None or (first and _entries_by_author_elsewhere(
+                raw, my_name, first["comment_id"])))
+        payload = {
+            "action": "dry-run", "doc_id": file_id,
+            "would_reply": [p for p in plan if p["state"] == "would_reply"],
+            "skipped_foreign": [p for p in plan
+                                if p["state"] == "skipped_foreign"],
+            "skipped_authorship_unknown":
+                [p for p in plan
+                 if p["state"] == "skipped_authorship_unknown"],
+            "missing": [p for p in plan if p["state"] == "missing"],
+            "resolved": [p for p in plan if p["state"] == "resolved"],
+            # Именно «на этом снимке»: обещать за будущий запуск нельзя, между
+            # прогонами документ живёт своей жизнью (ревью плана T6).
+            "would_wait_before_first_on_this_snapshot": would_wait,
+            "gate_seconds": _REPLY_GATE_SECONDS,
+        }
+        if my_name is None:
+            payload["reply_gate_unavailable"] = (
+                "имя автора этого аккаунта установить не удалось — скрепка не "
+                "видит, с чем может столкнуться, и выдерживает паузу перед "
+                "каждым ответом")
+        _emit_json(payload, output=output)
+        return
+
+    journal_path = _reply_journal_path(replies_path)
+    with config.lock(_document_lock_name(file_id)):
+        _batch_reply_locked(drive_service, file_id, entries, classify,
+                            journal_path, input_hash, my_name, my_pid,
+                            include_foreign, output)
+
+
+def _batch_reply_locked(drive_service, file_id, entries, classify,
+                        journal_path, input_hash, my_name, my_pid,
+                        include_foreign, output):
+    """Записывающая половина. Блокировка документа держится всё это время:
+    свежая перепись → ожидание → все записи → пост-проверки → журнал."""
+    raw = _list_comments_raw(drive_service, file_id)
+    census_at = time.monotonic()
+    if my_name is None:
+        my_name, my_pid = _my_identity(drive_service, raw)
+    if not my_pid:
+        # Журнал опознаёт аккаунт по `permissionId`, и записать туда пустоту
+        # значит сломать возобновление всем следующим запускам.
+        _error(
+            "не удалось определить аккаунт (нет permissionId): пакетный "
+            "ответ без него не начинается — журнал не с чем связать. "
+            "Проверьте авторизацию через `skrepka doctor`.",
+            reason="reply_journal_mismatch",
+            details={"permission_id": None})
+    naked_now = sorted(_threads_without_witness(raw))
+    plan = classify(raw)
+
+    header = {"schema": _REPLY_JOURNAL_SCHEMA, "doc_id": file_id,
+              "permission_id": my_pid, "display_name": my_name,
+              "include_foreign": bool(include_foreign),
+              "input_sha256": input_hash}
+    old, status = _read_reply_journal(journal_path, file_id, my_pid,
+                                      input_hash, include_foreign)
+    if status not in ("missing", "valid"):
+        # Молча начать заново значит отправить всё повторно и затереть
+        # свидетельство прошлого прогона. Отказ ДО первой записи (ревью кода).
+        _error(
+            f"рядом с {journal_path} лежит журнал другого прогона: разошлось "
+            f"{status}. Ответы повторно не отправляются. Уберите или "
+            f"переименуйте журнал, если начинаете работу заново.",
+            reason="reply_journal_mismatch",
+            details={"journal": journal_path, "mismatch": status})
+    prior = {r["comment_id"]: r for r in ((old or {}).get("replies") or [])}
+
+    records, todo, stopped = {}, [], None
+    for item in plan:
+        cid = item["comment_id"]
+        was = prior.get(cid)
+        if was and was.get("state") in ("applied", "unknown", "inflight"):
+            # `inflight` из прошлого прогона — это `unknown`: запрос ушёл, а
+            # чем кончился, мы не знаем. Повтор породил бы дубль в чужом
+            # документе, поэтому не повторяется никогда.
+            rec = dict(was)
+            if rec["state"] == "inflight":
+                rec["state"] = "unknown"
+                rec["note"] = ("прошлый прогон оборвался после отправки — "
+                               "исход неизвестен, повторно не отправляем")
+            records[cid] = rec
+            continue
+        records[cid] = {"comment_id": cid, "text": item["text"],
+                        "state": ("pending" if item["state"] == "would_reply"
+                                  else item["state"]),
+                        "link": item["link"]}
+        if item["state"] == "would_reply":
+            todo.append(cid)
+
+    # Незавершённая пост-проверка из прошлого прогона идёт ПЕРВОЙ: пока она не
+    # сделана, следующая запись не разрешена — иначе коллизия, созданная в
+    # прошлый раз, останется незамеченной, а мы добавим к ней ещё одну.
+    for cid, rec in records.items():
+        if rec.get("state") != "applied" or \
+                rec.get("collision_check") != "pending":
+            continue
+        if not rec.get("reply_id"):
+            # Проверить нечего и никогда не будет: без id ответа мы не
+            # отличим его от чужого. Дальше писать нельзя (ревью кода).
+            stopped = "collision_check_unknown"
+            rec["note"] = "ответ применён, но его id не сохранился"
+            break
+        # `or` здесь был бы ошибкой: ПУСТОЙ сохранённый снимок — законный и
+        # частый случай («до записи повреждённых тредов не было»), а как
+        # значение он ложен, и `or` молча подменил бы его свежей переписью —
+        # ровно той подменой, от которой снимок и заведён (найдено тестом).
+        baseline = rec.get("naked_baseline")
+        verdict, extra = _reply_verify(
+            drive_service, file_id, cid, rec["reply_id"],
+            naked_now if baseline is None else baseline)
+        naked_now = extra.pop("_naked_now", naked_now)
+        rec["collision_check"] = verdict
+        rec.update(extra)
+        _reply_journal_write(journal_path, header, records, stopped)
+        if verdict == "collision":
+            stopped = "identity_collision_created"
+            break
+        if verdict == "pending":
+            stopped = "collision_check_unknown"
+            break
+
+    # Терминальный исход ПРОШЛОГО прогона останавливает и этот. Иначе
+    # «повторно не отправляем» касалось бы одной записи, а остальные ответы
+    # уходили бы поверх неразобранной коллизии (ревью кода).
+    if not stopped:
+        # Исход, который прошлый прогон объявил окончательным, окончателен и
+        # здесь. `collision_check_unknown` в этот список НЕ входит: он ровно
+        # тем и разрешается, что проверку доводят до конца выше.
+        was_stopped = (old or {}).get("stopped_because")
+        if was_stopped in ("identity_collision_created",
+                           "reply_second_unknown"):
+            stopped = was_stopped
+    if not stopped:
+        for rec in records.values():
+            if rec.get("collision_check") == "collision":
+                stopped = "identity_collision_created"
+                break
+            if rec.get("state") == "unknown":
+                stopped = "unknown_write_outcome"
+                break
+
+    last_write_at = None
+    for cid in todo:
+        if stopped:
+            break
+        rec = records[cid]
+        attempts = 0
+        while True:
+            # Шлюз. Перед ПЕРВОЙ записью ждём от завершения переписи, если в
+            # документе вообще есть запись того же автора в другом треде:
+            # текущей серверной секунды мы не знаем и знать не можем. Дальше —
+            # от момента получения предыдущего ответа, там секунда известна.
+            if last_write_at is None:
+                if my_name is None or _entries_by_author_elsewhere(
+                        raw, my_name, cid):
+                    _wait_reply_gate(census_at)
+            else:
+                _wait_reply_gate(last_write_at)
+
+            rec.update(state="inflight", naked_baseline=naked_now)
+            _reply_journal_write(journal_path, header, records, stopped)
+            try:
+                reply = drive_service.replies().create(
+                    fileId=file_id, commentId=cid,
+                    body={"content": rec["text"]},
+                    fields="id,createdTime").execute()
+                break
+            except HttpError as e:
+                kind, state, reason, after = _reply_http_verdict(e)
+                if kind == "retry" and attempts < 3:
+                    # Запись не состоялась — повтор дубля не даст. После
+                    # паузы обязательно снова через шлюз: ожидание Google не
+                    # заменяет нашего (план T6).
+                    attempts += 1
+                    last_write_at = time.monotonic()
+                    # Состояние пишется ДО сна: сервер уже доказал, что запрос
+                    # не применён, и умереть во время паузы с `inflight` в
+                    # журнале значит навсегда отказаться от повтора там, где
+                    # он безопасен (ревью кода).
+                    rec.update(state="pending", retries=attempts)
+                    _reply_journal_write(journal_path, header, records, stopped)
+                    if after:
+                        time.sleep(after)
+                    continue
+                rec.update(state=state or "not_applied", reason=reason)
+                _reply_journal_write(journal_path, header, records, stopped)
+                if kind == "auth_failed":
+                    stopped = "auth_failed"
+                elif kind == "unknown_write_outcome":
+                    stopped = "unknown_write_outcome"
+                elif kind == "retry":
+                    stopped = "rate_limited"
+                reply = None
+                break
+            except Exception as e:                      # noqa: BLE001
+                rec.update(state="unknown", reason=str(e)[:200])
+                _reply_journal_write(journal_path, header, records, stopped)
+                stopped = "unknown_write_outcome"
+                reply = None
+                break
+        if reply is None:
+            continue
+        last_write_at = time.monotonic()
+        created = reply.get("createdTime")
+        rec.update(state="applied", reply_id=reply.get("id"),
+                   created_time=created, collision_check="pending")
+        _reply_journal_write(journal_path, header, records, stopped)
+
+        if not _second_key({"author": {"displayName": my_name or "?"},
+                            "createdTime": created}):
+            # Ответ применён, а следующий отправить нечем: без читаемой
+            # секунды шлюз не на чем строить. Называть это `failed` значило бы
+            # врать о том, что произошло.
+            rec["note"] = "у ответа нет читаемого времени — следующий не шлём"
+            _reply_journal_write(journal_path, header, records, stopped)
+            stopped = "reply_second_unknown"
+            continue
+
+        verdict, extra = _reply_verify(drive_service, file_id, cid,
+                                       rec["reply_id"], naked_now)
+        naked_now = extra.pop("_naked_now", naked_now)
+        rec["collision_check"] = verdict
+        rec.update(extra)
+        _reply_journal_write(journal_path, header, records, stopped)
+        if verdict == "collision":
+            stopped = "identity_collision_created"
+        elif verdict == "pending":
+            stopped = "collision_check_unknown"
+
+    _reply_journal_write(journal_path, header, records, stopped)
+    applied = [r for r in records.values() if r.get("state") == "applied"]
+    payload = {
+        "action": ("replied"
+                   if (not stopped
+                       and all(r.get("state") == "applied"
+                               for r in records.values()))
+                   else "partially-replied"),
+        "doc_id": file_id, "replies_sent": len(applied),
+        "applied": [{"comment_id": r["comment_id"],
+                     "reply_id": r.get("reply_id"),
+                     "createdTime": r.get("created_time"), "text": r["text"],
+                     "collision_check": r.get("collision_check")}
+                    for r in applied],
+        "skipped_foreign": [r for r in records.values()
+                            if r.get("state") == "skipped_foreign"],
+        "skipped_authorship_unknown": [
+            r for r in records.values()
+            if r.get("state") == "skipped_authorship_unknown"],
+        "missing": [r for r in records.values() if r.get("state") == "missing"],
+        "resolved": [r for r in records.values()
+                     if r.get("state") == "resolved"],
+        "failed": [r for r in records.values()
+                   if r.get("state") in ("not_applied", "unknown")],
+        # Операция, до которой батч не дошёл, НЕ провалилась: её не пробовали.
+        # Смешать одно с другим значит соврать T10 о том, что случилось, — и
+        # заодно спрятать, сколько работы осталось (найдено тестом).
+        "not_attempted": [r for r in records.values()
+                          if r.get("state") == "pending"],
+        "stopped_because": stopped,
+        "journal": journal_path,
+    }
+    if my_name is None:
+        payload["reply_gate_unavailable"] = (
+            "имя автора этого аккаунта установить не удалось — пауза "
+            "выдерживалась перед каждым ответом")
+    _emit_json(payload, output=output)
+    if payload["action"] != "replied":
+        sys.exit(3)
+
+
+def reply_comment(file_id, comment_id, text, resolve=False, yes=False,
+                  output=None):
     """Post a reply to an existing comment. If resolve=True, also resolves the thread."""
     if resolve:
         # Resolving a thread is the reviewer's call, never the agent's. --yes
@@ -7841,21 +8566,48 @@ def reply_comment(file_id, comment_id, text, resolve=False, yes=False):
     except Exception as e:
         _error(f"auth failed: {e}")
 
-    body = {"content": text}
-    if resolve:
-        body["action"] = "resolve"
+    # Секундный шлюз и на одиночной форме. Главный вывод M27 — «чинить надо не
+    # пакетный `reply`, а сам `reply`»: боевой документ сжёг цикл из одиночных
+    # вызовов, и пакетная команда от него не спасает. Между вызовами CLI
+    # памяти нет, поэтому предыдущая запись ищется в свежей переписи.
+    #
+    # Круг авторов сюда НЕ распространяется: человек назвал тред явно, и это
+    # само по себе разрешение. Меняется только скорость, не контракт.
+    #
+    # Блокировка по документу берётся и здесь: без неё два одиночных процесса
+    # на одной машине проходят шлюз одновременно и пишут в одну секунду —
+    # ровно то, от чего шлюз и заведён (ревью кода).
+    degraded = None
+    with config.lock(_document_lock_name(file_id)):
+        try:
+            raw = _list_comments_raw(drive_service, file_id)
+        except Exception:                               # noqa: BLE001
+            raw = None        # не увидели документ — ждём безусловно
+        census_at = time.monotonic()
+        my_name, _pid = _my_identity(drive_service, raw or ())
+        if raw is None or my_name is None:
+            degraded = ("перепись или имя автора недоступны — пауза "
+                        "выдержана вслепую, а появление коллизии не "
+                        "проверялось")
+        if raw is None or my_name is None or _entries_by_author_elsewhere(
+                raw, my_name, comment_id):
+            _wait_reply_gate(census_at)
 
-    try:
-        reply = drive_service.replies().create(
-            fileId=file_id,
-            commentId=comment_id,
-            body=body,
-            fields="id,content,author/displayName,action,createdTime",
-        ).execute()
-    except HttpError as e:
-        _error(f"reply failed: {e.reason if hasattr(e, 'reason') else e}")
+        body = {"content": text}
+        if resolve:
+            body["action"] = "resolve"
 
-    print(json.dumps({
+        try:
+            reply = drive_service.replies().create(
+                fileId=file_id,
+                commentId=comment_id,
+                body=body,
+                fields="id,content,author/displayName,action,createdTime",
+            ).execute()
+        except HttpError as e:
+            _error(f"reply failed: {e.reason if hasattr(e, 'reason') else e}")
+
+    payload = {
         "id": reply.get("id"),
         "comment_id": comment_id,
         "content": reply.get("content"),
@@ -7867,7 +8619,14 @@ def reply_comment(file_id, comment_id, text, resolve=False, yes=False):
         "createdTime": reply.get("createdTime"),
         "action": reply.get("action"),
         "resolved": resolve,
-    }, ensure_ascii=False))
+    }
+    if degraded:
+        # Молчание тут читалось бы как обещание: шлюз выдержан, но доказать,
+        # что коллизии не возникло, было нечем (ревью кода).
+        payload["reply_gate_unavailable"] = degraded
+    # `--output` общий для обеих форм команды. Принимать флаг и молча его
+    # игнорировать хуже, чем не иметь его вовсе (ревью кода).
+    _emit_json(payload, output=output)
 
 
 def resolve_comment(file_id, comment_id, text=None, yes=False):
@@ -10522,10 +11281,21 @@ def main():
                          "limits and get silently truncated)")
 
     # reply command
-    rp = sub.add_parser("reply", help="Post a reply to a comment")
+    rp = sub.add_parser("reply",
+                        help="Post a reply to a comment, or a batch of them")
     rp.add_argument("file_id", help="Google Doc file ID or URL")
-    rp.add_argument("comment_id", help="Comment ID to reply to")
-    rp.add_argument("text", help="Reply text")
+    rp.add_argument("comment_id", nargs="?", help="Comment ID to reply to")
+    rp.add_argument("text", nargs="?", help="Reply text")
+    rp.add_argument("--file", help='Batch form: JSON with {"replies": '
+                                   '[{"comment_id": "...", "text": "..."}]} — '
+                                   'each reply lands in its own second')
+    rp.add_argument("--dry-run", action="store_true",
+                    help="With --file: show what would be sent and what is "
+                         "skipped, write nothing")
+    rp.add_argument("--include-foreign", action="store_true",
+                    help="With --file: reply in threads started by somebody "
+                         "else too (by default only your own)")
+    rp.add_argument("--output", help="Write the JSON result to this file")
     rp.add_argument("--resolve", action="store_true",
                     help="Also mark the thread as resolved")
     rp.add_argument("--yes", action="store_true",
@@ -10627,12 +11397,33 @@ def main():
     elif args.command == "comments":
         list_comments(_extract_doc_id(args.file_id), output=args.output)
     elif args.command == "reply":
-        # a bare --yes would silently mean nothing here; refusing keeps the
-        # flag tied to the one thing it confirms
-        if args.yes and not args.resolve:
-            _error("--yes applies only together with --resolve — nothing done")
-        reply_comment(args.file_id, args.comment_id, args.text,
-                      resolve=args.resolve, yes=args.yes)
+        if args.file:
+            if args.comment_id or args.text:
+                _error("--file и позиционные COMMENT_ID/TEXT — разные формы "
+                       "одной команды, вместе они не работают")
+            if args.resolve or args.yes:
+                # Резолв пакетной формой невозможен в принципе: закрывает тред
+                # только человек, и правило не менялось с первого выпуска.
+                _error("пакетный ответ не резолвит треды: закрыть тред может "
+                       "только человек в интерфейсе Google Docs")
+            batch_reply(args.file_id, args.file, dry_run=args.dry_run,
+                        include_foreign=args.include_foreign,
+                        output=args.output)
+        else:
+            if not args.comment_id or args.text is None:
+                _error("нужны COMMENT_ID и TEXT — либо --file для пакетной "
+                       "формы")
+            if args.dry_run or args.include_foreign:
+                _error("--dry-run и --include-foreign работают только с "
+                       "--file")
+            # a bare --yes would silently mean nothing here; refusing keeps the
+            # flag tied to the one thing it confirms
+            if args.yes and not args.resolve:
+                _error("--yes applies only together with --resolve — nothing "
+                       "done")
+            reply_comment(args.file_id, args.comment_id, args.text,
+                          resolve=args.resolve, yes=args.yes,
+                          output=args.output)
     elif args.command == "resolve":
         resolve_comment(args.file_id, args.comment_id, text=args.text,
                         yes=args.yes)

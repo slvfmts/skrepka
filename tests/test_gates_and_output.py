@@ -126,16 +126,40 @@ def test_consent_refuses_when_the_terminal_cannot_be_read(engine, monkeypatch,
 
 # --- resolve / reply --resolve wiring ---
 
-def _fake_reply_drive(seen):
+def _fake_reply_drive(seen, comments=()):
+    """Дублёр Drive для одиночного `reply`.
+
+    С T6 у `reply` есть секундный шлюз, и он читает перепись перед записью.
+    Пустая перепись — законный случай «столкнуться не с чем»: паузы нет, и
+    тесты ниже это заодно доказывают. Не умей дублёр `comments()`, шлюз
+    честно ждал бы вслепую, и каждый такой тест стоил бы секунды.
+    """
     class _Req:
+        def __init__(self, payload=None):
+            self.payload = payload
+
         def execute(self):
-            return {"id": "r1", "content": "ok", "action": "resolve",
-                    "createdTime": "2026-07-31T10:00:00.000Z",
-                    "author": {"displayName": "Slava"}}
+            return self.payload or {
+                "id": "r1", "content": "ok", "action": "resolve",
+                "createdTime": "2026-07-31T10:00:00.000Z",
+                "author": {"displayName": "Slava"}}
 
     class Drive:
         def replies(self):
             return self
+
+        def comments(self):
+            return self
+
+        def list(self, **kw):
+            return _Req({"comments": [dict(c) for c in comments]})
+
+        def about(self):
+            return self
+
+        def get(self, **kw):
+            return _Req({"user": {"displayName": "Slava",
+                                  "permissionId": "pid-1"}})
 
         def create(self, **kw):
             seen.update(kw)

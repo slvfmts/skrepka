@@ -16,6 +16,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import secrets
 import stat
 
@@ -292,17 +293,53 @@ def write_secret_bytes(name, data):
     _fsync_dir(d)
 
 
+def _named_lock_path(name):
+    """Path of a named lock, in a 0700 subdir of the config dir.
+
+    `name` is built by the caller from a hash, never from user text: it becomes
+    a filename, and a caller-supplied component would be a path-traversal
+    handle. Rejected here as well, so the rule cannot be lost at a call site.
+    """
+    if not re.fullmatch(r"[a-z0-9_-]{1,64}", name or ""):
+        raise ConfigError(f"invalid lock name {name!r}")
+    d = os.path.join(ensure_config_dir(), "locks")
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    except OSError as e:
+        raise ConfigError(f"cannot create lock dir: {e}")
+    st = os.lstat(d)
+    if stat.S_ISLNK(st.st_mode):
+        raise ConfigError(f"{d} is a symlink — refusing (fail closed)")
+    if st.st_uid != os.getuid():
+        raise ConfigError(f"{d} is not owned by you — refusing")
+    if st.st_mode & 0o077:
+        os.chmod(d, 0o700)
+    return os.path.join(d, f"{name}.lock")
+
+
 @contextlib.contextmanager
-def lock():
+def lock(name=None):
     """Exclusive advisory lock serializing token activation and refresh so a
     read-compare-write cannot interleave with a concurrent reauth (code-r2 #1).
-    Unix-only (Windows is out of 0.9 scope)."""
+    Unix-only (Windows is out of 0.9 scope).
+
+    With `name` it locks something else instead of the token: `reply` takes one
+    per DOCUMENT so two batches on one file cannot interleave their writes.
+    That lock must not key on the journal path — two processes can hold
+    different `replies.json` for the same document, and on the first run there
+    is no journal at all (ревью плана T6).
+
+    Everything below is shared on purpose: the hardening here was reviewed
+    once, and a second lock primitive would be a second place to get
+    `O_NOFOLLOW`, the ownership check and the mode wrong.
+    """
     # Validate the parent chain and tighten the dir BEFORE touching anything
     # inside it. `logout` and `forget` take this lock before any protected
     # read, so without this they were the one path into a swapped config dir
     # that skipped every check.
     d = ensure_config_dir()
-    lock_path = os.path.join(d, ".lock")
+    lock_path = (_named_lock_path(name) if name is not None
+                 else os.path.join(d, ".lock"))
     # O_NOFOLLOW: a symlink at .lock must not redirect the open. O_CLOEXEC:
     # never leak the descriptor into a child process.
     try:
