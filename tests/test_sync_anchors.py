@@ -239,9 +239,37 @@ class DriveStub:
         self._comments_after = comments_after
         self._switch_after = switch_after_lists
         self._list_calls = 0
+        # С T10 `patch` после пересадки комментария САМ отвечает в тред.
+        # Дублёр обязан это уметь, иначе тест про правку меряет заодно и
+        # сорванную отправку. Ответы копятся здесь и видны следующей переписи:
+        # пост-проверка T6 их там и ищет.
+        self.replies_created = []
 
     def comments(self):
         return self
+
+    def replies(self):
+        return self
+
+    def about(self):
+        return self
+
+    def get(self, **kw):
+        return _Req({"user": {"displayName": "A",
+                              "permissionId": "pid-1"}})
+
+    def create(self, **kw):
+        cid = kw.get("commentId")
+        rid = f"auto{len(self.replies_created) + 1}"
+        stamp = f"2026-07-13T18:0{len(self.replies_created)}:00.000Z"
+        self.replies_created.append((cid, kw["body"]["content"]))
+        for c in self._comments:
+            if c.get("id") == cid:
+                c.setdefault("replies", []).append(
+                    {"id": rid, "content": kw["body"]["content"],
+                     "createdTime": stamp,
+                     "author": {"displayName": "A", "me": True}})
+        return _Req({"id": rid, "createdTime": stamp})
 
     def list(self, **kw):
         self._list_calls += 1
