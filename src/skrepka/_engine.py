@@ -102,6 +102,8 @@ _REASON_CODES = frozenset((
     "comment_anchor_would_be_lost",  # последний якорь треда исчез бы
     "anchor_identity_collision",    # два треда неразличимы в выгрузке
     "unsupported_structure",        # конструкция, которую skrepka не правит
+    "schema_invalid",               # операция не того вида: не объект,
+                                    # поле не того типа
     "concurrent_edit",              # документ изменился под правкой
     "comment_thread_unresolvable",  # тред не адресуется: закрыт, удалён,
                                     # без якоря или его якорь не размещён
@@ -1869,6 +1871,18 @@ def _resolve_op(op, doc_tab, tab_id):
         _error(f"op missing 'op' field: {op}")
 
     new_text = op.get("text") if "text" in op else op.get("with")
+    # Тип проверяется ДО содержимого, и это не педантизм. Раньше проверка
+    # запрещённых знаков стояла под `isinstance`, а всё остальное молчало:
+    # `{"text": 3}` доходил до `insertText`, Google отвергал запрос, и на
+    # чистом пути с ним падал ВЕСЬ атомарный батч — из-за одной опечатки в
+    # типе человек терял все остальные правки файла (найдено ревью T11).
+    if new_text is not None and not isinstance(new_text, str):
+        _error(
+            f"текст правки должен быть строкой, а не "
+            f"{type(new_text).__name__}: {op}",
+            reason="schema_invalid",
+            details={"field": "text" if "text" in op else "with",
+                     "type": type(new_text).__name__})
     if isinstance(new_text, str):
         bad = _OP_TEXT_FORBIDDEN.search(new_text)
         if bad:
@@ -1880,6 +1894,37 @@ def _resolve_op(op, doc_tab, tab_id):
                 f"silently. Allowed control characters are the tab, the "
                 f"paragraph break (\\n) and the soft line break (\\v, "
                 f"shift+enter). {op}")
+
+    # Тип адреса проверяется до всякой работы с ним. Ниже стоят `"\x00" in
+    # quote`, `int(op["occurrence"])` и поиск именованного диапазона — на
+    # числе, списке или `None` они дают `TypeError`/`ValueError`, а это не
+    # `PatchOpError`, и по-операционная обработка их не ловит: процесс падает
+    # трейсбеком, и валидные соседки по файлу не применяются вовсе. Ровно та
+    # же цена, что у операции-не-объекта (найдено ревью T11).
+    for field in ("range", "quote"):
+        if field in op and not isinstance(op[field], str):
+            _error(
+                f"поле {field!r} должно быть строкой, а не "
+                f"{type(op[field]).__name__}: {op}",
+                reason="schema_invalid",
+                details={"field": field, "type": type(op[field]).__name__})
+    if "occurrence" in op:
+        # `bool` — подкласс `int`, и `int(True)` даёт 1: номер вхождения,
+        # которого человек не называл, молча превратился бы в первый.
+        if isinstance(op["occurrence"], bool) or not isinstance(
+                op["occurrence"], int):
+            _error(
+                f"'occurrence' — это целое число от 1, а не "
+                f"{type(op['occurrence']).__name__}: {op}",
+                reason="schema_invalid",
+                details={"field": "occurrence",
+                         "type": type(op["occurrence"]).__name__})
+        if op["occurrence"] < 1:
+            _error(
+                f"'occurrence' считается с единицы, а не с нуля: {op}",
+                reason="schema_invalid",
+                details={"field": "occurrence",
+                         "value": op["occurrence"]})
 
     # Resolve target
     quote_total = None
@@ -5115,16 +5160,47 @@ def _ops_overlap_conflicts(indexed):
     conflicts = {}
     order = sorted(indexed, key=lambda i: (indexed[i]["affect_start"],
                                            indexed[i]["affect_end"]))
-    for pos in range(len(order) - 1):
-        i, j = order[pos], order[pos + 1]
-        a, b = indexed[i], indexed[j]
-        if _ranges_overlap(a["affect_start"], a["affect_end"],
-                           b["affect_start"], b["affect_end"]):
-            why = (f"ops overlap: {a['source']} and {b['source']} — "
-                   f"split into separate patches")
-            conflicts[i] = why
-            conflicts[j] = why
+    # Сравниваются ВСЕ пары, а не соседние по сортировке. Широкая правка
+    # перекрывает несколько узких, и соседняя пара может при этом не
+    # пересечься: на `[1,7]`, `[2,3]`, `[4,5]` соседи ловят только первые две,
+    # а `[4,5]` уходит внутрь `[1,7]` незамеченной. Чистый путь строит запросы
+    # в обратном порядке индексов, значит удаление `[1,7]` затирает уже
+    # записанное правкой `[4,5]`, и обе числятся применёнными — порча текста
+    # молча. Полный перебор здесь по средствам: файл операций человек пишет
+    # руками, и это десятки строк, а не тысячи (найдено ревью T11; правило
+    # было на ветке `sprint/public-mvp` и потерялось при переносе по задачам).
+    for pos, i in enumerate(order):
+        for j in order[pos + 1:]:
+            a, b = indexed[i], indexed[j]
+            if _ranges_overlap(a["affect_start"], a["affect_end"],
+                               b["affect_start"], b["affect_end"]):
+                why = (f"ops overlap: {a['source']} and {b['source']} — "
+                       f"split into separate patches")
+                conflicts[i] = why
+                conflicts[j] = why
     return conflicts
+
+
+def _op_inserts(op, resolved=None):
+    """Вставляет ли операция текст — по разрешённой цели или по имени.
+
+    Один предикат на писателя и на холостой прогон: шлюз C5 задаёт вопрос
+    «есть ли в этом файле вставка», и два разных ответа на него означали бы,
+    что советчик обещает не то, что сделает запись. Операция, чья цель не
+    разрешилась, обязана отвечать по имени — иначе шлюз слепнет ровно там,
+    где опаснее всего.
+
+    Замена, которая только УДЛИНЯЕТ цель, здесь не считается вставкой — так
+    же, как не считает её писатель. Это не описка: она физически шлёт
+    `insertText`, и шлюз её не видит, но менять область спящей ограды без
+    нового замера нельзя (C5 замерена `True` 13.07). Долг записан в
+    `TASKS-r19.md`.
+    """
+    if resolved:
+        return resolved["kind"] == "insert"
+    if not isinstance(op, dict):
+        return False
+    return str(op.get("op", "")).startswith("insert")
 
 
 def _op_source_label(op, resolved=None):
@@ -7592,7 +7668,689 @@ def _send_reply_intents(drive_service, file_id, ops_path, intents):
     return result(stopped, {"reply_journal": journal_path})
 
 
-def patch_doc(file_id, ops_path, tab_id=None):
+# --------------------------------------------------------------------------
+# T11 (#50): холостой прогон `patch`.
+#
+# Советчик, который читает. Он воспроизводит ровно те ограды `patch_doc`, что
+# решаются по снимку документа, и отказывается выносить вердикт там, где
+# писателю нужны свежая карта выгрузки и канарейка. Писатель, выгрузка,
+# канарейка и автоответ из этого пути физически недостижимы: планировщик
+# принимает СНИМОК, а не сервис, а `dry_run_patch` строит только чтение.
+#
+# Гарантия односторонняя и названа вслух: `would_apply` не должен потом
+# обернуться обычным предсказуемым отказом или неприменением. Обратной
+# гарантии нет — `not_simulated` существует ровно для случаев, где предсказать
+# нельзя. Действует, пока документ не менялся между прогоном и записью: в
+# квитанции для этого стоит `revision_id_before`.
+#
+# Полной локальной модели документа здесь нет и не будет: вторая реализация
+# индексной семантики Docs обязана совпадать с первой, а расхождение даёт либо
+# ложный отказ, либо потерянный документ. Всё, что этот путь считает по
+# тексту, отвечает на один вопрос — «может ли ранняя правка изменить число
+# совпадений цитаты поздней», — и любой утвердительный ответ СНИМАЕТ обещание,
+# а не выдаёт его.
+# --------------------------------------------------------------------------
+
+_DRY_STATUSES = frozenset((
+    "would_apply",     # писатель применит эту правку
+    "noop",            # правка ничего не пишет
+    "would_refuse",    # писатель откажет, и вот его причина
+    "unknown",         # по чтению не решается: нужна свежая карта якорей
+    "not_simulated",   # решаемо, но зависит от правки, которую не считали
+))
+
+# Причины, которых у писателя нет по смыслу: он либо пишет, либо отказывает, а
+# «не знаю» — состояние советчика. Отказы же он объясняет своими кодами из
+# `_REASON_CODES`, и здесь они пересказываются как есть. Где писатель кода не
+# даёт, вердикт тоже идёт без кода: выдумать его значило бы обещать разбор,
+# которого в квитанции самой правки не будет.
+# Отказы по цели, которые может снять соседка по файлу: она унесла лишнюю
+# копию цитаты или, наоборот, принесла ту, которой не было. Всё остальное —
+# схема, гвардии, треды — от текста не зависит и соседкой не снимается.
+_DRY_LIFTABLE_REFUSALS = ("quote_not_found", "quote_ambiguous")
+
+_DRY_REASON_CODES = frozenset((
+    "tab_selection",                  # вкладка не выбрана или неоднозначна
+    "missing_revision_id",            # снимок без ревизии: запись не закрепить
+    "insert_near_anchor_unverified",  # шлюз C5 закрыт
+    "fresh_anchor_map_requires_canary",      # нужна выгрузка и канарейка
+    "prior_mutation_may_change_uniqueness",  # ранняя правка двигает цитату
+    "prior_unsimulated_mutation",     # раньше стоит несосчитанная правка
+))
+
+
+def _dry_verdict(index, source, status, *, reason=None, error=None,
+                 details=None, **extra):
+    """Собрать один вердикт, проверив словарь статусов и причин.
+
+    Проверка не декоративная: статус и код причины — публичный контракт, по
+    которому агент разбирает квитанцию, и опечатка в них уезжает наружу молча.
+    Падаем, как падает `_error` на незнакомом коде, и по той же причине: под
+    `python -O` assert исчезает, а контракт обязан ломаться в любом режиме.
+    """
+    if status not in _DRY_STATUSES:
+        raise ValueError(f"unknown dry-run status {status!r}")
+    if (reason is not None and reason not in _REASON_CODES
+            and reason not in _DRY_REASON_CODES):
+        raise ValueError(f"unknown dry-run reason code {reason!r}")
+    verdict = {"op": index, "source": source, "status": status}
+    if reason:
+        verdict["reason"] = reason
+    if error:
+        verdict["error"] = error
+    if details:
+        verdict["details"] = details
+    verdict.update(extra)
+    return verdict
+
+
+def _dry_run_select_tab(doc, tab_id=None):
+    """Выбрать вкладку для читающего планировщика, не вызывая `_error`.
+
+    Обычный `_select_tab` намеренно сцеплен с пишущим CLI: он выходит из
+    процесса на неудачном выборе. Холостому прогону нужно значение, которое
+    станет по-операционным отказом и сохранит машинную квитанцию.
+    """
+    tabs = _collect_tabs(doc)
+    if tab_id is not None:
+        matches = [(tid, title, dt) for tid, title, dt in tabs
+                   if tid == tab_id]
+        if len(matches) > 1:
+            # `_select_tab` в таком документе берёт ПЕРВУЮ совпавшую вкладку.
+            # Повторить это здесь значит выдать вердикт для пространства
+            # индексов, о котором ничего не известно: у двух вкладок с одним
+            # id разный текст, и «применится» относилось бы неизвестно к
+            # какой. Отказываем, называя обе, — ложная тревога в эту сторону
+            # ничего не стоит, а ложное обещание стоит документа.
+            candidates = [{"tab_id": tid, "title": title}
+                          for tid, title, _dt in matches[:8]]
+            return None, None, {
+                "error": (f"tab id {tab_id!r} appears {len(matches)} times; "
+                          f"explicit tab selection is ambiguous"),
+                "reason": "tab_selection",
+                "details": {"code": "duplicate_tab_id", "tab_id": tab_id,
+                            "count": len(matches), "candidates": candidates},
+            }
+        if len(matches) == 1:
+            tid, _title, dt = matches[0]
+            return tid, dt, None
+        available = ", ".join(
+            f"{tid}:{title!r}" for tid, title, _ in tabs if tid) or "(none)"
+        return None, None, {
+            "error": f"tab not found: {tab_id}. Available tabs: {available}",
+            "reason": "tab_selection",
+            "details": {"code": "tab_not_found", "tab_id": tab_id}}
+    if len(tabs) == 1:
+        return tabs[0][0], tabs[0][2], None
+    listing = "; ".join(f"{tid}={title!r}" for tid, title, _ in tabs)
+    return None, None, {
+        "error": (f"document has {len(tabs)} tabs; pass --tab <tabId>. "
+                  f"Tabs: {listing}"),
+        "reason": "tab_selection",
+        "details": {"code": "tab_required", "tabs": len(tabs)}}
+
+
+def _dry_call(fn):
+    """Позвать ограду писателя и снять с неё отказ вместо выхода.
+
+    Возвращает (значение, отказ). Отказ — словарь той же формы, что уходит в
+    квитанцию: текст, код причины писателя и его подробности.
+    """
+    global _RAISE_ERRORS
+    _RAISE_ERRORS = True
+    try:
+        return fn(), None
+    except PatchOpError as exc:
+        return None, {
+            "error": str(exc),
+            **({"reason": exc.reason} if exc.reason else {}),
+            **({"details": exc.details} if exc.details is not None else {}),
+        }
+    except Exception as exc:                                    # noqa: BLE001
+        # Планировщик не имеет права ронять процесс на кривой операции: он
+        # советует. Писателю сюда уже не дойти — типы адреса и текста
+        # проверены в `_resolve_op`, — но сеть страховки остаётся: советчик
+        # обязан досчитать остальные операции файла.
+        return None, {"error": f"invalid operation: {exc}",
+                      "reason": "schema_invalid"}
+    finally:
+        _RAISE_ERRORS = False
+
+
+def prepare_patch(doc, ops, *, tab_id=None, anchored=False, comments=None):
+    """Разобрать файл операций по снимку документа.
+
+    Функция намеренно чиста относительно сервисов Google: на вход приходит
+    снимок документа и перепись комментариев, а не Docs/Drive. Дотянуться
+    отсюда до `batchUpdate`, ответов, канарейки или выгрузки docx нечем.
+
+    Повторяет плановый цикл `patch_doc` шаг в шаг: тот же разбор поздних
+    операций, тот же резолвер, та же классификация «ничего не пишет» и «только
+    удлиняет». Разойтись им нельзя — советчик, считающий не то, что писатель,
+    хуже отсутствующего.
+    """
+    tid, doc_tab, tab_error = _dry_run_select_tab(doc, tab_id=tab_id)
+    # Состояние тредов по переписи. Тред, которого в документе нет, закрыт или
+    # удалён, писатель не адресует вовсе (`_locate_thread_anchor`), и это
+    # видно по чтению. Опечатка в `comment_id` — самая частая беда адресации
+    # по треду, и узнавать о ней после записи незачем.
+    thread_state = {}
+    for c in comments or ():
+        cid = c.get("id")
+        if not cid:
+            continue
+        thread_state[cid] = ("deleted" if c.get("deleted") else
+                             "resolved" if c.get("resolved") else "open")
+    prepared = {"doc_tab": doc_tab, "tab_id": tid, "anchored": bool(anchored),
+                "revision_id": doc.get("revisionId"),
+                "thread_state": thread_state, "items": []}
+    for i, op in enumerate(ops):
+        item = {"index": i, "op": op, "resolved": None, "insertion": None,
+                "noop": False, "late_bound": False, "error": None,
+                "deferred": None}
+        if tab_error:
+            item["error"] = tab_error
+        elif not isinstance(op, dict):
+            item["error"] = {
+                "error": (f"операция должна быть объектом, а не "
+                          f"{type(op).__name__}"),
+                "reason": "schema_invalid",
+                "details": {"type": type(op).__name__}}
+        elif str(op.get("op", "")) in _LATE_BOUND_OPS:
+            item["late_bound"] = True
+            validate = (_validate_around_op
+                        if op.get("op") == "replace_around_anchor"
+                        else _validate_anchor_op)
+            _value, error = _dry_call(lambda: validate(op))
+            if error:
+                item["error"] = error
+        else:
+            r, error = _dry_call(lambda: _resolve_op(op, doc_tab, tid))
+            if error:
+                # Цель не разрешилась НА СНИМКЕ. У писателя это `deferred`, а
+                # не отказ: на заякоренном документе он пробует её ещё раз по
+                # живому чтению. Смешивать это с ошибкой схемы нельзя — у них
+                # разная судьба.
+                item["deferred"] = error
+            else:
+                item["resolved"] = r
+                pair, error = _dry_call(
+                    lambda: (_op_pure_insertion(op, doc_tab, r),
+                             _op_is_noop(op, doc_tab, r)))
+                if error:
+                    item["resolved"] = None
+                    item["error"] = error
+                else:
+                    item["insertion"], item["noop"] = pair
+        prepared["items"].append(item)
+    return prepared
+
+
+def _dry_address_text(item):
+    """Текст, которым адресуется операция, — или None, если адрес не текст.
+
+    Цитата: число её совпадений и есть доказательство адреса, и его может
+    сдвинуть соседка по файлу — либо неоднозначностью, либо через
+    `_check_occurrence_stability`. Именованный диапазон: его границы Google
+    ведёт сам, правка текста рядом их не двигает. Тред: адресом служит
+    разговор, а не текст, и такая операция всё равно `unknown`.
+    """
+    op = item["op"]
+    if item["late_bound"] or not isinstance(op, dict):
+        return None
+    quote = op.get("quote")
+    return quote if isinstance(quote, str) and quote else None
+
+
+def _dry_mutated_buffer(writers, buf, at, doc_tab):
+    """Буфер вкладки после ВСЕХ ранних правок, которые писатель применит.
+
+    Композиция нужна целиком, а не по одной: две вставки, ни одна из которых
+    сама по себе копии не создаёт, вместе собирают вторую на стыке — и тогда
+    поздняя правка по цитате получает `quote_ambiguous`, а холостой прогон
+    успел ей пообещать применение (найдено ревью плана T11). Диапазоны ранних
+    правок не пересекаются — это доказано оградой пересечений, — поэтому их
+    можно наложить разом, справа налево.
+
+    Смещения здесь буферные, а не индексы Docs, и это не вторая система
+    координат: буфер строит тот же `_text_buffer`, которым ищет и считает сам
+    резолвер. Результат отвечает ровно на один вопрос — изменилось ли число
+    совпадений — и никогда не становится адресом записи.
+
+    `None` значит «наложить не вышло»: место записи не нашлось в буфере. Тогда
+    обещания нет, потому что считать нечем.
+    """
+    spans = []
+    for item in writers:
+        r = item["resolved"]
+        idx = item["index"]
+        start = at.get(r["start"])
+        if start is None:
+            return None
+        if item.get("insertion"):
+            where, text = item["insertion"]
+            old = _op_current_text(item["op"], doc_tab, r)
+            if old is None:
+                return None
+            point = start if where == "before" else start + len(old)
+            spans.append((point, point, idx, text))
+        elif r["kind"] == "insert":
+            spans.append((start, start, idx, r.get("text", "")))
+        else:
+            # Складывается ТОЛЬКО то, что писатель применяет, ничего не
+            # удаляя: на заякоренном документе `would_apply` получают ровно
+            # вставки и чистые удлинения. Правка, которая что-то удаляет,
+            # сюда не приходит, и разбирать её здесь значило бы написать
+            # ветку, которую нечем вызвать, — обещание защиты вместо защиты.
+            # Если набор писателей когда-нибудь расширят, ответ отсюда будет
+            # «не сосчитали», а не тихая ошибка.
+            return None
+    out = buf
+    # Порядок наложения — справа налево, а при равной позиции ПОЗДНЯЯ операция
+    # накладывается первой: писатель применяет их по очереди, и текст ранней
+    # оказывается слева от текста поздней. Ключ сортировки поэтому кончается
+    # номером операции, а не самим текстом: по тексту порядок «z раньше a»
+    # решала бы алфавитная случайность.
+    #
+    # Через `compile_index_plan` две записи в одну точку сегодня не приходят —
+    # у них совпадают диапазоны, и ограда пересечений отклоняет обе. Но это
+    # ограда по индексам Docs, а здесь смещения буфера, и держать
+    # правильность одной функции на свойстве другой значит однажды их
+    # рассогласовать.
+    for start, end, _idx, text in sorted(spans, reverse=True):
+        out = out[:start] + text + out[end:]
+    return out
+
+
+def decide_op(item, *, doc_tab, anchored, thread_state=None,
+              early=None, blocked=None):
+    """Вердикт по одной операции — без писателя, выгрузки и канарейки."""
+    op, r = item["op"], item.get("resolved")
+    index, source = item["index"], _op_source_label(op, r)
+    if early:
+        return _dry_verdict(index, source, "would_refuse",
+                            reason=early.get("reason"),
+                            error=early.get("error"),
+                            details=early.get("details"))
+    if item["noop"]:
+        # Правка, которая ничего не пишет, не нуждается ни в ревизии, ни в
+        # шлюзе: писатель для неё не отправляет ни одного запроса. Поэтому
+        # `noop` стоит ВЫШЕ глобальных ограждений — иначе советчик отказывал
+        # бы там, где вызов проходит успешно (ревью плана T11).
+        return _dry_verdict(index, source, "noop")
+    if blocked:
+        return _dry_verdict(index, source, "would_refuse",
+                            reason=blocked["reason"], error=blocked["error"])
+    if item["late_bound"]:
+        cid = op.get("comment_id")
+        if not anchored:
+            return _dry_verdict(
+                index, source, "would_refuse",
+                reason="comment_thread_unresolvable",
+                error=("в документе нет заякоренных комментариев — правку по "
+                       "треду адресовать не к чему."),
+                details={"comment_id": cid})
+        state = (thread_state or {}).get(cid)
+        if state != "open":
+            # Тред закрыт, удалён или его вовсе нет в этом документе.
+            # `_locate_thread_anchor` откажет по любой из этих причин, и
+            # перепись комментариев — тот же источник, которым он пользуется.
+            return _dry_verdict(
+                index, source, "would_refuse",
+                reason="comment_thread_unresolvable",
+                error=(f"тред {cid!r} не адресуется: "
+                       + {"resolved": "он закрыт.",
+                          "deleted": "он удалён."}.get(
+                              state, "в этом документе его нет.")
+                       + " Прочитайте `comments` заново и возьмите id оттуда."),
+                details={"comment_id": cid,
+                         "thread_state": state or "absent"})
+        return _dry_verdict(index, source, "unknown",
+                            reason="fresh_anchor_map_requires_canary")
+    if item["deferred"]:
+        # Чистый путь такую операцию пропускает, заякоренный пробует ещё раз
+        # по живому чтению и получает ту же ошибку — документ между чтениями
+        # не менялся. Случай, когда его меняет соседка по файлу, разбирается
+        # отдельно, в проверке зависимостей.
+        d = item["deferred"]
+        return _dry_verdict(index, source, "would_refuse",
+                            reason=d.get("reason"), error=d.get("error"),
+                            details=d.get("details"))
+    if not r:
+        return _dry_verdict(index, source, "would_refuse",
+                            reason="schema_invalid",
+                            error="operation did not resolve")
+    if r["kind"] == "insert" and not r.get("text"):
+        # Вставке нечего вставлять. Чистый путь не строит для неё запроса,
+        # заякоренный возвращает «вставлять нечего» — ни один знак документа
+        # не меняется, и обещать применение значило бы обещать событие.
+        return _dry_verdict(index, source, "noop")
+    if not anchored:
+        return _dry_verdict(index, source, "would_apply")
+    # Заякоренный документ. Вставка и замена, которая только удлиняет цель,
+    # идут в `_apply_op_anchor_safe` коротким путём: карта выгрузки для них не
+    # строится вовсе, а все их ограды — предложения по точке — решаются по
+    # снимку. Настоящая замена без карты неразрешима.
+    if r["kind"] == "insert" or item["insertion"]:
+        return _dry_verdict(index, source, "would_apply")
+    return _dry_verdict(index, source, "unknown",
+                        reason="fresh_anchor_map_requires_canary")
+
+
+def compile_index_plan(prepared):
+    """Собрать вердикты по всему файлу операций.
+
+    Порядок фаз повторяет плановый цикл `patch_doc`: пересечения, отложенная с
+    явным номером вхождения, два адреса по одному треду, ограды предложений.
+    Затем — то, чего у писателя нет и быть не может: границы собственного
+    знания советчика.
+    """
+    doc_tab = prepared["doc_tab"] or {}
+    items = prepared["items"]
+    anchored = prepared["anchored"]
+    early = {it["index"]: it["error"] for it in items if it["error"]}
+
+    # Пересечения. Считаются тем же кодом, что у писателя, и по тем же
+    # разрешённым записям.
+    indexed = {it["index"]: it["resolved"] for it in items
+               if it["resolved"] and not it["noop"]}
+    for i, why in _ops_overlap_conflicts(indexed).items():
+        # Кода причины здесь нет и у писателя — вердикт молчит так же, как
+        # молчит его квитанция.
+        early[i] = {"error": why}
+
+    # Отложенная операция с ЯВНЫМ номером вхождения: номер осмыслен только
+    # вместе с числом копий, а плановая фаза его не видела.
+    for it in items:
+        i, op = it["index"], it["op"]
+        if (it["deferred"] and isinstance(op, dict) and "occurrence" in op
+                and it["deferred"].get("reason") != "schema_invalid"):
+            early[i] = {
+                "error": (f"на исходном снимке эта правка не разрешилась "
+                          f"({it['deferred'].get('error')}), а номер вхождения "
+                          f"имеет смысл только вместе с числом копий."),
+                "reason": "concurrent_edit",
+                "details": {"occurrence": op.get("occurrence")}}
+
+    # Две правки по одному треду в одном файле — почти наверняка описка,
+    # разобрать её за человека нечем. Отклоняются обе.
+    by_thread = {}
+    for it in items:
+        if it["late_bound"] and it["index"] not in early:
+            by_thread.setdefault(it["op"].get("comment_id"),
+                                 []).append(it["index"])
+    for cid, group in by_thread.items():
+        if len(group) < 2:
+            continue
+        for i in group:
+            early[i] = {
+                "error": (f"в файле {len(group)} правки по одному треду "
+                          f"{cid!r} — отклонены все. Оставьте одну."),
+                "reason": "unsupported_structure",
+                "details": {"comment_id": cid, "ops": group}}
+
+    # Предложения судятся по месту: операция, которая ничего не удаляет,
+    # проверяется как точка, замена — как диапазон.
+    for it in items:
+        i, r, ins = it["index"], it["resolved"], it["insertion"]
+        if r is None or it["noop"] or i in early:
+            continue
+        if r["kind"] == "insert" or ins:
+            point = r["end"] if (ins and ins[0] == "after") else r["start"]
+            _v, err = _dry_call(
+                lambda: _refuse_on_suggestion_at(doc_tab, point, r["source"]))
+        else:
+            _v, err = _dry_call(
+                lambda: _refuse_on_suggestion_range(
+                    doc_tab, r["start"], r["end"], r["source"]))
+        if err:
+            early[i] = err
+
+    # Глобальные ограждения писателя: их он проверяет один раз на весь файл и
+    # выходит из процесса, не применив ничего. Для `noop` они не работают —
+    # `decide_op` пропускает их выше, потому что запросов у такой правки нет.
+    blocked = None
+    if not prepared.get("revision_id"):
+        blocked = {"reason": "missing_revision_id",
+                   "error": ("документ прочитан без `revisionId` — запись "
+                             "нечем закрепить за ревизией, и незакреплённой "
+                             "скрепка её не отправит.")}
+    elif anchored and C5_INSERT_NEAR_ANCHOR_SAFE is not True and any(
+            _op_inserts(it["op"], it["resolved"]) for it in items):
+        state = ("unverified" if C5_INSERT_NEAR_ANCHOR_SAFE is None
+                 else "verified UNSAFE")
+        blocked = {"reason": "insert_near_anchor_unverified",
+                   "error": (f"в документе есть заякоренные комментарии, а "
+                             f"поведение вставки рядом с якорем {state} — "
+                             f"вставки заблокированы, и с ними весь файл.")}
+
+    verdicts = [decide_op(it, doc_tab=doc_tab, anchored=anchored,
+                          thread_state=prepared.get("thread_state"),
+                          early=early.get(it["index"]), blocked=blocked)
+                for it in items]
+
+    # Дальше — только заякоренный путь. На чистом документе все операции
+    # разрешаются по ОДНОМУ снимку и уходят одним атомарным батчем в обратном
+    # порядке индексов, поэтому вердикт поздней правки не может зависеть от
+    # ранней. Зависимость по уникальности была свойством `replaceAllText`,
+    # который искал текст в момент записи; его больше нет.
+    if not anchored:
+        return verdicts
+
+    # Правка по треду ПОСЛЕ правки, писавшей без карты комментариев. Вставка
+    # и чистое удлинение карту не строят, значит задели они чей-то якорь или
+    # нет — неизвестно, и писатель такую правку по треду отклоняет.
+    unmapped_at = None
+    for pos, it in enumerate(items):
+        # Именно `unknown`: другого вердикта у живой правки по треду на
+        # заякоренном документе не бывает, и перечислять здесь ещё два значило
+        # бы написать условие, которому нечем сработать.
+        if (it["late_bound"] and unmapped_at is not None
+                and verdicts[pos]["status"] == "unknown"):
+            verdicts[pos] = _dry_verdict(
+                it["index"], verdicts[pos]["source"], "would_refuse",
+                reason="concurrent_edit",
+                error=("раньше в этом же файле стоит правка, которая карту "
+                       "комментариев не строит (вставка), — задела она текст "
+                       "под этим тредом или нет, неизвестно. Поставьте правки "
+                       "по тредам ПЕРЕД вставками или разнесите их на два "
+                       "вызова."),
+                details={"comment_id": it["op"].get("comment_id"),
+                         "after_op": unmapped_at})
+        elif (verdicts[pos]["status"] == "would_apply"
+                and unmapped_at is None
+                and (it["resolved"] and (it["resolved"]["kind"] == "insert"
+                                         or it["insertion"]))):
+            unmapped_at = it["index"]
+
+    # Один проход слева направо, и он же — вся граница знания советчика.
+    #
+    # Раньше проходов было два, и между ними жила дыра: правки, отказавшие на
+    # снимке, в счёт не шли вовсе — «отказ значит не пишет». Это неверно.
+    # Заякоренный путь применяет операции ПО ОДНОЙ, перечитывая документ, и
+    # правка, чья цитата на снимке неоднозначна, к своей очереди может стать
+    # однозначной — соседка унесла копию, — примениться и отнять однозначность
+    # у следующей. Найдено ревью кода на входе `XbaQCba` из трёх вставок.
+    #
+    # Отсюда два множества и правило перехода между ними:
+    #
+    # `placed` — правки, которые писатель применит, и место с текстом у них
+    #   известны. Их можно наложить на буфер и пересчитать совпадения.
+    # `unplaceable` — правки, которые МОГУТ писать, но сложить их нечем:
+    #   неизвестный исход (`unknown`) и всё, что мы не считали
+    #   (`not_simulated`). После такой обещаний не остаётся вовсе.
+    #
+    # Отказ на снимке попадает в `unplaceable` не сам по себе, а только через
+    # `not_simulated`: если сложение показало, что число совпадений его цитаты
+    # не менялось, отказ окончателен, и травить им остальной файл незачем.
+    buf, imap = _text_buffer(doc_tab)
+    # Индекс Docs -> смещение в буфере. Записываются и начала знаков, и
+    # позиция сразу ЗА знаком: точка вставки после последней цитаты документа —
+    # это ровно «за концом», и без неё такая правка теряла бы место записи.
+    at = {}
+    for j, ch in enumerate(buf):
+        d = imap[j]
+        if d < 0:
+            continue
+        at.setdefault(d, j)
+        at.setdefault(d + (2 if ord(ch) > 0xFFFF else 1), j + 1)
+
+    placed, unplaceable = [], []
+    for pos, item in enumerate(items):
+        verdict = verdicts[pos]
+        # `noop` — это ровно «ничего не напишет», и оба его повода от текста
+        # не зависят: у замены он значит, что новый текст дословно равен
+        # цитате (свойство самой операции), у вставки — что вставлять нечего.
+        # Такая правка не может стать записью, что бы соседки ни сделали.
+        #
+        # Но собственный вердикт у неё измениться может: если соседка унесла
+        # её цитату, писатель откажет вместо тихого «ничего не делаю». Поэтому
+        # понижение к ней применяется как ко всем, а в число возможных
+        # писателей она не входит никогда — иначе снимала бы обещания со всех,
+        # кто стоит за ней (обе половины найдены ревью кода).
+        writes_nothing = verdict["status"] == "noop"
+        # Отказ по цели снимается только соседкой по тексту. Отказ по схеме,
+        # по гвардии или по треду соседка не снимет, и притворяться, что
+        # такая правка может выстрелить, значит терять обещания даром.
+        liftable = (verdict["status"] == "would_refuse"
+                    and item["deferred"] is not None
+                    and item["index"] not in early
+                    and item["deferred"].get("reason") in _DRY_LIFTABLE_REFUSALS)
+        if verdict["status"] in ("would_apply", "noop") or liftable:
+            if unplaceable:
+                verdicts[pos] = _dry_verdict(
+                    verdict["op"], verdict["source"], "not_simulated",
+                    reason="prior_unsimulated_mutation",
+                    depends_on=list(unplaceable))
+            elif placed and _dry_address_text(item):
+                target = _dry_address_text(item)
+                mutated = _dry_mutated_buffer(placed, buf, at, doc_tab)
+                if (mutated is None
+                        or _count_in_buffer(mutated, target)
+                        != _count_in_buffer(buf, target)):
+                    verdicts[pos] = _dry_verdict(
+                        verdict["op"], verdict["source"], "not_simulated",
+                        reason="prior_mutation_may_change_uniqueness",
+                        depends_on=[w["index"] for w in placed])
+        if writes_nothing:
+            continue
+        status = verdicts[pos]["status"]
+        if status == "would_apply" and item["resolved"]:
+            placed.append(item)
+        elif status in ("unknown", "not_simulated"):
+            unplaceable.append(item["index"])
+
+    _dry_mark_reply_intents(items, verdicts)
+    return verdicts
+
+
+def _dry_mark_reply_intents(items, verdicts):
+    """Условное намерение ответа у правки, стирающей прокомментированное слово.
+
+    Утверждать здесь нечего: ответ уходит только за подтверждённой пересадкой
+    якоря (`_fold_reply_intents`), а она видна лишь по свежей карте. Поэтому
+    поле условное с обеих сторон — и в том, что ответ будет, и в том, что его
+    подавят.
+
+    Подавление называется потому, что человек не увидит его ни в документе, ни
+    в треде: вставка, стоящая в файле ПОЗЖЕ, отменяет все накопленные
+    намерения, и обязательный ответ просто не уходит.
+    """
+    later_unmapped = None
+    for pos in range(len(items) - 1, -1, -1):
+        item, verdict = items[pos], verdicts[pos]
+        if (item["late_bound"] and verdict["status"] == "unknown"
+                and item["op"].get("op") == "replace_around_anchor"):
+            intent = {"comment_id": item["op"].get("comment_id"),
+                      "state": "conditional",
+                      "note": ("если комментарий переедет на соседнее слово, "
+                               "скрепка ответит в этом треде сама")}
+            if later_unmapped is not None:
+                intent["suppressed_if_applied"] = {
+                    "by_op": later_unmapped,
+                    "note": ("вставка ниже по файлу отменяет накопленные "
+                             "намерения — обязательный ответ не уйдёт. "
+                             "Поставьте её в отдельный вызов.")}
+            verdicts[pos] = {**verdict, "would_reply": intent}
+        elif (verdict["status"] not in ("would_refuse", "noop")
+                and item["resolved"]
+                and (item["resolved"]["kind"] == "insert"
+                     or item["insertion"])):
+            # Не `would_apply`: каскад успел понизить вставку, стоящую после
+            # `unknown`, до `not_simulated`, а писать она от этого не
+            # перестала — и намерение ответа она отменит так же.
+            later_unmapped = item["index"]
+
+
+def _dry_receipt(doc_id, prepared, verdicts):
+    return {
+        "action": "dry-run",
+        "strategy": "read-only-advisory",
+        "doc_id": doc_id,
+        "tab_id": prepared.get("tab_id"),
+        "revision_id_before": prepared.get("revision_id"),
+        # Каким путём пойдёт запись, решает документ целиком, и от этого
+        # зависит половина вердиктов. Без этой строки читающий квитанцию не
+        # поймёт, почему обычная замена оказалась `unknown`.
+        "doc_strategy": ("anchor-safe-per-op" if prepared["anchored"]
+                         else "index-atomic"),
+        "writes_performed": 0,
+        "operations": verdicts,
+    }
+
+
+def dry_run_patch(file_id, ops_path, tab_id=None, output=None):
+    """Холостой прогон `patch`: только чтение, ни одной записи.
+
+    Снимок берётся читающими вызовами, и других здесь нет. Ни писатель, ни
+    выгрузка docx, ни канарейка, ни отправка ответов в этот граф вызовов не
+    входят.
+    """
+    file_id = _extract_doc_id(file_id)
+
+    def _bail(message):
+        receipt = {"action": "dry-run", "strategy": "read-only-advisory",
+                   "doc_id": file_id, "writes_performed": 0,
+                   "operations": [_dry_verdict(None, "ops.json",
+                                               "would_refuse",
+                                               reason="schema_invalid",
+                                               error=message)]}
+        _emit_json(receipt, output=output,
+                   summary={"action": "dry-run", "writes_performed": 0})
+        raise SystemExit(3)
+
+    if not os.path.exists(ops_path):
+        _error(f"ops file not found: {ops_path}")
+    try:
+        with open(ops_path, "r") as f:
+            ops = json.load(f)
+    except Exception as exc:                                    # noqa: BLE001
+        # Кривой файл остаётся внутри квитанции холостого прогона и его
+        # контракта по коду возврата: советчик не пишет и не падает иначе.
+        _bail(f"cannot parse ops json: {exc}")
+    if not isinstance(ops, list) or not ops:
+        _bail("ops file must contain a non-empty JSON array of operations")
+    try:
+        creds = get_creds()
+        docs_service = get_docs_service(creds)
+        drive_service = get_drive_service(creds)
+        doc = _safe_get_doc(docs_service, file_id)
+        raw, anchored, _fp, _universe = _census_comments(
+            drive_service, file_id)
+    except Exception as exc:                                    # noqa: BLE001
+        _error(f"dry-run read failed: {exc}")
+    prepared = prepare_patch(doc, ops, tab_id=tab_id,
+                             anchored=bool(anchored), comments=raw)
+    verdicts = compile_index_plan(prepared)
+    receipt = _dry_receipt(file_id, prepared, verdicts)
+    _emit_json(receipt, output=output,
+               summary={"action": "dry-run", "writes_performed": 0})
+    if any(v["status"] not in ("would_apply", "noop") for v in verdicts):
+        raise SystemExit(3)
+    return receipt
+
+
+def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None):
     """Apply structural patch operations to a Google Doc.
 
     Strategy is selected at DOCUMENT level (codex r1 #2 — anchor positions
@@ -7602,6 +8360,14 @@ def patch_doc(file_id, ops_path, tab_id=None):
         replaceAllText, inserts via insertText; each op class is gated by
         its phase-0 characterization result (fail closed while unverified).
     """
+    if dry_run:
+        return dry_run_patch(file_id, ops_path, tab_id=tab_id, output=output)
+    if output:
+        # `--output` существует ради холостого прогона: его квитанция — это
+        # список вердиктов на весь файл, и она обрезается в выводе агента.
+        # Молча принять флаг у настоящей записи значило бы пообещать файл,
+        # которого не будет.
+        _error("--output работает только вместе с --dry-run")
     file_id = _extract_doc_id(file_id)
 
     if not os.path.exists(ops_path):
@@ -7652,6 +8418,21 @@ def patch_doc(file_id, ops_path, tab_id=None):
     _RAISE_ERRORS = True
     try:
         for i, op in enumerate(ops):
+            if not isinstance(op, dict):
+                # Раньше `op.get(...)` стоял здесь без проверки типа и ронял
+                # процесс трейсбеком: файл `[null, нормальная правка]` не
+                # применял НИЧЕГО и не оставлял квитанции. Одна испорченная
+                # строка не должна стоить человеку остальных — то же правило,
+                # по которому неразрешившаяся цель не уносит соседей (#36).
+                resolved.append(None)
+                insertions.append(None)
+                noops.append(False)
+                early_refusals[i] = (
+                    f"операция должна быть объектом, а не "
+                    f"{type(op).__name__}")
+                early_diag[i] = ("schema_invalid",
+                                 {"type": type(op).__name__})
+                continue
             if str(op.get("op", "")) in _LATE_BOUND_OPS:
                 resolved.append(None)
                 insertions.append(None)
@@ -7696,6 +8477,12 @@ def patch_doc(file_id, ops_path, tab_id=None):
     # Пропустить такую значит применить голый порядковый номер к состоянию
     # документа, которого человек не видел.
     for i in list(deferred):
+        # Ошибку схемы это правило не касается: `occurrence: "два"` не
+        # разрешился не потому, что документ изменился под правкой, и назвать
+        # это `concurrent_edit` значит отправить человека искать чужую правку
+        # вместо своей опечатки (найдено стендом мутаций T11).
+        if early_diag.get(i, (None, None))[0] == "schema_invalid":
+            continue
         if "occurrence" in (ops[i] if isinstance(ops[i], dict) else {}):
             early_refusals[i] = (
                 f"на исходном снимке эта правка не разрешилась "
@@ -7856,9 +8643,7 @@ def patch_doc(file_id, ops_path, tab_id=None):
     # A deferred op has no resolved record, so its kind is read from the op
     # itself — the gate must not go blind just because a target did not
     # resolve on the planning snapshot.
-    has_insert = any(r["kind"] == "insert" if r else
-                     str(ops[i].get("op", "")).startswith("insert")
-                     for i, r in enumerate(resolved))
+    has_insert = any(_op_inserts(ops[i], r) for i, r in enumerate(resolved))
     if has_insert and C5_INSERT_NEAR_ANCHOR_SAFE is not True:
         state = "unverified" if C5_INSERT_NEAR_ANCHOR_SAFE is None else "verified UNSAFE"
         _error(
@@ -11728,6 +12513,14 @@ def main():
     pt.add_argument("ops", help="Path to ops.json with list of operations")
     pt.add_argument("--tab", dest="tab_id", default=None,
                     help="Tab ID (required if doc has multiple tabs)")
+    pt.add_argument("--dry-run", action="store_true",
+                    help="Показать вердикт по каждой правке, ничего не "
+                         "записывая. `would_apply` — применится; `unknown` — "
+                         "по чтению не решается; `would_refuse` — откажет, и "
+                         "видно почему")
+    pt.add_argument("--output", default=None,
+                    help="Записать полную квитанцию холостого прогона в файл "
+                         "и напечатать короткую (только с --dry-run)")
 
     # mark command (named ranges)
     mk = sub.add_parser("mark", help="Create a named range around a text fragment")
@@ -11838,7 +12631,8 @@ def main():
         mark_range(args.file_id, args.name, args.quote,
                    tab_id=args.tab_id, occurrence=args.occurrence)
     elif args.command == "patch":
-        patch_doc(args.file_id, args.ops, tab_id=args.tab_id)
+        patch_doc(args.file_id, args.ops, tab_id=args.tab_id,
+                  dry_run=args.dry_run, output=args.output)
     elif args.command == "download":
         download_doc(args.file_id, fmt=args.format, output=args.output,
                      images_dir=args.images_dir)
