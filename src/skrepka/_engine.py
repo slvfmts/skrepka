@@ -1901,14 +1901,20 @@ def _resolve_op(op, doc_tab, tab_id):
     # `PatchOpError`, и по-операционная обработка их не ловит: процесс падает
     # трейсбеком, и валидные соседки по файлу не применяются вовсе. Ровно та
     # же цена, что у операции-не-объекта (найдено ревью T11).
-    for field in ("range", "quote"):
-        if field in op and not isinstance(op[field], str):
-            _error(
-                f"поле {field!r} должно быть строкой, а не "
-                f"{type(op[field]).__name__}: {op}",
-                reason="schema_invalid",
-                details={"field": field, "type": type(op[field]).__name__})
-    if "occurrence" in op:
+    # Проверяется ТОЛЬКО то поле, которым операция реально адресуется, и
+    # порядок здесь тот же, что в разборе цели ниже: `range` старше `quote`.
+    # Операция с именованным диапазоном может нести и лишнюю `quote`, и
+    # лишний `occurrence` — они не используются, это решено и записано в
+    # докстроке `_op_current_text`, — и отвергать из-за них рабочий вход
+    # значит ломать то, что работало (найдено ревью починок).
+    address = "range" if "range" in op else "quote" if "quote" in op else None
+    if address is not None and not isinstance(op[address], str):
+        _error(
+            f"поле {address!r} должно быть строкой, а не "
+            f"{type(op[address]).__name__}: {op}",
+            reason="schema_invalid",
+            details={"field": address, "type": type(op[address]).__name__})
+    if address == "quote" and "occurrence" in op:
         # `bool` — подкласс `int`, и `int(True)` даёт 1: номер вхождения,
         # которого человек не называл, молча превратился бы в первый.
         if isinstance(op["occurrence"], bool) or not isinstance(
@@ -5163,12 +5169,26 @@ def _ops_overlap_conflicts(indexed):
     # Сравниваются ВСЕ пары, а не соседние по сортировке. Широкая правка
     # перекрывает несколько узких, и соседняя пара может при этом не
     # пересечься: на `[1,7]`, `[2,3]`, `[4,5]` соседи ловят только первые две,
-    # а `[4,5]` уходит внутрь `[1,7]` незамеченной. Чистый путь строит запросы
-    # в обратном порядке индексов, значит удаление `[1,7]` затирает уже
-    # записанное правкой `[4,5]`, и обе числятся применёнными — порча текста
-    # молча. Полный перебор здесь по средствам: файл операций человек пишет
-    # руками, и это десятки строк, а не тысячи (найдено ревью T11; правило
-    # было на ветке `sprint/public-mvp` и потерялось при переносе по задачам).
+    # а `[4,5]` уходит внутрь `[1,7]` незамеченной.
+    #
+    # Порчи текста прежний обход не давал, и это проверено, а не выведено:
+    # самая ранняя правка пересекающейся пары помечалась всегда — её сосед по
+    # сортировке начинается внутри неё. Беда была другая. Из
+    # противоречивого набора применялось ПОДМНОЖЕСТВО: широкая правка
+    # отклонялась, узкая внутри неё проходила, и человек получал половину
+    # того, что задумывал целиком, а квитанция не говорила, что уцелевшая
+    # правка из того же клубка.
+    #
+    # Цена полного перебора названа вслух: правка, пересекающаяся только с
+    # УЖЕ отклонённой, теперь тоже отклоняется. Чаще всего это случается с
+    # заменой, которая лишь удлиняет цель: она объявляет своим диапазоном
+    # весь исходный фрагмент, хотя пишет в одну точку за ним. Сузить её
+    # диапазон до места записи — правка ПОРЯДКА в писателе, не ограды, и она
+    # требует своего круга (записано долгом в `TASKS-r19.md`).
+    #
+    # Полный перебор здесь по средствам: файл операций человек пишет руками,
+    # это десятки строк, а не тысячи (найдено ревью T11; правило было на
+    # ветке `sprint/public-mvp` и потерялось при переносе по задачам).
     for pos, i in enumerate(order):
         for j in order[pos + 1:]:
             a, b = indexed[i], indexed[j]
@@ -7845,45 +7865,60 @@ def prepare_patch(doc, ops, *, tab_id=None, anchored=False, comments=None):
                 "revision_id": doc.get("revisionId"),
                 "thread_state": thread_state, "items": []}
     for i, op in enumerate(ops):
-        item = {"index": i, "op": op, "resolved": None, "insertion": None,
-                "noop": False, "late_bound": False, "error": None,
-                "deferred": None}
-        if tab_error:
-            item["error"] = tab_error
-        elif not isinstance(op, dict):
-            item["error"] = {
-                "error": (f"операция должна быть объектом, а не "
-                          f"{type(op).__name__}"),
-                "reason": "schema_invalid",
-                "details": {"type": type(op).__name__}}
-        elif str(op.get("op", "")) in _LATE_BOUND_OPS:
-            item["late_bound"] = True
-            validate = (_validate_around_op
-                        if op.get("op") == "replace_around_anchor"
-                        else _validate_anchor_op)
-            _value, error = _dry_call(lambda: validate(op))
-            if error:
-                item["error"] = error
-        else:
-            r, error = _dry_call(lambda: _resolve_op(op, doc_tab, tid))
-            if error:
-                # Цель не разрешилась НА СНИМКЕ. У писателя это `deferred`, а
-                # не отказ: на заякоренном документе он пробует её ещё раз по
-                # живому чтению. Смешивать это с ошибкой схемы нельзя — у них
-                # разная судьба.
-                item["deferred"] = error
-            else:
-                item["resolved"] = r
-                pair, error = _dry_call(
-                    lambda: (_op_pure_insertion(op, doc_tab, r),
-                             _op_is_noop(op, doc_tab, r)))
-                if error:
-                    item["resolved"] = None
-                    item["error"] = error
-                else:
-                    item["insertion"], item["noop"] = pair
-        prepared["items"].append(item)
+        prepared["items"].append(
+            _dry_prepare_item(i, op, doc_tab, tid, tab_error))
     return prepared
+
+
+def _dry_prepare_item(i, op, doc_tab, tid, tab_error):
+    """Разобрать одну операцию по снимку — тот же разбор, что у писателя.
+
+    Три исхода, и путать их нельзя, потому что судьба у них разная:
+    `error` — отказ, который писатель вынесет на любом снимке; `deferred` —
+    цель не разрешилась ЗДЕСЬ, а заякоренный путь попробует ещё раз по живому
+    чтению; `resolved` — цель разрешилась, и рядом лежит классификация
+    «ничего не пишет» и «только удлиняет».
+    """
+    item = {"index": i, "op": op, "resolved": None, "insertion": None,
+            "noop": False, "late_bound": False, "error": None,
+            "deferred": None}
+    if tab_error:
+        item["error"] = tab_error
+        return item
+    if not isinstance(op, dict):
+        item["error"] = {
+            "error": (f"операция должна быть объектом, а не "
+                      f"{type(op).__name__}"),
+            "reason": "schema_invalid",
+            "details": {"type": type(op).__name__}}
+        return item
+    if str(op.get("op", "")) in _LATE_BOUND_OPS:
+        item["late_bound"] = True
+        validate = (_validate_around_op
+                    if op.get("op") == "replace_around_anchor"
+                    else _validate_anchor_op)
+        _value, error = _dry_call(lambda: validate(op))
+        if error:
+            item["error"] = error
+        return item
+    r, error = _dry_call(lambda: _resolve_op(op, doc_tab, tid))
+    if error:
+        # Цель не разрешилась НА СНИМКЕ. У писателя это `deferred`, а не
+        # отказ: на заякоренном документе он пробует её ещё раз по живому
+        # чтению. Смешивать это с ошибкой схемы нельзя.
+        item["deferred"] = error
+        return item
+    pair, error = _dry_call(lambda: (_op_pure_insertion(op, doc_tab, r),
+                                     _op_is_noop(op, doc_tab, r)))
+    if error:
+        # У писателя резолвер и классификация стоят под ОДНИМ `try`, и сбой
+        # любой из них уходит в `deferred`. Держим тот же исход: назвать это
+        # ошибкой схемы значило бы отказать там, где писатель пробует ещё раз.
+        item["deferred"] = error
+        return item
+    item["resolved"] = r
+    item["insertion"], item["noop"] = pair
+    return item
 
 
 def _dry_address_text(item):
@@ -7962,9 +7997,51 @@ def _dry_mutated_buffer(writers, buf, at, doc_tab):
     return out
 
 
+def _dry_decide_by_thread(index, source, op, anchored, thread_state):
+    """Вердикт для правки, адресованной тредом.
+
+    Координат у такого адреса до свежей карты выгрузки не существует, поэтому
+    честный потолок здесь — `unknown`. Но два случая решаются по чтению, и
+    оба стоят того: на документе без заякоренных комментариев адресовать
+    нечего вовсе, а тред закрытый, удалённый или чужой писатель не адресует —
+    и перепись комментариев, по которой это видно, тот же источник, которым
+    пользуется он сам. Опечатка в `comment_id` — самая частая беда этой
+    адресации, и узнавать о ней после записи незачем.
+    """
+    cid = op.get("comment_id")
+    if not anchored:
+        return _dry_verdict(
+            index, source, "would_refuse",
+            reason="comment_thread_unresolvable",
+            error=("в документе нет заякоренных комментариев — правку по "
+                   "треду адресовать не к чему."),
+            details={"comment_id": cid})
+    state = (thread_state or {}).get(cid)
+    if state != "open":
+        return _dry_verdict(
+            index, source, "would_refuse",
+            reason="comment_thread_unresolvable",
+            error=(f"тред {cid!r} не адресуется: "
+                   + {"resolved": "он закрыт.",
+                      "deleted": "он удалён."}.get(
+                          state, "в этом документе его нет.")
+                   + " Прочитайте `comments` заново и возьмите id оттуда."),
+            details={"comment_id": cid, "thread_state": state or "absent"})
+    return _dry_verdict(index, source, "unknown",
+                        reason="fresh_anchor_map_requires_canary")
+
+
 def decide_op(item, *, doc_tab, anchored, thread_state=None,
-              early=None, blocked=None):
-    """Вердикт по одной операции — без писателя, выгрузки и канарейки."""
+              early=None, blocked_all=None, blocked_writers=None):
+    """Вердикт по одной операции — без писателя, выгрузки и канарейки.
+
+    Два глобальных ограждения писателя действуют на РАЗНОЕ, и путать их
+    нельзя. `blocked_all` — шлюз C5: писатель выходит из процесса до первой
+    операции, значит не применяется ничто, включая правки, которые ничего не
+    пишут. `blocked_writers` — отсутствие ревизии: она нужна только тому, кто
+    отправляет запрос, а для «ничего не пишу» запроса нет вовсе, и вызов
+    писателя проходит успешно.
+    """
     op, r = item["op"], item.get("resolved")
     index, source = item["index"], _op_source_label(op, r)
     if early:
@@ -7972,41 +8049,22 @@ def decide_op(item, *, doc_tab, anchored, thread_state=None,
                             reason=early.get("reason"),
                             error=early.get("error"),
                             details=early.get("details"))
-    if item["noop"]:
-        # Правка, которая ничего не пишет, не нуждается ни в ревизии, ни в
-        # шлюзе: писатель для неё не отправляет ни одного запроса. Поэтому
-        # `noop` стоит ВЫШЕ глобальных ограждений — иначе советчик отказывал
-        # бы там, где вызов проходит успешно (ревью плана T11).
-        return _dry_verdict(index, source, "noop")
-    if blocked:
+    if blocked_all:
         return _dry_verdict(index, source, "would_refuse",
-                            reason=blocked["reason"], error=blocked["error"])
+                            reason=blocked_all["reason"],
+                            error=blocked_all["error"])
+    # Обе формы «ничего не напишет» решаются ЗДЕСЬ: замена, чей новый текст
+    # дословно равен цитате, и вставка, которой нечего вставлять. Запроса у
+    # них нет, поэтому ревизия им не нужна и отказ по ней был бы выдуман.
+    # Вторая форма стояла ниже и такой отказ получала (своё ревью).
+    if item["noop"] or (r and r["kind"] == "insert" and not r.get("text")):
+        return _dry_verdict(index, source, "noop")
+    if blocked_writers:
+        return _dry_verdict(index, source, "would_refuse",
+                            reason=blocked_writers["reason"],
+                            error=blocked_writers["error"])
     if item["late_bound"]:
-        cid = op.get("comment_id")
-        if not anchored:
-            return _dry_verdict(
-                index, source, "would_refuse",
-                reason="comment_thread_unresolvable",
-                error=("в документе нет заякоренных комментариев — правку по "
-                       "треду адресовать не к чему."),
-                details={"comment_id": cid})
-        state = (thread_state or {}).get(cid)
-        if state != "open":
-            # Тред закрыт, удалён или его вовсе нет в этом документе.
-            # `_locate_thread_anchor` откажет по любой из этих причин, и
-            # перепись комментариев — тот же источник, которым он пользуется.
-            return _dry_verdict(
-                index, source, "would_refuse",
-                reason="comment_thread_unresolvable",
-                error=(f"тред {cid!r} не адресуется: "
-                       + {"resolved": "он закрыт.",
-                          "deleted": "он удалён."}.get(
-                              state, "в этом документе его нет.")
-                       + " Прочитайте `comments` заново и возьмите id оттуда."),
-                details={"comment_id": cid,
-                         "thread_state": state or "absent"})
-        return _dry_verdict(index, source, "unknown",
-                            reason="fresh_anchor_map_requires_canary")
+        return _dry_decide_by_thread(index, source, op, anchored, thread_state)
     if item["deferred"]:
         # Чистый путь такую операцию пропускает, заякоренный пробует ещё раз
         # по живому чтению и получает ту же ошибку — документ между чтениями
@@ -8017,14 +8075,13 @@ def decide_op(item, *, doc_tab, anchored, thread_state=None,
                             reason=d.get("reason"), error=d.get("error"),
                             details=d.get("details"))
     if not r:
+        # Сюда не приходят: цель не разрешилась — значит `deferred`, схема или
+        # вкладка — значит `error`, адрес по треду — значит `late_bound`, и все
+        # три разобраны выше. Это не ограда, а подпорка под `r["kind"]` ниже:
+        # советчик обязан досчитать файл, а не упасть на невозможном.
         return _dry_verdict(index, source, "would_refuse",
                             reason="schema_invalid",
                             error="operation did not resolve")
-    if r["kind"] == "insert" and not r.get("text"):
-        # Вставке нечего вставлять. Чистый путь не строит для неё запроса,
-        # заякоренный возвращает «вставлять нечего» — ни один знак документа
-        # не меняется, и обещать применение значило бы обещать событие.
-        return _dry_verdict(index, source, "noop")
     if not anchored:
         return _dry_verdict(index, source, "would_apply")
     # Заякоренный документ. Вставка и замена, которая только удлиняет цель,
@@ -8037,19 +8094,14 @@ def decide_op(item, *, doc_tab, anchored, thread_state=None,
                         reason="fresh_anchor_map_requires_canary")
 
 
-def compile_index_plan(prepared):
-    """Собрать вердикты по всему файлу операций.
+def _dry_early_refusals(items, doc_tab):
+    """Отказы, которые писатель выносит ДО цикла записи: {индекс -> отказ}.
 
-    Порядок фаз повторяет плановый цикл `patch_doc`: пересечения, отложенная с
-    явным номером вхождения, два адреса по одному треду, ограды предложений.
-    Затем — то, чего у писателя нет и быть не может: границы собственного
-    знания советчика.
+    Порядок и состав повторяют плановый цикл `patch_doc` шаг в шаг: разбор
+    самой операции, пересечения, отложенная с явным номером вхождения, два
+    адреса по одному треду, ограды предложений. Разойтись им нельзя.
     """
-    doc_tab = prepared["doc_tab"] or {}
-    items = prepared["items"]
-    anchored = prepared["anchored"]
     early = {it["index"]: it["error"] for it in items if it["error"]}
-
     # Пересечения. Считаются тем же кодом, что у писателя, и по тем же
     # разрешённым записям.
     indexed = {it["index"]: it["resolved"] for it in items
@@ -8106,37 +8158,52 @@ def compile_index_plan(prepared):
         if err:
             early[i] = err
 
-    # Глобальные ограждения писателя: их он проверяет один раз на весь файл и
-    # выходит из процесса, не применив ничего. Для `noop` они не работают —
-    # `decide_op` пропускает их выше, потому что запросов у такой правки нет.
-    blocked = None
-    if not prepared.get("revision_id"):
-        blocked = {"reason": "missing_revision_id",
-                   "error": ("документ прочитан без `revisionId` — запись "
-                             "нечем закрепить за ревизией, и незакреплённой "
-                             "скрепка её не отправит.")}
-    elif anchored and C5_INSERT_NEAR_ANCHOR_SAFE is not True and any(
+    return early
+
+
+def _dry_global_blocks(prepared, items):
+    """Два глобальных ограждения писателя: (на всё, только на пишущих).
+
+    Их он проверяет один раз на весь файл, и действуют они на разное.
+    """
+    anchored = prepared["anchored"]
+    # Два глобальных ограждения писателя, и они действуют на разное.
+    #
+    # Шлюз C5 — на ВСЁ: писатель зовёт `_error` до первой операции, процесс
+    # выходит, и не применяется ничто, включая правки, которые ничего не
+    # пишут. Условие берётся тем же `_op_inserts`, что у него, и пустая
+    # вставка его тоже поднимает — там вопрос в виде операции, а не в длине
+    # текста.
+    #
+    # Отсутствие ревизии — только на тех, кто пишет: `_write_control`
+    # вызывается под отправку запроса, а у «ничего не пишу» запроса нет.
+    blocked_all = None
+    if anchored and C5_INSERT_NEAR_ANCHOR_SAFE is not True and any(
             _op_inserts(it["op"], it["resolved"]) for it in items):
         state = ("unverified" if C5_INSERT_NEAR_ANCHOR_SAFE is None
                  else "verified UNSAFE")
-        blocked = {"reason": "insert_near_anchor_unverified",
-                   "error": (f"в документе есть заякоренные комментарии, а "
-                             f"поведение вставки рядом с якорем {state} — "
-                             f"вставки заблокированы, и с ними весь файл.")}
+        blocked_all = {"reason": "insert_near_anchor_unverified",
+                       "error": (f"в документе есть заякоренные комментарии, "
+                                 f"а поведение вставки рядом с якорем "
+                                 f"{state} — вставки заблокированы, и с ними "
+                                 f"весь файл.")}
+    blocked_writers = None
+    if not prepared.get("revision_id"):
+        blocked_writers = {"reason": "missing_revision_id",
+                           "error": ("документ прочитан без `revisionId` — "
+                                     "запись нечем закрепить за ревизией, и "
+                                     "незакреплённой скрепка её не отправит.")}
 
-    verdicts = [decide_op(it, doc_tab=doc_tab, anchored=anchored,
-                          thread_state=prepared.get("thread_state"),
-                          early=early.get(it["index"]), blocked=blocked)
-                for it in items]
+    return blocked_all, blocked_writers
 
-    # Дальше — только заякоренный путь. На чистом документе все операции
-    # разрешаются по ОДНОМУ снимку и уходят одним атомарным батчем в обратном
-    # порядке индексов, поэтому вердикт поздней правки не может зависеть от
-    # ранней. Зависимость по уникальности была свойством `replaceAllText`,
-    # который искал текст в момент записи; его больше нет.
-    if not anchored:
-        return verdicts
 
+def _dry_thread_order_gate(items, verdicts):
+    """Правка по треду после правки, писавшей без карты комментариев.
+
+    Вставка и чистое удлинение карту не строят, значит задели они чей-то якорь
+    или нет — неизвестно, и писатель такую правку по треду отклоняет. Решается
+    статически, и это ровно тот совет о порядке, который человеку нужен.
+    """
     # Правка по треду ПОСЛЕ правки, писавшей без карты комментариев. Вставка
     # и чистое удлинение карту не строят, значит задели они чей-то якорь или
     # нет — неизвестно, и писатель такую правку по треду отклоняет.
@@ -8163,6 +8230,13 @@ def compile_index_plan(prepared):
                                          or it["insertion"]))):
             unmapped_at = it["index"]
 
+
+
+def _dry_knowledge_boundary(items, verdicts, doc_tab, early):
+    """Граница знания советчика: один проход слева направо.
+
+    Здесь и только здесь снимаются обещания, которые нечем подтвердить.
+    """
     # Один проход слева направо, и он же — вся граница знания советчика.
     #
     # Раньше проходов было два, и между ними жила дыра: правки, отказавшие на
@@ -8240,6 +8314,38 @@ def compile_index_plan(prepared):
         elif status in ("unknown", "not_simulated"):
             unplaceable.append(item["index"])
 
+
+
+def compile_index_plan(prepared):
+    """Собрать вердикты по всему файлу операций.
+
+    Сначала — зеркало писателя: его ранние отказы и его глобальные ограждения.
+    Затем то, чего у него нет и быть не может: границы собственного знания
+    советчика.
+    """
+    doc_tab = prepared["doc_tab"] or {}
+    items = prepared["items"]
+    anchored = prepared["anchored"]
+
+    early = _dry_early_refusals(items, doc_tab)
+    blocked_all, blocked_writers = _dry_global_blocks(prepared, items)
+    verdicts = [decide_op(it, doc_tab=doc_tab, anchored=anchored,
+                          thread_state=prepared.get("thread_state"),
+                          early=early.get(it["index"]),
+                          blocked_all=blocked_all,
+                          blocked_writers=blocked_writers)
+                for it in items]
+
+    # Дальше — только заякоренный путь. На чистом документе все операции
+    # разрешаются по ОДНОМУ снимку и уходят одним атомарным батчем в обратном
+    # порядке индексов, поэтому вердикт поздней правки не может зависеть от
+    # ранней. Зависимость по уникальности была свойством `replaceAllText`,
+    # который искал текст в момент записи; его больше нет.
+    if not anchored:
+        return verdicts
+
+    _dry_thread_order_gate(items, verdicts)
+    _dry_knowledge_boundary(items, verdicts, doc_tab, early)
     _dry_mark_reply_intents(items, verdicts)
     return verdicts
 

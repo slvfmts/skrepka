@@ -631,6 +631,7 @@ def test_non_overlapping_ranges_remain_decidable(engine):
     {"op": "replace_quote", "quote": "Alpha", "occurrence": True, "with": "X"},
     {"op": "replace_quote", "quote": "Alpha", "occurrence": 0, "with": "X"},
     {"op": "replace_range", "range": [], "text": "X"},
+    {"op": "insert_before_quote", "quote": 3.5, "text": "X"},
     {"op": "insert_after_quote", "quote": "Alpha", "text": 3},
 ])
 def test_bad_field_type_is_a_per_op_refusal_not_a_traceback(engine, bad):
@@ -887,3 +888,71 @@ def test_two_writes_at_one_point_compose_in_operation_order(engine):
         [_writer(0, "a"), _writer(1, "z")], buf, at, doc_tab) == "XazWQ"
     assert engine._dry_mutated_buffer(
         [_writer(0, "z"), _writer(1, "a")], buf, at, doc_tab) == "XzaWQ"
+
+
+def test_empty_insert_alone_is_not_refused_without_a_revision(engine):
+    # Писатель для пустой вставки не строит ни одного запроса, значит
+    # `_write_control` не вызывается и ревизия ему не нужна: вызов проходит
+    # успешно. Отказ здесь был бы выдуман (своё ревью T11).
+    doc = _doc("Alpha")
+    doc.pop("revisionId")
+    verdict = _plan(engine, [{"op": "insert_after_quote", "quote": "Alpha",
+                              "text": ""}], doc=doc)[0]
+    assert verdict["status"] == "noop"
+
+
+def test_empty_insert_is_still_blocked_by_the_c5_gate(engine, monkeypatch):
+    # Обратная сторона: шлюз C5 писатель проверяет ДО первой операции и
+    # выходит из процесса, поэтому не применяется ничто — и правка, которая
+    # ничего не пишет, тоже. Условие у него по ВИДУ операции, а не по длине
+    # текста, и пустая вставка его поднимает.
+    monkeypatch.setattr(engine, "C5_INSERT_NEAR_ANCHOR_SAFE", None)
+    verdicts = _plan(engine, [
+        {"op": "insert_after_quote", "quote": "Alpha", "text": ""},
+        {"op": "replace_quote", "quote": "Alpha", "with": "Alpha"},
+    ], anchored=True)
+    assert [v["status"] for v in verdicts] == ["would_refuse"] * 2
+    assert verdicts[1]["reason"] == "insert_near_anchor_unverified"
+
+
+@pytest.mark.parametrize("extra", [
+    {"occurrence": "1"}, {"occurrence": 0}, {"quote": 3},
+])
+def test_unused_fields_do_not_refuse_a_range_addressed_op(engine, extra):
+    # Операция с именованным диапазоном адресуется им, а `quote` и
+    # `occurrence` при нём не используются — так решено и записано в
+    # докстроке `_op_current_text`. Проверять их значит ломать вход, который
+    # работал (найдено ревью починок писателя).
+    doc_tab = _tab("Alpha")
+    doc_tab["namedRanges"] = {"R": {"namedRanges": [{
+        "name": "R", "ranges": [{"startIndex": 1, "endIndex": 6}]}]}}
+    op = {"op": "replace_range", "range": "R", "text": "Beta", **extra}
+    engine._RAISE_ERRORS = True
+    try:
+        r = engine._resolve_op(op, doc_tab, None)
+    finally:
+        engine._RAISE_ERRORS = False
+    assert r["kind"] == "replace" and r["text"] == "Beta"
+
+
+def test_overlap_gate_refuses_the_whole_tangle_not_a_subset(engine):
+    # Прежний обход сравнивал только соседей по сортировке и применял
+    # ПОДМНОЖЕСТВО противоречивого набора: широкую правку отклонял, узкую
+    # внутри неё пропускал. Порчи текста это не давало (самая ранняя из пары
+    # помечалась всегда), но человек получал половину задуманного.
+    assert set(engine._ops_overlap_conflicts(
+        _ranges((1, 11), (2, 4), (5, 7)))) == {0, 1, 2}
+
+
+def test_overlap_gate_cost_is_deliberate(engine):
+    # Обратная сторона, названная вслух: правка, пересекающаяся только с уже
+    # отклонённой, теперь тоже отклоняется. Так выходит с заменой, которая
+    # лишь удлиняет цель, — она объявляет своим диапазоном весь исходный
+    # фрагмент, хотя пишет в одну точку за ним. Сужение диапазона — правка
+    # порядка в писателе, отдельный круг (долг в TASKS-r19).
+    verdicts = _plan(engine, [
+        {"op": "replace_quote", "quote": "abcdefghij", "with": "abcdefghij!"},
+        {"op": "replace_quote", "quote": "bc", "with": "BC"},
+        {"op": "replace_quote", "quote": "ef", "with": "EF"},
+    ], text="abcdefghij")
+    assert [v["status"] for v in verdicts] == ["would_refuse"] * 3
