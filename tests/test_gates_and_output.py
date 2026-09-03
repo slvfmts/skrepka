@@ -346,10 +346,11 @@ def test_update_blocks_on_named_ranges_alone(engine, monkeypatch, tmp_path,
     assert json.loads(capsys.readouterr().out)["named_ranges"] == ["intro"]
 
 
-def test_update_with_acknowledge_loss_needs_no_terminal(
-        engine, monkeypatch, tmp_path):
-    """The regression #17 fixes: with the flag, a non-interactive run must get
-    all the way to the backup instead of being stopped by a missing TTY."""
+def test_acknowledge_loss_alone_no_longer_replaces_anything(
+        engine, monkeypatch, tmp_path, capsys):
+    """Since T12 the flag is one of THREE, not the whole gate. On its own it
+    must not reach a write — and the refusal has to name what is missing,
+    otherwise the agent guesses."""
     calls = []
     _stub_update_preflight(monkeypatch, engine, [{"id": "c1"}])
     monkeypatch.setattr(engine, "get_drive_service",
@@ -357,34 +358,18 @@ def test_update_with_acknowledge_loss_needs_no_terminal(
     md = tmp_path / "doc.md"
     md.write_text("# hi\n", encoding="utf-8")
 
-    with pytest.raises(_Exploded):
+    with pytest.raises(SystemExit):
         engine.update_doc("doc1", str(md), acknowledge_loss=True)
-    assert calls == ["copy"]  # backup attempted, no write yet
+    assert calls == []
+    assert "--create-new" in capsys.readouterr().out
 
 
-def test_destructive_receipt_says_the_consent_was_one_time(
+def test_a_document_with_nothing_to_lose_still_needs_a_mode(
         engine, monkeypatch, tmp_path, capsys):
-    """The refusal is the only place the rule is stated, and an agent that
-    already knows the flag never sees it again — that is how a second document
-    got destroyed on no consent at all. The receipt has to repeat it."""
-    calls = []
-    _stub_update_preflight(monkeypatch, engine, [{"id": "c1"}])
-    monkeypatch.setattr(engine, "get_drive_service",
-                        lambda c: _fake_update_drive(calls, let_it_run=True))
-    md = tmp_path / "doc.md"
-    md.write_text("# hi\n", encoding="utf-8")
-
-    engine.update_doc("doc1", str(md), acknowledge_loss=True)
-    out = json.loads(capsys.readouterr().out)
-    assert calls == ["copy", "update"]
-    assert "one-time consent" in out["consent_note"]
-    assert "any other document" in out["consent_note"]
-
-
-def test_clean_document_receipt_has_no_consent_note(
-        engine, monkeypatch, tmp_path, capsys):
-    """No comments, no named ranges: nothing was destroyed and no consent was
-    spent, so the note would be noise."""
+    """No comments and no named ranges used to mean «replace without asking».
+    It no longer does: the person still has to say whether they meant a new
+    document or a replacement, because an unnoticed replacement is damage too
+    (T12)."""
     calls = []
     _stub_update_preflight(monkeypatch, engine, [])
     monkeypatch.setattr(engine, "get_drive_service",
@@ -392,10 +377,10 @@ def test_clean_document_receipt_has_no_consent_note(
     md = tmp_path / "doc.md"
     md.write_text("# hi\n", encoding="utf-8")
 
-    engine.update_doc("doc1", str(md))
-    out = json.loads(capsys.readouterr().out)
-    assert calls == ["update"]  # no backup: nothing to lose
-    assert "consent_note" not in out
+    with pytest.raises(SystemExit) as exc:
+        engine.update_doc("doc1", str(md))
+    assert exc.value.code == 2
+    assert calls == []
 
 
 # --- _emit_json ---

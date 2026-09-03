@@ -1311,6 +1311,19 @@ def upload_md(file_path, folder_id=None, title=None, no_highlights=False):
     except Exception as e:
         _error(f"auth failed: {e}")
 
+    print(json.dumps(_upload_md_as_doc(
+        creds, drive_service, file_path, folder_id=folder_id, title=title,
+        no_highlights=no_highlights)))
+
+
+def _upload_md_as_doc(creds, drive_service, file_path, folder_id=None,
+                      title=None, no_highlights=False):
+    """Положить markdown новым Google-документом и вернуть квитанцию.
+
+    Выделено из `upload_md` под T12: `update --create-new` делает ровно это,
+    и вторая копия загрузчика рядом означала бы однажды поправить одну из
+    них. Печатает вызывающий — у него своя квитанция.
+    """
     # Prepare: replace image refs with text markers
     upload_path, images = _prepare_md_for_upload(file_path)
 
@@ -1356,11 +1369,8 @@ def upload_md(file_path, folder_id=None, title=None, no_highlights=False):
         except Exception as e:
             _warn(f"highlight post-processing skipped: {e}")
 
-    print(json.dumps({
-        "id": file["id"],
-        "name": file["name"],
-        "url": file["webViewLink"],
-    }))
+    return {"id": file["id"], "name": file["name"],
+            "url": file["webViewLink"]}
 
 
 def _comment_tab_catalog(doc):
@@ -12319,21 +12329,339 @@ def sync_doc(file_id, md_path, tab_id=None):
 # Update existing document
 # ---------------------------------------------------------------------------
 
-def update_doc(file_id, file_path, title=None, no_highlights=False,
-               acknowledge_loss=False):
-    """Update an existing Google Doc with new markdown content.
+# --------------------------------------------------------------------------
+# T12: `update` перестаёт быть командой, которую можно вызвать по привычке.
+#
+# Это единственная команда, которая уничтожает треды: `drive.files().update` с
+# media заменяет документ целиком, все комментарии становятся в интерфейсе
+# невидимыми призраками (в API они при этом живы), именованные диапазоны
+# пропадают. Отката не существует: `keepForever` к Google-файлам неприменим
+# («only applicable to files with binary content in Drive» — дискавери Drive
+# v3), именованных версий в API нет, а восстановление из выгрузки даёт НОВЫЙ
+# файл, то есть стоит смены ссылки. Смена ссылки — названный ущерб: 25 августа
+# заказчику разослали ссылку, документ пересобрали, ссылка умерла.
+#
+# Отсюда три правила, и все три — решения, а не техника.
+#
+# 1. Режим называется явно. Умолчания у этой команды нет вовсе: она либо
+#    создаёт новый документ, либо разрушает существующий, и выбрать за
+#    человека нельзя. Тихое создание нового было бы ловушкой хуже той, от
+#    которой уходили: агент отчитается «готово», а человек откроет разосланную
+#    ссылку и увидит старый текст.
+# 2. База доказывается РЕВИЗИЕЙ. Google говорит прямо: «If the revision ID is
+#    unchanged between calls, then the document has not changed». Сверка
+#    текстов на эту роль не годится — она пропускает `sectionBreak`, сравнивает
+#    opaque-элементы позиционно и схлопывает неразрывный пробел с обычным.
+#    Сверка остаётся, но как диагностика: сказать человеку, ЧТО разошлось.
+# 3. То, что снимается перед разрушением, называется АРХИВОМ. Резервной копией
+#    это назвать нельзя: ни одна команда не восстановит из него документ по
+#    прежней ссылке.
+# --------------------------------------------------------------------------
 
-    DESTRUCTIVE: drive.files().update with media replaces the whole document.
-    Confirmed behavior: ALL comments become invisible ghosts in the UI (alive
-    in the API only) and named ranges are destroyed. Blocked when the doc has
-    any comment or named range unless --acknowledge-loss is passed, in which
-    case a backup copy is made first (note: per C0, the backup does NOT
-    preserve comments either — only text and styles).
+# Ревизия живёт сутки. Дальше Google не обещает, что идентификатор не сменится
+# сам по себе — «a changed ID can also be due to internal factors such as ID
+# format changes», — и расхождение перестаёт что-либо доказывать. Ложным
+# бывает только расхождение, совпадение ложным не бывает, поэтому сторона
+# безопасная; но отказ обязан объяснить, что документ, возможно, цел.
+_BASE_REVISION_TTL_HOURS = 24
+
+
+class _ArchiveError(Exception):
+    """Архив снять не удалось — разрушение не начинается."""
+
+
+def _doc_link(file_id):
+    """Обычный адрес документа. Один сборщик на всех, кто его печатает."""
+    return f"https://docs.google.com/document/d/{file_id}/edit" if file_id else ""
+
+
+def _raw_comments_digest(raw_comments):
+    """Отпечаток переписи, включающий ТЕКСТ разговора.
+
+    Не `_fingerprint_from_census`: тот считает id, авторов, времена и состояния
+    и `content` не смотрит вовсе — он заведён под учёт якорей, где текст ни на
+    что не влияет. Здесь вопрос другой: не изменилось ли то, что мы собираемся
+    положить в архив и уничтожить. Правка текста ответа ревизию документа не
+    двигает (комментарии — отдельный ресурс Drive), значит без этого отпечатка
+    архив мог бы смешать два состояния и назвать это одним.
+    """
+    def _entry(e):
+        return {k: e.get(k) for k in
+                ("id", "content", "createdTime", "modifiedTime", "deleted",
+                 "resolved", "action", "quotedFileContent", "anchor")}
+    canon = []
+    for c in sorted(raw_comments or (), key=lambda c: str(c.get("id"))):
+        canon.append({
+            **_entry(c),
+            "author": (c.get("author") or {}).get("displayName"),
+            "replies": [{**_entry(r),
+                         "author": (r.get("author") or {}).get("displayName")}
+                        for r in sorted(c.get("replies") or [],
+                                        key=lambda r: str(r.get("id")))],
+        })
+    return _sha256_str(json.dumps(canon, ensure_ascii=False, sort_keys=True,
+                                 separators=(",", ":")))
+
+
+def _archive_before_replace(docs_service, drive_service, file_id, dest_dir):
+    """Снять архив документа под ДВУМЯ границами и записать его на диск.
+
+    Границы две, потому что источников три и они независимы: ревизия Docs,
+    выгрузка docx и перепись комментариев Drive. Один проход способен смешать
+    состояния, которые никогда не существовали вместе, — это уже записано в
+    проекте про `comments` и здесь верно ровно так же. Ревизия закрывает
+    документ, отпечаток переписи — разговоры; сойтись обязаны обе.
+
+    Возвращает манифест. Любая неудача — исключение: разрушение не начинается
+    с неполным архивом, и это не перестраховка, а единственное, что остаётся
+    вместо отката.
+    """
+    last = "the document kept changing while the archive was taken"
+    for _attempt in range(3):
+        doc_before = _safe_get_doc(docs_service, file_id)
+        rev_before = doc_before.get("revisionId")
+        raw_before = _list_comments_raw(drive_service, file_id)
+        docx = drive_service.files().export(
+            fileId=file_id,
+            mimeType="application/vnd.openxmlformats-officedocument"
+                     ".wordprocessingml.document").execute()
+        raw_after = _list_comments_raw(drive_service, file_id)
+        doc_after = _safe_get_doc(docs_service, file_id)
+        rev_after = doc_after.get("revisionId")
+        if not rev_before or not rev_after:
+            raise _ArchiveError(
+                "Google returned no revision id — nothing proves the archive "
+                "was taken from a single state. That is how a document the "
+                "account cannot edit answers.")
+        if rev_before != rev_after:
+            last = "the document was edited while the archive was taken"
+            continue
+        if _raw_comments_digest(raw_before) != _raw_comments_digest(raw_after):
+            last = "the comments changed while the archive was taken"
+            continue
+        doc_json = json.dumps(doc_after, ensure_ascii=False, sort_keys=True,
+                              separators=(",", ":"))
+        comments_json = json.dumps(raw_after, ensure_ascii=False,
+                                   sort_keys=True, separators=(",", ":"))
+        files = {"document.docx": docx,
+                 "document.json": doc_json,
+                 "comments.json": comments_json}
+        written, digests = {}, {}
+        for name, data in files.items():
+            blob = data if isinstance(data, bytes) else data.encode("utf-8")
+            written[name] = safeio.atomic_write(
+                os.path.join(dest_dir, name), blob, make_parents=True)
+            digests[name] = hashlib.sha256(blob).hexdigest()
+        manifest = {
+            "kind": "skrepka-archive",
+            "note": ("This is an ARCHIVE, not a backup: no command restores "
+                     "the document at its own link from it. The docx opens as "
+                     "a NEW file; the comments stay as text in JSON."),
+            "doc_id": file_id,
+            "revision_id": rev_after,
+            "taken_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "comments_total": len(raw_after),
+            "files": [{"name": n, "path": written[n], "sha256": digests[n]}
+                      for n in sorted(written)],
+        }
+        manifest_path = safeio.atomic_write(
+            os.path.join(dest_dir, "manifest.json"),
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            make_parents=True)
+        manifest["manifest_path"] = manifest_path
+        manifest["comments_digest"] = _raw_comments_digest(raw_after)
+        return manifest
+    raise _ArchiveError(last)
+
+
+def _base_revision_age_hours(base_path):
+    """Сколько часов назад снята база, по времени файла. None — не узнать."""
+    try:
+        return (time.time() - os.path.getmtime(base_path)) / 3600.0
+    except OSError:
+        return None
+
+
+def _check_replace_base(base_path, file_id, doc, doc_tab):
+    """Доказать, что база описывает документ, который лежит сейчас.
+
+    Доказательство одно и оно у Google записано словами: «If the revision ID
+    is unchanged between calls, then the document has not changed». Сверка
+    текстов эту роль не тянет — `sectionBreak` в последовательность не
+    попадает вовсе, opaque-элементы сравниваются позиционно без содержимого,
+    неразрывный пробел схлопывается с обычным. Поэтому она здесь идёт следом и
+    только как диагностика: назвать человеку, ЧТО разошлось.
+
+    О комментариях база не говорит ничего и говорить не может — сайдкар их не
+    хранит, да и в `.md` их нет. Их свежесть проверяется перед самой записью.
+    """
+    if not os.path.exists(base_path):
+        _error(f"base not found: {base_path}. A live replace needs one — the "
+               f"sidecar `download --format md` writes next to the file.")
+    try:
+        with open(base_path, "r", encoding="utf-8") as f:
+            base = json.load(f)
+    except Exception as e:                                      # noqa: BLE001
+        _error(f"cannot read the base ({base_path}): {e}")
+    if not isinstance(base, dict):
+        _error(f"{base_path} does not look like a skrepka sidecar")
+    for field in ("schema_version", "doc_id", "revision_id"):
+        if field not in base:
+            _error(f"the base has no {field!r} field — download the doc "
+                   f"again")
+    if base["schema_version"] != SIDECAR_SCHEMA_VERSION:
+        _error(f"base schema {base['schema_version']} is unsupported — "
+               f"download the doc again")
+    if base["doc_id"] != file_id:
+        _error(f"the base belongs to doc {base['doc_id']}, not {file_id}")
+
+    live_rev = doc.get("revisionId")
+    if not live_rev:
+        _error("Google returned no revision id for this document — that is "
+               "how a document the account cannot edit answers. Nothing "
+               "proves the base describes today's state of it, and skrepka "
+               "will not destroy blind.")
+    if base["revision_id"] == live_rev:
+        return base
+
+    # Расхождение. Прежде чем отказать, скажем, что именно разошлось: человек
+    # должен понять, правил ли документ кто-то живой, или это Google сменил
+    # формат идентификатора у базы, которая пролежала сутки.
+    detail = {"base_revision": base["revision_id"], "live_revision": live_rev}
+    age = _base_revision_age_hours(base_path)
+    if age is not None:
+        detail["base_age_hours"] = round(age, 1)
+    text_same = None
+    try:
+        base_els = base.get("elements") or []
+        live_els = _doc_elements(doc_tab)
+        text_same = ([(e.get("type"), _norm_ws(e.get("text") or ""))
+                      for e in base_els]
+                     == [(e.get("type"), _norm_ws(e.get("text") or ""))
+                         for e in live_els])
+    except Exception:                                           # noqa: BLE001
+        pass
+    if text_same is not None:
+        detail["text_matches_base"] = text_same
+
+    stale = age is not None and age > _BASE_REVISION_TTL_HOURS
+    if text_same and stale:
+        hint = (f"the text still matches the base word for word, and the "
+                f"base itself is over {_BASE_REVISION_TTL_HOURS} hours old — "
+                f"Google only promises a revision id stays put for a day. The "
+                f"document is most likely intact, but nothing proves it: "
+                f"download it again and redo this on a fresh base.")
+    elif text_same:
+        hint = ("the text matches the base word for word, so what changed is "
+                "formatting, a table or the structure — the part a `.md` does "
+                "not carry. Download the doc again.")
+    else:
+        hint = ("the document's text differs from the base: it was edited "
+                "after you downloaded it, and your replace would wipe those "
+                "edits. Download it again and move your changes into the "
+                "fresh copy.")
+    _error(f"the base describes a different state than the document is in "
+           f"right now — {hint}", reason="concurrent_edit", details=detail)
+
+
+# The guidance an agent must read before it reaches for this command at all.
+# Every clause here was put in by a live incident and none of it may be
+# dropped: #24 measured that naming only the PRICE taught agents that losing
+# the threads was the only way to do the job — it never was. Held in one
+# constant because two refusals now show it (mode not chosen, flags missing),
+# and two copies mean fixing one of them some day.
+_UPDATE_ALTERNATIVES = (
+    "Use `patch` for iterative edits — since 0.10.0 it also rewrites a "
+    "commented fragment whole without losing the thread, unless the doc has "
+    "closed threads. If you hold a freshly written .md instead of a list of "
+    "edits: `download` this doc, move your changes into the downloaded file "
+    "(its sidecar must stay beside it) and `sync` — that path keeps the OPEN "
+    "threads (a closed one may be unhooked, its words archived beside the .md "
+    "first), but it refuses outright when the new text rewrites commented "
+    "paragraphs, and those belong to `patch`. Whatever is left unapplied is a "
+    "list to show the person, not a reason to come back here."
+)
+
+_UPDATE_CONSENT_ORDER = (
+    "If a full replace is really wanted: ask the person in plain words about "
+    "THIS document, name what it loses, and wait for an explicit yes before "
+    "rerunning with --acknowledge-loss. A yes given for another document, or "
+    "earlier in this session, does not carry over — ask again for each "
+    "document."
+)
+
+
+def _update_mode_required(meta, comments_count, named_ranges):
+    """Refuse until the mode is named. Nothing created, nothing destroyed.
+
+    This command has no default on purpose. Silently creating a new document
+    would be a trap worse than the one it avoids: the agent reports success,
+    the person opens the link they already circulated and sees the old text —
+    damage with nobody to notice it. Silently replacing destroys the threads.
+    Choosing between those two is the person's call, not skrepka's.
+    """
+    print(json.dumps({
+        "error": "update needs an explicit mode",
+        "reason": (
+            "this command either creates a NEW document or destroys the "
+            "existing one together with every comment thread: a full replace "
+            "via drive.files().update makes ALL comments invisible ghosts in "
+            "the UI and destroys named ranges. Which of the two it is, the "
+            "person decides — there is no default here. "
+            + _UPDATE_ALTERNATIVES + " " + _UPDATE_CONSENT_ORDER),
+        "document": meta.get("name"),
+        "comments": comments_count,
+        "named_ranges": sorted(named_ranges),
+        "create_new": ("--create-new — a new document beside this one; the "
+                       "existing one is not touched"),
+        "replace": ("--replace-existing --base <sidecar> --acknowledge-loss — "
+                    "replace the existing one; every thread goes invisible "
+                    "and there is no rollback to the same URL"),
+    }, ensure_ascii=False, indent=2))
+    sys.exit(2)
+
+
+def _post_process_after_replace(docs_service, drive_service, file_id, images,
+                                folder_id, no_highlights):
+    """Постобработка после замены. Возвращает список несделанного.
+
+    Возвращает, а не глотает. Оба постпроцессора внутри превращают отказ в
+    предупреждение, и квитанция поверх них показывала полный успех: документ
+    заменён, картинка осталась текстовым маркером, а `action` говорит
+    «updated». Так выглядит успешно проваленная работа (найдено ревью плана).
+    """
+    undone = []
+    if images:
+        try:
+            post_process_images(docs_service, drive_service, file_id, images,
+                                folder_id)
+        except Exception as e:                                  # noqa: BLE001
+            undone.append({"step": "images", "error": str(e)[:200]})
+    if not no_highlights:
+        try:
+            post_process_highlights(docs_service, file_id)
+        except Exception as e:                                  # noqa: BLE001
+            undone.append({"step": "highlights", "error": str(e)[:200]})
+    return undone
+
+
+def update_doc(file_id, file_path, title=None, no_highlights=False,
+               acknowledge_loss=False, create_new=False,
+               replace_existing=False, base=None):
+    """Заменить существующий Google Doc или положить новый рядом.
+
+    Режим обязателен: см. `_update_mode_required`. Разрушающий путь требует
+    трёх вещей одновременно, и каждая закрывает свою беду: `--base` доказывает,
+    что заменяется то состояние, с которого писали; `--acknowledge-loss` — что
+    человека спросили про ЭТОТ документ; `--replace-existing` — что перезапись
+    названа вслух, а не получена по умолчанию.
     """
     file_id = _extract_doc_id(file_id)
-
     if not os.path.exists(file_path):
         _error(f"file not found: {file_path}")
+    if create_new and replace_existing:
+        _error("--create-new and --replace-existing are mutually exclusive: "
+               "pick one")
 
     try:
         creds = get_creds()
@@ -12342,162 +12670,181 @@ def update_doc(file_id, file_path, title=None, no_highlights=False,
     except Exception as e:
         _error(f"auth failed: {e}")
 
-    # Get current file metadata (folder for images)
     try:
         meta = drive_service.files().get(
             fileId=file_id, fields="name,parents", supportsAllDrives=True
         ).execute()
     except HttpError as e:
         _error(f"cannot access file: {e.reason if hasattr(e, 'reason') else e}")
-
     folder_id = (meta.get("parents") or [None])[0]
 
-    # ---- destructiveness guard (fail closed) ----
-    all_comments, anchored, _, _ = _census_comments(drive_service, file_id)
+    all_comments, _anchored, _fp, _u = _census_comments(drive_service,
+                                                        file_id)
     named_ranges = []
     try:
-        cur_doc = _safe_get_doc(docs_service, file_id)
-        for _tid, _title, dt in _collect_tabs(cur_doc):
+        pre_doc = _safe_get_doc(docs_service, file_id)
+        for _t, _n, dt in _collect_tabs(pre_doc):
             named_ranges.extend((dt.get("namedRanges") or {}).keys())
     except HttpError as e:
+        # Fail closed: the refusal names what is at stake, and a doc we cannot
+        # read is not a doc we may replace.
+        _error(f"cannot read doc (fail closed): "
+               f"{e.reason if hasattr(e, 'reason') else e}")
+
+    if not create_new and not replace_existing:
+        _update_mode_required(meta, len(all_comments), named_ranges)
+
+    if create_new:
+        # Ничего не разрушается, поэтому ни базы, ни согласия здесь не нужно.
+        # Квитанция называет действие ИНАЧЕ и говорит про старый адрес: агент,
+        # разбирающий её по полю `action`, обязан увидеть, что документ по
+        # прежней ссылке не менялся.
+        created = _upload_md_as_doc(
+            creds, drive_service, file_path, folder_id=folder_id,
+            title=title or f"{meta.get('name', 'doc')} (new version)",
+            no_highlights=no_highlights)
+        created.update({
+            "action": "created-new",
+            "original_id": file_id,
+            "original_untouched": True,
+            "original_url": _doc_link(file_id),
+            "note": ("a NEW document was created; the existing one at its "
+                     "own link was NOT changed. To replace it you need "
+                     "--replace-existing, --base and --acknowledge-loss."),
+        })
+        print(json.dumps(created, ensure_ascii=False, indent=2))
+        return
+
+    # ---- разрушающий путь ----
+    missing = [name for name, given in
+               (("--base <sidecar>", base),
+                ("--acknowledge-loss", acknowledge_loss)) if not given]
+    if missing:
         _error(
-            f"cannot read doc to check named ranges (fail closed): "
-            f"{e.reason if hasattr(e, 'reason') else e}"
-        )
+            f"a live replace needs three things at once and these are "
+            f"missing: {', '.join(missing)}. `--base` proves that what is "
+            f"being replaced is the state you wrote against; "
+            f"`--acknowledge-loss` proves the person was asked about THIS "
+            f"document. skrepka supplies neither on your behalf. "
+            f"{_UPDATE_ALTERNATIVES} {_UPDATE_CONSENT_ORDER}")
 
-    backup_info = None
-    if all_comments or named_ranges:
-        if not acknowledge_loss:
-            print(json.dumps({
-                "error": "destructive update blocked",
-                "reason": (
-                    "full replace via drive.files().update makes ALL comments "
-                    "invisible ghosts in the UI and destroys named ranges. "
-                    "Use `patch` for iterative edits — since 0.10.0 it also "
-                    "rewrites a commented fragment whole without losing the "
-                    "thread, unless the doc has closed threads. If you hold a "
-                    "freshly written .md instead of a list of edits: "
-                    "`download` this doc, move your changes into the "
-                    "downloaded file (its sidecar must stay beside it) and "
-                    "`sync` — that path keeps the OPEN threads (a closed one may be "
-                    "unhooked, its words archived beside the .md first), "
-                    "but it refuses "
-                    "outright when the new text rewrites commented "
-                    "paragraphs, and those belong to `patch`. Whatever is "
-                    "left unapplied is a list to show the person, not a "
-                    "reason to come back here. If a full replace is "
-                    "really wanted: ask the person in plain words about THIS "
-                    "document, name what it loses, and wait for an explicit "
-                    "yes before rerunning with --acknowledge-loss. A yes given "
-                    "for another document, or earlier in this session, does "
-                    "not carry over — ask again for each document. The backup "
-                    "made first holds text and styles only: per C0 it will NOT "
-                    "contain the comments."
-                ),
-                "document": meta.get("name"),
-                "comments": len(all_comments),
-                "anchored_comments": len(anchored),
-                "named_ranges": sorted(named_ranges),
-            }, ensure_ascii=False, indent=2))
-            sys.exit(2)
-        # --acknowledge-loss IS the acknowledgement (#17): the CLI used to also
-        # demand a terminal, which an agent-run process never has, so the
-        # legitimate destructive path was unreachable for the actual audience.
-        # What stands between an agent and this branch is the contract: ask the
-        # person in plain words and wait for an explicit yes before passing the
-        # flag (agents/CONTRACT.md §2.2).
-        # Acknowledged: back up first, verify placement, report id BEFORE
-        # destruction (codex code review #8: pin and verify parents).
-        backup_body = {"name": f"{meta.get('name', 'doc')}.pre-update-backup-"
-                               f"{time.strftime('%Y%m%d-%H%M%S')}"}
-        if folder_id:
-            backup_body["parents"] = [folder_id]
-        try:
-            backup = drive_service.files().copy(
-                fileId=file_id,
-                body=backup_body,
-                fields="id,name,parents",
-                supportsAllDrives=True,
-            ).execute()
-        except HttpError as e:
-            _error(
-                f"backup copy failed — update aborted: "
-                f"{e.reason if hasattr(e, 'reason') else e}"
-            )
-        if not backup.get("id"):
-            _error("backup copy returned no id — update aborted")
-        if folder_id and folder_id not in (backup.get("parents") or []):
-            _error(
-                f"backup {backup['id']} landed outside the doc's folder "
-                f"(parents={backup.get('parents')}) — update aborted"
-            )
-        backup_info = {"id": backup["id"], "name": backup.get("name"),
-                       "parents": backup.get("parents"),
-                       "preserves_comments": False}
-        _warn(f"backup created before destructive update: {backup['id']} "
-              f"(text/styles only — comments are NOT in the backup)")
+    _check_replace_base(base, file_id, pre_doc, _collect_tabs(pre_doc)[0][2])
 
-    # Prepare markdown: replace image refs with markers
-    upload_path, images = _prepare_md_for_upload(file_path)
-
+    archive_dir = f"{file_path}.skrepka-archive-{time.strftime('%Y%m%d-%H%M%S')}"
     try:
-        # Update content via Drive API (re-upload as markdown)
-        media = MediaFileUpload(upload_path, mimetype="text/markdown", resumable=True)
-        update_meta = {}
-        if title:
-            update_meta["name"] = title
-        drive_service.files().update(
-            fileId=file_id,
-            body=update_meta if update_meta else {},
-            media_body=media,
-            supportsAllDrives=True,
-        ).execute()
+        archive = _archive_before_replace(docs_service, drive_service, file_id,
+                                          archive_dir)
+    except _ArchiveError as e:
+        _error(f"archive not taken, the document was not touched: {e}")
+    except Exception as e:                                      # noqa: BLE001
+        _error(f"archive not taken, the document was not touched: "
+               f"{str(e)[:200]}")
+
+    # A Drive copy on top of the archive, and the two are not the same thing.
+    # The archive holds everything (docx, the full Docs resource, every
+    # comment incl. deleted ones) but nothing opens it as a document. The copy
+    # opens straight away and holds text and styles — and NOT a single thread:
+    # measured 27.08, 62 threads in, 0 out. Naming it a backup is what taught
+    # people it was one.
+    copy_info = None
+    try:
+        copy_body = {"name": f"{meta.get('name', 'doc')}.before-replace-"
+                             f"{time.strftime('%Y%m%d-%H%M%S')}"}
+        if folder_id:
+            copy_body["parents"] = [folder_id]
+        copied = drive_service.files().copy(
+            fileId=file_id, body=copy_body, fields="id,name,parents",
+            supportsAllDrives=True).execute()
+        if copied.get("id"):
+            copy_info = {"id": copied["id"], "name": copied.get("name"),
+                         "holds_comments": False,
+                         "note": ("opens as a document, text and styles only "
+                                  "— it carries NO comment threads")}
     except HttpError as e:
-        _error(f"update failed: {e.reason if hasattr(e, 'reason') else e}")
+        # Not fatal: the archive is the thing that must exist, and it does.
+        _warn(f"convenience copy not made ({getattr(e, 'reason', e)}) — the "
+              f"archive is complete and the replace goes on")
+
+    # Последняя проверка перед разрушением. Между решением человека и этой
+    # секундой в документе мог появиться новый комментарий — он исчез бы, а
+    # человек так и не узнал бы, что он был.
+    fresh_doc = _safe_get_doc(docs_service, file_id)
+    if fresh_doc.get("revisionId") != archive["revision_id"]:
+        _error("the document changed while the archive was being taken — "
+               "the replace is off. Read it again.",
+               reason="concurrent_edit")
+    if _raw_comments_digest(
+            _list_comments_raw(drive_service, file_id)) != (
+            archive["comments_digest"]):
+        _error("the comments changed while the archive was being taken — "
+               "the replace is off. Read the document again.",
+               reason="concurrent_edit")
+
+    upload_path, images = _prepare_md_for_upload(file_path)
+    outcome, write_error = "replaced", None
+    try:
+        media = MediaFileUpload(upload_path, mimetype="text/markdown",
+                                resumable=True)
+        update_meta = {"name": title} if title else {}
+        drive_service.files().update(
+            fileId=file_id, body=update_meta, media_body=media,
+            supportsAllDrives=True).execute()
+    except HttpError as e:
+        outcome = "not-applied"
+        write_error = e.reason if hasattr(e, "reason") else str(e)
+    except Exception as e:                                      # noqa: BLE001
+        # Обрыв связи после того, как байты уже легли, выглядит отсюда так же,
+        # как обрыв до. Что в документе — неизвестно, и промолчать об этом
+        # нельзя: раньше такая ветка вообще не ловилась, и команда уходила без
+        # квитанции (найдено ревью плана).
+        outcome = "outcome-unknown"
+        write_error = str(e)[:200]
     finally:
         if upload_path != file_path:
             os.unlink(upload_path)
 
-    # Post-process images
-    if images:
-        try:
-            post_process_images(docs_service, drive_service, file_id, images, folder_id)
-        except Exception as e:
-            _warn(f"image processing skipped: {e}")
-
-    # Post-process highlights
-    if not no_highlights:
-        try:
-            post_process_highlights(docs_service, file_id)
-        except Exception as e:
-            _warn(f"highlight post-processing skipped: {e}")
-
-    # Get updated metadata
-    try:
-        updated = drive_service.files().get(
-            fileId=file_id, fields="id,name,webViewLink", supportsAllDrives=True
-        ).execute()
-    except HttpError:
-        updated = {"id": file_id, "name": title or meta.get("name"), "webViewLink": ""}
-
-    out = {
-        "id": updated["id"],
-        "name": updated.get("name", ""),
-        "url": updated.get("webViewLink", ""),
-        "action": "updated",
-    }
-    if backup_info:
-        out["backup"] = backup_info
-        # The refusal above is the only place the rule is stated, and an agent
-        # that already knows the flag never sees it again. Measured in an
-        # acceptance run: told "now do the same for the second doc", the agent
-        # reused the working command and destroyed a document nobody had
-        # consented to. The receipt has to carry the rule too.
-        out["consent_note"] = (
+    result = {
+        "id": file_id,
+        "name": title or meta.get("name", ""),
+        "url": _doc_link(file_id),
+        "action": outcome,
+        "archive": {
+            "dir": archive_dir,
+            "manifest": archive["manifest_path"],
+            "comments_archived": archive["comments_total"],
+            "note": archive["note"],
+        },
+        "copy": copy_info,
+        "no_rollback": (
+            "there is no programmatic rollback for a Google Doc: the archive "
+            "can only be restored as a NEW file, which costs the link. That "
+            "is the price the person was asked about."),
+        "race_window": (
+            "a Drive media upload cannot be pinned to a revision — the method "
+            "has no precondition at all. Freshness was verified immediately "
+            "before the upload began, but an edit made by a person WHILE the "
+            "upload was running is overwritten, and skrepka cannot detect "
+            "that it happened."),
+        "consent_note": (
             "--acknowledge-loss consumed a one-time consent: this document, "
             "this run. Before replacing any other document, ask the person "
-            "again, name that document, and wait for a fresh explicit yes.")
-    print(json.dumps(out, ensure_ascii=False))
+            "again, name that document, and wait for a fresh explicit yes."),
+        "comments_lost": len(all_comments),
+        "named_ranges_lost": sorted(named_ranges),
+    }
+    if outcome != "replaced":
+        result["error"] = write_error
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        sys.exit(3)
+
+    undone = _post_process_after_replace(docs_service, drive_service, file_id,
+                                         images, folder_id, no_highlights)
+    if undone:
+        result["action"] = "replaced-partially"
+        result["post_processing_undone"] = undone
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        sys.exit(3)
+    print(json.dumps(result, ensure_ascii=False))
 
 
 def _extract_folder_id(val):
@@ -12662,13 +13009,28 @@ def main():
     # update command
     upd = sub.add_parser(
         "update",
-        help="Replace a doc's whole content (destroys comment threads — "
-             "see `patch` to keep them)")
+        help="Положить содержимое новым документом (--create-new) либо "
+             "заменить существующий целиком (--replace-existing, разрушает "
+             "все треды). Режим обязателен; точечные правки делает `patch`")
     upd.add_argument("file_id", help="Google Doc file ID or URL")
     upd.add_argument("file", help="Path to .md file with new content")
     upd.add_argument("--title", help="New document title")
     upd.add_argument("--no-highlights", action="store_true",
                      help="Skip highlight post-processing")
+    upd.add_argument(
+        "--create-new", action="store_true",
+        help="Положить содержимое НОВЫМ документом рядом, в ту же папку. "
+             "Существующий не трогается; в квитанции обе ссылки. Умолчания у "
+             "этой команды нет: режим называется явно.")
+    upd.add_argument(
+        "--replace-existing", action="store_true",
+        help="Заменить содержимое существующего документа. Требует также "
+             "--base и --acknowledge-loss: одного флага для разрушения мало.")
+    upd.add_argument(
+        "--base", default=None,
+        help="Сайдкар, который `download --format md` положил рядом со "
+             "скачанным файлом. Доказывает, что заменяется то состояние "
+             "документа, с которого вы писали.")
     upd.add_argument(
         "--acknowledge-loss", action="store_true",
         # The one channel that reaches an agent reading --help before it ever
@@ -12749,7 +13111,10 @@ def main():
     elif args.command == "update":
         update_doc(args.file_id, args.file, title=args.title,
                    no_highlights=args.no_highlights,
-                   acknowledge_loss=args.acknowledge_loss)
+                   acknowledge_loss=args.acknowledge_loss,
+                   create_new=args.create_new,
+                   replace_existing=args.replace_existing,
+                   base=args.base)
     else:
         parser.print_help()
         sys.exit(1)
