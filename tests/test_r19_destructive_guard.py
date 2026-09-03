@@ -419,3 +419,75 @@ def test_document_edited_between_archive_and_write_stops_the_replace(
     assert "update" not in drive.calls
     assert "while the archive was being taken" in json.loads(
         capsys.readouterr().out)["error"]
+
+
+def test_document_moving_between_base_check_and_archive_stops_it(
+        engine, monkeypatch, tmp_path, capsys):
+    # Цепочку рвёт середина: базу проверили на R0, документ уехал на R1,
+    # архив снялся с R1 и сам с собой сошёлся, предзаписная проверка сошлась
+    # с архивом — и замена ушла бы поверх правок, которых человек не видел.
+    # Каждое звено сверяется с БАЗОЙ, а не с соседним (найдено ревью кода).
+    drive = FakeDrive()
+    _wire(monkeypatch, engine, drive, revisions=("R0", "R1"))
+    with pytest.raises(SystemExit):
+        _replace(engine, tmp_path, _base(tmp_path, engine, revision="R0"),
+                 drive)
+    assert "update" not in drive.calls
+    out = json.loads(capsys.readouterr().out)
+    assert out["details"]["base_revision"] == "R0"
+    assert out["details"]["archive_revision"] == "R1"
+
+
+def test_nothing_is_created_when_the_freshness_check_refuses(
+        engine, monkeypatch, tmp_path, capsys):
+    # Копия Drive — тоже запись, и делать её, когда условие уже не выполнено,
+    # значит сорить в чужой папке. Она идёт ПОСЛЕ всех проверок свежести.
+    drive = FakeDrive()
+    _wire(monkeypatch, engine, drive, revisions=("R0", "R0", "R0", "R1"))
+    with pytest.raises(SystemExit):
+        _replace(engine, tmp_path, _base(tmp_path, engine), drive)
+    assert "copy" not in drive.calls and "update" not in drive.calls
+    capsys.readouterr()
+
+
+def test_a_failing_convenience_copy_does_not_abort_the_replace(
+        engine, monkeypatch, tmp_path, capsys):
+    # Копия необязательна: архив уже снят целиком. Обрывать из-за неё
+    # законную замену значит отказывать там, где всё готово.
+    drive = FakeDrive(copy_ok=False)
+    _wire(monkeypatch, engine, drive, comments=[{"id": "c1"}])
+    _replace(engine, tmp_path, _base(tmp_path, engine), drive)
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "replaced"
+    assert out["copy"] is None
+
+
+def test_a_failing_temp_cleanup_never_eats_the_receipt(engine, monkeypatch,
+                                                       tmp_path, capsys):
+    # Исход уже случился. Промолчать о нём из-за неудалённого временного
+    # файла — худшее, что можно сделать после разрушающей записи.
+    drive = FakeDrive()
+    _wire(monkeypatch, engine, drive)
+    # Временный файл появляется только когда в markdown есть картинка: без
+    # неё загружается сам исходник и убирать нечего.
+    (tmp_path / "pic.png").write_bytes(b"\x89PNG")
+    md = _md(tmp_path, "# hi\n\n![alt](pic.png)\n")
+    monkeypatch.setattr(engine.os, "unlink",
+                        lambda p: (_ for _ in ()).throw(OSError("busy")))
+    engine.update_doc("doc1", md, replace_existing=True,
+                      base=_base(tmp_path, engine), acknowledge_loss=True)
+    assert json.loads(capsys.readouterr().out)["action"] == "replaced"
+
+
+def test_the_archive_retakes_itself_when_its_two_reads_disagree(
+        engine, monkeypatch, tmp_path, capsys):
+    # Внутренняя граница архива нужна и после того, как архив сверяется с
+    # базой: без неё выгрузка docx попала бы в архив из момента, когда
+    # документ был другим, а итоговая ревизия сошлась бы с базой и всё
+    # выглядело бы честным. Видно по числу выгрузок: с оградой их две.
+    drive = FakeDrive()
+    _wire(monkeypatch, engine, drive,
+          revisions=("R0", "R1", "R0", "R0", "R0", "R0"))
+    _replace(engine, tmp_path, _base(tmp_path, engine), drive)
+    assert drive.calls.count("export") == 2
+    assert json.loads(capsys.readouterr().out)["action"] == "replaced"

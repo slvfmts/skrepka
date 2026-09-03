@@ -1345,8 +1345,15 @@ def _upload_md_as_doc(creds, drive_service, file_path, folder_id=None,
     except HttpError as e:
         _error(f"upload failed: {e.reason if hasattr(e, 'reason') else e}")
     finally:
+        # Уборка временного файла НЕ имеет права уносить квитанцию: после
+        # успешной записи исход уже случился, и молчание о нём — худшее, что
+        # можно сделать. Раньше исключение отсюда завершало команду без
+        # единого из трёх исходов (ревью кода).
         if upload_path != file_path:
-            os.unlink(upload_path)
+            try:
+                os.unlink(upload_path)
+            except OSError as e:
+                _warn(f"temp upload file left behind ({upload_path}): {e}")
 
     doc_id = file["id"]
     try:
@@ -12728,7 +12735,9 @@ def update_doc(file_id, file_path, title=None, no_highlights=False,
             f"document. skrepka supplies neither on your behalf. "
             f"{_UPDATE_ALTERNATIVES} {_UPDATE_CONSENT_ORDER}")
 
-    _check_replace_base(base, file_id, pre_doc, _collect_tabs(pre_doc)[0][2])
+    base_doc = _check_replace_base(base, file_id, pre_doc,
+                                   _collect_tabs(pre_doc)[0][2])
+    base_revision = base_doc["revision_id"]
 
     archive_dir = f"{file_path}.skrepka-archive-{time.strftime('%Y%m%d-%H%M%S')}"
     try:
@@ -12739,6 +12748,33 @@ def update_doc(file_id, file_path, title=None, no_highlights=False,
     except Exception as e:                                      # noqa: BLE001
         _error(f"archive not taken, the document was not touched: "
                f"{str(e)[:200]}")
+
+    # Архив обязан быть снят с ТОГО ЖЕ состояния, которое доказала база.
+    # Иначе цепочка рвётся посередине: базу проверили на R, документ уехал на
+    # R2, архив снялся с R2 и сам с собой сошёлся, предзаписная проверка тоже
+    # сошлась с архивом — и замена ушла бы поверх правок, которых человек не
+    # видел. Сравнивать надо не соседние звенья, а каждое с базой (ревью кода).
+    if archive["revision_id"] != base_revision:
+        _error("the document changed between the base check and the archive — "
+               "the replace is off. Read it again.",
+               reason="concurrent_edit",
+               details={"base_revision": base_revision,
+                        "archive_revision": archive["revision_id"]})
+
+    # Последняя проверка перед разрушением. Между решением человека и этой
+    # секундой в документе мог появиться новый комментарий — он исчез бы, а
+    # человек так и не узнал бы, что он был.
+    fresh_doc = _safe_get_doc(docs_service, file_id)
+    if fresh_doc.get("revisionId") != base_revision:
+        _error("the document changed while the archive was being taken — "
+               "the replace is off. Read it again.",
+               reason="concurrent_edit")
+    if _raw_comments_digest(
+            _list_comments_raw(drive_service, file_id)) != (
+            archive["comments_digest"]):
+        _error("the comments changed while the archive was being taken — "
+               "the replace is off. Read the document again.",
+               reason="concurrent_edit")
 
     # A Drive copy on top of the archive, and the two are not the same thing.
     # The archive holds everything (docx, the full Docs resource, every
@@ -12760,25 +12796,12 @@ def update_doc(file_id, file_path, title=None, no_highlights=False,
                          "holds_comments": False,
                          "note": ("opens as a document, text and styles only "
                                   "— it carries NO comment threads")}
-    except HttpError as e:
-        # Not fatal: the archive is the thing that must exist, and it does.
+    except Exception as e:                                      # noqa: BLE001
+        # Not fatal, and NOT only HttpError: a timeout here used to abort a
+        # legitimate replace after the archive was already complete, leaving
+        # the person with no result at all (found in code review).
         _warn(f"convenience copy not made ({getattr(e, 'reason', e)}) — the "
               f"archive is complete and the replace goes on")
-
-    # Последняя проверка перед разрушением. Между решением человека и этой
-    # секундой в документе мог появиться новый комментарий — он исчез бы, а
-    # человек так и не узнал бы, что он был.
-    fresh_doc = _safe_get_doc(docs_service, file_id)
-    if fresh_doc.get("revisionId") != archive["revision_id"]:
-        _error("the document changed while the archive was being taken — "
-               "the replace is off. Read it again.",
-               reason="concurrent_edit")
-    if _raw_comments_digest(
-            _list_comments_raw(drive_service, file_id)) != (
-            archive["comments_digest"]):
-        _error("the comments changed while the archive was being taken — "
-               "the replace is off. Read the document again.",
-               reason="concurrent_edit")
 
     upload_path, images = _prepare_md_for_upload(file_path)
     outcome, write_error = "replaced", None
@@ -12800,8 +12823,15 @@ def update_doc(file_id, file_path, title=None, no_highlights=False,
         outcome = "outcome-unknown"
         write_error = str(e)[:200]
     finally:
+        # Уборка временного файла НЕ имеет права уносить квитанцию: после
+        # успешной записи исход уже случился, и молчание о нём — худшее, что
+        # можно сделать. Раньше исключение отсюда завершало команду без
+        # единого из трёх исходов (ревью кода).
         if upload_path != file_path:
-            os.unlink(upload_path)
+            try:
+                os.unlink(upload_path)
+            except OSError as e:
+                _warn(f"temp upload file left behind ({upload_path}): {e}")
 
     result = {
         "id": file_id,
