@@ -117,7 +117,9 @@ def test_the_other_unknowns_are_never_bare(sections):
     # действия: там догадывать нельзя. Одна фраза «unknown — не отказ» на весь
     # навык перенесла бы разрешение с вердикта прогона на призрака якоря.
     body = sections["1. Прочитать"]
-    for match in re.finditer(r"unknown", body):
+    # Имя поля, внутри которого есть `unknown` (`skipped_authorship_unknown`),
+    # само себя и называет — сторожу интересно голое слово.
+    for match in re.finditer(r"(?<![\w])unknown\b", body):
         window = body[max(0, match.start() - 90):match.start()]
         assert ("tab_attribution" in window or "anchor_export" in window
                 or "status" in window), \
@@ -226,3 +228,36 @@ def test_auto_reply_is_not_duplicated_by_the_agent(sections):
     body = sections["4. Применить"]
     assert "отвечает сама" in body
     assert "auto_replies" in body
+
+
+# ---------------------------------------------------------------------------
+# Найдено живым прогоном навыка чужим исполнителем (r19/T13)
+# ---------------------------------------------------------------------------
+
+def test_tab_rule_does_not_block_a_single_tab_document(sections):
+    # На одновкладочном документе атрибуция приходит `unknown` просто потому,
+    # что у комментария нет сохранённой цитаты. Правило, прочитанное как
+    # всеобщее, велит остановиться и спросить — то есть глобальный отказ по
+    # локальному условию, ровно против доктрины проекта.
+    flat = _flat(sections["1. Прочитать"])
+    assert "вкладок НЕСКОЛЬКО" in flat
+    assert "Если вкладка одна" in flat
+
+
+def test_authorship_false_is_named_as_two_different_things(sections):
+    # В записи `author.me: false` стоит и у чужого треда, и у треда с
+    # неподтверждённым авторством. Исполнитель спланировал ответы по файлу,
+    # а узнал разницу только на отправке.
+    flat = _flat(sections["1. Прочитать"])
+    assert "две разные вещи" in flat
+    assert "authorship_unspecified" in flat
+    assert "skipped_authorship_unknown" in flat
+
+
+def test_choosing_the_addressing_is_stated_before_the_edit_is_built(sections):
+    # Широкая правка цитатой поверх якоря отказывает: перезапись требует
+    # точного совпадения. Исполнитель узнал это отказом и переделывал файл.
+    flat = _flat(sections["2. Собрать правку"])
+    assert "адресуй её тредом" in flat
+    assert "совпадает с ним ровно" in flat
+

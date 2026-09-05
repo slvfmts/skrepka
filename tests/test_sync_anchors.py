@@ -3718,3 +3718,50 @@ def test_closed_thread_archive_refuses_malformed_old_replies(
 
     assert "единственная копия" in str(exc.value)
     assert path.read_text(encoding="utf-8") == original
+
+
+def test_refusal_names_the_borders_not_the_replacement_text(engine):
+    """Правка шире якоря: отказ обязан назвать ГРАНИЦЫ, а не текст замены.
+
+    Найдено живым прогоном навыка чужим исполнителем (r19/T13). Он заменял
+    «Доставка заказа осуществляется», где прокомментировано только последнее
+    слово. Перезапись отказала по своей настоящей причине — цель обязана
+    совпадать с якорем ровно, — а объяснение свалилось в общий ответ про
+    уцелевший символ. Исполнитель получил совет оставить часть якорного
+    текста и пошёл переписывать правку, хотя достаточно было адресовать её
+    тредом.
+    """
+    text = "Доставка заказа осуществляется"
+    tab, start, end = _one_para(engine, text)
+    anchor_start = start + engine._utf16_len("Доставка заказа ")
+    kw = {
+        "doc_tab": tab, "search_text": text, "new_text": "Мы доставляем заказ",
+        "start": start, "end": end,
+        "anchors": [(anchor_start, end, "осуществляется", "0")],
+        "attribution": {"0": "c1"},
+        "named_intervals": [],
+    }
+    # Сначала сам отказ: перезапись действительно не строится.
+    assert engine._rewrite_anchor_requests(**kw) is None
+
+    why = engine._why_no_rewrite(**kw)
+    assert "«осуществляется»" in why
+    assert "точном совпадении" in why
+    # Названы оба машинных выхода, и ни один из них не «сделайте руками».
+    assert "replace_anchor" in why and "replace_around_anchor" in why
+    # Ложная причина не должна остаться: текст замены тут ни при чём.
+    assert "уцелеть" not in why.lower()
+
+
+def test_exact_anchor_still_gets_the_surviving_character_answer(engine):
+    """Ограда узкая: при ТОЧНОМ совпадении ответ прежний.
+
+    Иначе новая ветка съела бы случай, для которого совет «оставьте часть
+    исходного текста» как раз верен.
+    """
+    kw = _rewrite_case(engine)
+    assert engine._doomed_threads(
+        kw["start"], kw["end"], kw["anchors"], kw["attribution"])
+    why = engine._why_no_rewrite(**kw)
+    assert "точном совпадении" not in why
+    assert "уцелеть" in why.lower()
