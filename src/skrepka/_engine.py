@@ -12462,8 +12462,12 @@ def _archive_before_replace(docs_service, drive_service, file_id, dest_dir):
         manifest = {
             "kind": "skrepka-archive",
             "note": ("This is an ARCHIVE, not a backup: no command restores "
-                     "the document at its own link from it. The docx opens as "
-                     "a NEW file; the comments stay as text in JSON."),
+                     "the document at its own link from it. Uploading the "
+                     "docx makes a NEW document — measured 05.09: the old "
+                     "text comes back AND every OPEN thread comes back as a "
+                     "live anchored comment. Closed threads do not: the "
+                     "export does not carry them at all (M13), and they "
+                     "survive only as text in comments.json."),
             "doc_id": file_id,
             "revision_id": rev_after,
             "taken_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -12848,7 +12852,10 @@ def update_doc(file_id, file_path, title=None, no_highlights=False,
         "no_rollback": (
             "there is no programmatic rollback for a Google Doc: the archive "
             "can only be restored as a NEW file, which costs the link. That "
-            "is the price the person was asked about."),
+            "is the price the person was asked about. What the restore does "
+            "bring back, measured: the old text and every OPEN thread, live "
+            "and anchored. Closed threads come back only as text in "
+            "comments.json — the export never carried them."),
         "race_window": (
             "a Drive media upload cannot be pinned to a revision — the method "
             "has no precondition at all. Freshness was verified immediately "

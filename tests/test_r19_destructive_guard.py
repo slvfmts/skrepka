@@ -285,6 +285,12 @@ def test_archive_manifest_names_a_digest_for_every_file(engine, monkeypatch,
     # Названо архивом, а не резервной копией: восстановления по прежнему
     # адресу не существует, и обещать его нельзя.
     assert "not a backup" in manifest["note"]
+    # Замерено живой приёмкой 05.09: загрузка docx из архива возвращает не
+    # только текст, но и ОТКРЫТЫЕ треды живыми якорными комментариями.
+    # Закрытые не возвращаются — их выгрузка не несёт вовсе (M13). Раньше
+    # квитанция занижала архив, обещая комментарии «только текстом в JSON».
+    assert "OPEN thread" in manifest["note"]
+    assert "Closed threads do not" in manifest["note"]
 
 
 def test_document_edited_during_the_archive_stops_everything(
