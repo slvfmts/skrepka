@@ -502,23 +502,29 @@ def test_entrypoint_reads_only_and_reports_zero_writes(
 
 def test_entrypoint_names_the_anchor_safe_strategy(
         engine, monkeypatch, tmp_path, capsys):
+    # Штатная картина живого документа: замена, которая что-то удаляет, на
+    # документе с комментариями. Ненулевым кодом она НЕ кончается — иначе
+    # агент прочитает неопределённость как запрет и не станет пробовать.
     _wire(engine, monkeypatch, _doc(), anchored=[{"id": "c1"}])
-    with pytest.raises(SystemExit) as exc:
-        engine.dry_run_patch("d1", _ops_file(tmp_path, [
-            {"op": "replace_quote", "quote": "Alpha", "with": "Beta"}]))
-    assert exc.value.code == 3
+    engine.dry_run_patch("d1", _ops_file(tmp_path, [
+        {"op": "replace_quote", "quote": "Alpha", "with": "Beta"}]))
     out = json.loads(capsys.readouterr().out)
     assert out["doc_strategy"] == "anchor-safe-per-op"
     assert out["operations"][0]["status"] == "unknown"
+    assert out["summary"]["verdict"] == "uncertain"
 
 
-def test_entrypoint_exit_zero_only_when_everything_would_apply(
-        engine, monkeypatch, tmp_path, capsys):
+def test_entrypoint_exit_zero_on_clean_run(engine, monkeypatch, tmp_path,
+                                           capsys):
     _wire(engine, monkeypatch, _doc())
     engine.dry_run_patch("d1", _ops_file(tmp_path, [
         {"op": "replace_quote", "quote": "Alpha", "with": "Beta"},
         {"op": "replace_quote", "quote": "Alpha", "with": "Alpha"}]))
-    capsys.readouterr()
+    out = json.loads(capsys.readouterr().out)
+    assert out["summary"]["verdict"] == "clean"
+    assert out["summary"]["counts"] == {"noop": 1, "not_simulated": 0,
+                                        "unknown": 0, "would_apply": 1,
+                                        "would_refuse": 0}
 
 
 def test_entrypoint_exit_three_on_refusal(engine, monkeypatch, tmp_path,
@@ -582,11 +588,12 @@ def test_writer_export_and_reply_are_unreachable(engine, monkeypatch,
     monkeypatch.setattr(engine, name, lambda *a, **k: (_ for _ in ()).throw(
         AssertionError(f"холостой прогон вызвал {name}")))
     _wire(engine, monkeypatch, _doc(), anchored=[{"id": "c1"}])
-    with pytest.raises(SystemExit):
-        engine.dry_run_patch("d1", _ops_file(tmp_path, [
-            {"op": "replace_quote", "quote": "Alpha", "with": "Beta"},
-            {"op": "replace_around_anchor", "comment_id": "c1",
-             "quote": "Alpha", "with": {"before": "A", "after": "a"}}]))
+    # Прогон завершается сам: доказывает тест не код возврата, а то, что
+    # подменённые функции писателя не были вызваны.
+    engine.dry_run_patch("d1", _ops_file(tmp_path, [
+        {"op": "replace_quote", "quote": "Alpha", "with": "Beta"},
+        {"op": "replace_around_anchor", "comment_id": "c1",
+         "quote": "Alpha", "with": {"before": "A", "after": "a"}}]))
 
 
 def test_planner_takes_a_snapshot_not_a_service(engine):
@@ -716,11 +723,10 @@ def test_patch_dry_run_flag_never_reaches_the_writer(engine, monkeypatch,
     # Мерка «холостой» — не в названии функции, а во флаге, которым её
     # зовут. Сорвись здесь ветвление, `patch --dry-run` записал бы документ.
     service = _wire(engine, monkeypatch, _doc(), anchored=[{"id": "c1"}])
-    with pytest.raises(SystemExit) as exc:
-        engine.patch_doc("d1", _ops_file(tmp_path, [
-            {"op": "replace_quote", "quote": "Alpha", "with": "Beta"}]),
-            dry_run=True)
-    assert exc.value.code == 3 and service.writes == 0
+    engine.patch_doc("d1", _ops_file(tmp_path, [
+        {"op": "replace_quote", "quote": "Alpha", "with": "Beta"}]),
+        dry_run=True)
+    assert service.writes == 0
     assert json.loads(capsys.readouterr().out)["action"] == "dry-run"
 
 
@@ -956,3 +962,87 @@ def test_overlap_gate_cost_is_deliberate(engine):
         {"op": "replace_quote", "quote": "ef", "with": "EF"},
     ], text="abcdefghij")
     assert [v["status"] for v in verdicts] == ["would_refuse"] * 3
+
+
+# ---------------------------------------------------------------------------
+# Итог прогона и код возврата (r19/T13)
+#
+# Отдельный канал заведён потому, что число на выходе — самый дешёвый сигнал,
+# и агент верит ему раньше любой прозы. Пока `unknown` кончался кодом 3,
+# документ с комментариями выглядел как провал при исправном прогоне.
+# ---------------------------------------------------------------------------
+
+def test_summary_vocabulary_is_closed(engine):
+    assert engine._DRY_VERDICTS == ("clean", "uncertain", "refusals")
+
+
+def test_summary_counts_every_status_and_sums_to_the_ops(engine):
+    verdicts = _plan(engine, [
+        {"op": "replace_quote", "quote": "Alpha", "with": "Beta"},
+        {"op": "replace_quote", "quote": "Alpha", "with": "Alpha"},
+        {"op": "replace_quote", "quote": "Missing", "with": "X"}])
+    summary = engine._dry_summary(verdicts)
+    assert set(summary["counts"]) == set(engine._DRY_STATUSES)
+    assert sum(summary["counts"].values()) == len(verdicts)
+
+
+def test_refusal_outranks_uncertainty_in_the_summary(engine):
+    # Отказ и неопределённость в одном файле: итог обязан назвать отказ,
+    # иначе `uncertain` спрячет операцию, которая точно не применится.
+    verdicts = _plan(engine, [
+        {"op": "replace_quote", "quote": "Missing", "with": "X"},
+        {"op": "replace_quote", "quote": "Alpha", "with": "Beta"}],
+        anchored=True)
+    assert [v["status"] for v in verdicts] == ["would_refuse", "unknown"]
+    assert engine._dry_summary(verdicts)["verdict"] == "refusals"
+
+
+def test_not_simulated_is_uncertain_not_refusal(engine):
+    summary = engine._dry_summary([
+        {"status": "would_apply"}, {"status": "not_simulated"}])
+    assert summary["verdict"] == "uncertain"
+
+
+def test_uncertain_run_exits_zero(engine, monkeypatch, tmp_path, capsys):
+    # Мерка задачи целиком: на живом комментированном документе любая
+    # удаляющая правка получает `unknown`, и если это ненулевой код, агент
+    # перестаёт пробовать — тот самый пост-мортем 27 августа наизнанку.
+    _wire(engine, monkeypatch, _doc(), anchored=[{"id": "c1"}])
+    engine.dry_run_patch("d1", _ops_file(tmp_path, [
+        {"op": "replace_quote", "quote": "Alpha", "with": "Beta"}]))
+    assert json.loads(capsys.readouterr().out)["summary"]["verdict"] \
+        == "uncertain"
+
+
+def test_refusals_run_exits_three(engine, monkeypatch, tmp_path, capsys):
+    _wire(engine, monkeypatch, _doc(), anchored=[{"id": "c1"}])
+    with pytest.raises(SystemExit) as exc:
+        engine.dry_run_patch("d1", _ops_file(tmp_path, [
+            {"op": "replace_quote", "quote": "Missing", "with": "X"}]))
+    assert exc.value.code == 3
+    assert json.loads(capsys.readouterr().out)["summary"]["verdict"] \
+        == "refusals"
+
+
+def test_broken_schema_keeps_the_summary_shape(engine, tmp_path, capsys):
+    # Битая схема отвечает той же квитанцией, что и разобранный файл:
+    # читающий её разбирает одним способом, а не двумя.
+    path = tmp_path / "ops.json"
+    path.write_text("not-json")
+    with pytest.raises(SystemExit) as exc:
+        engine.dry_run_patch("d1", str(path))
+    assert exc.value.code == 3
+    out = json.loads(capsys.readouterr().out)
+    assert out["summary"]["verdict"] == "refusals"
+    assert out["summary"]["counts"]["would_refuse"] == 1
+
+
+def test_verdict_reaches_the_short_console_receipt(engine, monkeypatch,
+                                                   tmp_path, capsys):
+    # С `--output` в консоль уходит короткая квитанция, и полную читают из
+    # файла. Без итога в короткой агент видит только «записано N байт».
+    _wire(engine, monkeypatch, _doc(), anchored=[{"id": "c1"}])
+    engine.dry_run_patch("d1", _ops_file(tmp_path, [
+        {"op": "replace_quote", "quote": "Alpha", "with": "Beta"}]),
+        output=str(tmp_path / "receipt.json"))
+    assert json.loads(capsys.readouterr().out)["verdict"] == "uncertain"

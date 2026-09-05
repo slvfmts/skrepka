@@ -7720,6 +7720,11 @@ def _send_reply_intents(drive_service, file_id, ops_path, intents):
 # нельзя. Действует, пока документ не менялся между прогоном и записью: в
 # квитанции для этого стоит `revision_id_before`.
 #
+# Код возврата сообщает ОДНО событие: 3 — есть предсказуемый отказ или битая
+# схема; 0 — прогон состоялся и ничего не записал. Ноль не значит «чисто» и
+# не даёт права не читать `summary.verdict`: `uncertain` живёт под нулём
+# намеренно, потому что неопределённость здесь штатна, а не аварийна.
+#
 # Полной локальной модели документа здесь нет и не будет: вторая реализация
 # индексной семантики Docs обязана совпадать с первой, а расхождение даёт либо
 # ложный отказ, либо потерянный документ. Всё, что этот путь считает по
@@ -7754,6 +7759,31 @@ _DRY_REASON_CODES = frozenset((
     "prior_mutation_may_change_uniqueness",  # ранняя правка двигает цитату
     "prior_unsimulated_mutation",     # раньше стоит несосчитанная правка
 ))
+
+
+# Итог прогона одним словом. Заведён, чтобы код возврата перестал быть
+# каналом для неопределённости: конвейер читает поле и сам решает свою
+# политику, а число на выходе остаётся грубым и означает ровно одно событие.
+_DRY_VERDICTS = ("clean", "uncertain", "refusals")
+
+
+def _dry_summary(verdicts):
+    """Счётчики по статусам и итог одним словом.
+
+    `uncertain` — не «плохо», а «предсказуемого отказа нет, решать писателю».
+    Разница между ним и `clean` существует для того, кто хочет остановиться на
+    неопределённости; сам прогон её поводом не считает.
+    """
+    counts = {status: 0 for status in sorted(_DRY_STATUSES)}
+    for verdict in verdicts:
+        counts[verdict["status"]] += 1
+    if counts["would_refuse"]:
+        outcome = "refusals"
+    elif counts["unknown"] or counts["not_simulated"]:
+        outcome = "uncertain"
+    else:
+        outcome = "clean"
+    return {"verdict": outcome, "counts": counts}
 
 
 def _dry_verdict(index, source, status, *, reason=None, error=None,
@@ -8418,6 +8448,7 @@ def _dry_receipt(doc_id, prepared, verdicts):
         "doc_strategy": ("anchor-safe-per-op" if prepared["anchored"]
                          else "index-atomic"),
         "writes_performed": 0,
+        "summary": _dry_summary(verdicts),
         "operations": verdicts,
     }
 
@@ -8432,14 +8463,15 @@ def dry_run_patch(file_id, ops_path, tab_id=None, output=None):
     file_id = _extract_doc_id(file_id)
 
     def _bail(message):
+        verdicts = [_dry_verdict(None, "ops.json", "would_refuse",
+                                 reason="schema_invalid", error=message)]
         receipt = {"action": "dry-run", "strategy": "read-only-advisory",
                    "doc_id": file_id, "writes_performed": 0,
-                   "operations": [_dry_verdict(None, "ops.json",
-                                               "would_refuse",
-                                               reason="schema_invalid",
-                                               error=message)]}
+                   "summary": _dry_summary(verdicts),
+                   "operations": verdicts}
         _emit_json(receipt, output=output,
-                   summary={"action": "dry-run", "writes_performed": 0})
+                   summary={"action": "dry-run", "writes_performed": 0,
+                            "verdict": receipt["summary"]["verdict"]})
         raise SystemExit(3)
 
     if not os.path.exists(ops_path):
@@ -8467,8 +8499,16 @@ def dry_run_patch(file_id, ops_path, tab_id=None, output=None):
     verdicts = compile_index_plan(prepared)
     receipt = _dry_receipt(file_id, prepared, verdicts)
     _emit_json(receipt, output=output,
-               summary={"action": "dry-run", "writes_performed": 0})
-    if any(v["status"] not in ("would_apply", "noop") for v in verdicts):
+               summary={"action": "dry-run", "writes_performed": 0,
+                        "verdict": receipt["summary"]["verdict"]})
+    # Ненулевым кодом кончается только предсказуемый отказ. Неопределённость
+    # им не наказывается: на заякоренном документе `unknown` получает любая
+    # правка, которая что-нибудь удаляет, то есть почти всё осмысленное, и
+    # число «провал» на выходе научило бы агента не пробовать — ровно то, от
+    # чего заведён сам прогон. Fail-closed живёт в писателе, где он отказывает
+    # по операции, перечитав документ; дублировать его здесь значило бы
+    # завести вторую реализацию того же решения.
+    if receipt["summary"]["verdict"] == "refusals":
         raise SystemExit(3)
     return receipt
 
@@ -13019,8 +13059,10 @@ def main():
     pt.add_argument("--dry-run", action="store_true",
                     help="Показать вердикт по каждой правке, ничего не "
                          "записывая. `would_apply` — применится; `unknown` — "
-                         "по чтению не решается; `would_refuse` — откажет, и "
-                         "видно почему")
+                         "по чтению не решается, это НЕ отказ; "
+                         "`would_refuse` — откажет, и видно почему. Итог — в "
+                         "`summary.verdict`; код возврата 3 бывает только на "
+                         "`refusals`")
     pt.add_argument("--output", default=None,
                     help="Записать полную квитанцию холостого прогона в файл "
                          "и напечатать короткую (только с --dry-run)")
