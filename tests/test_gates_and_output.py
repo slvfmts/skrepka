@@ -551,11 +551,11 @@ def test_update_help_names_the_path_that_keeps_threads(engine, monkeypatch,
         engine.main()
     assert ei.value.code == 0
     help_text = " ".join(capsys.readouterr().out.split())
-    assert "`patch` applies edits and keeps the threads alive" in help_text
-    assert "closed threads" in help_text          # the honest caveat
+    assert "`patch` вносит правки и оставляет треды живыми" in help_text
     assert "download" in help_text and "sync" in help_text
-    assert "sidecar must stay next to it" in help_text
-    assert "not a reason to use this flag" in help_text
+    assert "сохраняет ОТКРЫТЫЕ треды" in help_text
+    assert "сайдкар должен лежать рядом" in help_text
+    assert "не повод брать этот флаг" in help_text
 
 
 def test_destructive_refusal_names_both_shapes_of_the_task(

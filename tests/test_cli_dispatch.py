@@ -69,11 +69,21 @@ def test_overview_names_the_cost_of_update_and_the_path_that_keeps_threads():
     it described `update` as neutrally as `upload`. An agent that learns the
     destructive path before the safe one will reach for it under pressure
     (#24) — the live incident cost 18 threads."""
-    lines = {ln.split()[0]: ln for ln in cli._TOP_HELP.splitlines()
-             if ln.startswith("  ") and ln.strip()}
-    assert "DESTROYS" in lines["update"]
-    assert "keeps comment threads alive" in lines["patch"]
-    assert "keeping OPEN comment" in lines["sync"]
+    # Описание команды — это её БЛОК, а не первая строка: перенос строки не
+    # должен уносить из-под сторожа то, ради чего он стоит.
+    blocks, current = {}, None
+    for ln in cli._TOP_HELP.splitlines():
+        if ln.startswith("  ") and ln.strip() and not ln.startswith("     "):
+            current = ln.split()[0]
+            blocks[current] = ln
+        elif current and ln.startswith("     "):
+            blocks[current] += " " + ln.strip()
+    assert "уничтожает все треды" in blocks["update"]
+    assert "Режим обязателен" in blocks["update"]
+    assert "не убивая комментарии" in blocks["patch"]
+    assert "--dry-run" in blocks["patch"]
+    assert "ОТКРЫТЫЕ треды" in blocks["sync"]
+    assert "экспериментальная" in blocks["sync"]
 
 
 def test_every_registered_subcommand_is_listed_in_the_overview():

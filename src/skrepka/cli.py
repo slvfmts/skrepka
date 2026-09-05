@@ -18,43 +18,45 @@ _INSTALL_HINT = (
 # Curated top-level help. The engine and the setup/privacy modules each own
 # their own argparse, so no single parser lists every command; without this,
 # `skrepka --help` would hide `init` — the first command a new user needs.
-_TOP_HELP = """skrepka — careful collaborative editing for Google Docs.
+_TOP_HELP = """skrepka — бережная совместная правка Google-документов.
 
-Setup:
-  init         Guided Google authorization (run this first)
-  doctor       Diagnose credentials, token, scopes, and API access
+Настройка:
+  init         Мастер доступа к Google (начните с него)
+  doctor       Проверить доступы, токен и связь с API
 
-Comments & edits:
-  comments     List comments on a doc
-  reply        Post a reply to a comment (--file for a batch,
-               each reply in its own second)
-  resolve      Resolve a comment thread (the person's decision, not an agent's)
-  comment      Create a document-level comment
-  patch        Apply anchor-safe text edits (keeps comment threads alive —
-               start here when a doc has comments)
-  mark         Create a named range around a text fragment
-  suggestions  List suggestions on a doc
+Комментарии и правки:
+  comments     Показать комментарии документа
+  reply        Ответить в тред (--file — пачкой, каждый ответ
+               в свою секунду)
+  resolve      Закрыть тред — это решение человека, не агента
+  comment      Оставить комментарий ко всему документу
+  patch        Внести правки, не убивая комментарии. --dry-run
+               примеряет их, ничего не записывая
+  mark         Пометить фрагмент именованным диапазоном
+  suggestions  Показать предложенные правки (принять их можно
+               только руками в интерфейсе)
 
-Documents:
-  upload       Create a Google Doc from a .md file
-  download     Export a Google Doc as markdown
-  update       Replace a doc's whole content — DESTROYS every comment thread
-  upload-file  Upload file(s) as-is (no Google Doc conversion)
-  sync         Three-way merge a local .md into a doc, keeping OPEN comment
-               threads (experimental; refuses when the edit rewrites
-               commented text; a closed thread can be unhooked — its words
-               are archived next to the .md first)
+Документы:
+  upload       Создать документ из .md
+  download     Выгрузить документ в markdown
+  update       Положить содержимое новым документом или заменить
+               существующий целиком. Режим обязателен; замена
+               уничтожает все треды
+  upload-file  Залить файлы как есть, без превращения в документ
+  sync         Слить правки из локального .md обратно в документ,
+               сохраняя ОТКРЫТЫЕ треды (экспериментальная; отказывает,
+               если правка переписывает прокомментированное)
 
-Data & privacy:
-  logout       Remove the local token (keeps your OAuth client)
-  revoke       Revoke the token with Google, then remove it locally
-  forget       Remove the local token/credentials/journals (and, with
-               --sidecars PATH, a document's sidecar)
+Данные и приватность:
+  logout       Удалить локальный токен, клиент OAuth останется
+  revoke       Отозвать токен у Google и удалить его локально
+  forget       Удалить локальные токен, ключи и журналы (а с
+               --sidecars PATH — и сайдкар документа)
 
-Other:
-  --version    Print the installed version
+Ещё:
+  --version    Установленная версия
 
-Run `skrepka <command> --help` for details on a command.
+Подробности по команде: skrepka <команда> --help
 """
 
 

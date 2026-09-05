@@ -20,7 +20,22 @@ skrepka убирает это копирование. Вы оставляете 
 
 Кроме этого skrepka выгружает документ в markdown и заливает правки обратно, создаёт документы из markdown и разбирает предложенные правки. Полный список сценариев — в [docs/PLUGIN.md](https://github.com/slvfmts/skrepka/blob/main/docs/PLUGIN.md).
 
+## Как это выглядит
+
+Работу ведёт агент, но команды видны, и вот весь цикл:
+
+```bash
+skrepka comments DOC --output comments.json     # прочитать треды
+skrepka patch DOC ops.json --dry-run            # примерить правки
+skrepka patch DOC ops.json                      # применить
+skrepka reply DOC --file replies.json           # ответить в треды
+```
+
+Третья строка — единственная, которая меняет документ. Вторая говорит по каждой правке, что с ней будет, и не пишет ничего: примерить дёшево, поэтому пробовать можно без риска. Треды при этом остаются живыми, а закрывает их человек.
+
 ## Как начать
+
+Нужен macOS или Linux: защиты файлового ввода-вывода опираются на механизмы Unix, Windows не поддержан.
 
 1. Поставьте skrepka: `pipx install skrepka`.
 2. Настройте доступ к Google: `skrepka init`. Первая настройка занимает 15–30 минут, инструкция со снимками экрана — в [docs/QUICKSTART.md](https://github.com/slvfmts/skrepka/blob/main/docs/QUICKSTART.md).
@@ -37,6 +52,7 @@ skrepka убирает это копирование. Вы оставляете 
 | [docs/QUICKSTART.md](https://github.com/slvfmts/skrepka/blob/main/docs/QUICKSTART.md) | Настройка доступа к Google по шагам |
 | [docs/PLUGIN.md](https://github.com/slvfmts/skrepka/blob/main/docs/PLUGIN.md) | Навыки для Claude Code и Codex |
 | [docs/LIMITATIONS.md](https://github.com/slvfmts/skrepka/blob/main/docs/LIMITATIONS.md) | Что skrepka не делает |
+| [docs/LIMITATIONS-TECHNICAL.md](https://github.com/slvfmts/skrepka/blob/main/docs/LIMITATIONS-TECHNICAL.md) | То же подробно: команды, коды причин, поведение API |
 | [PRIVACY.md](https://github.com/slvfmts/skrepka/blob/main/PRIVACY.md) | Какие данные и куда идут |
 | [SECURITY.md](https://github.com/slvfmts/skrepka/blob/main/SECURITY.md) | Модель угроз и как сообщить об уязвимости |
 

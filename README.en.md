@@ -20,7 +20,22 @@ The main scenario is working through comments. You tell the agent to handle the 
 
 skrepka also exports a document to markdown and pushes edits back, creates documents from markdown, and reviews suggested changes. Full list of scenarios in [docs/PLUGIN.md](docs/PLUGIN.md).
 
+## What it looks like
+
+The agent does the work, but the commands are plain, and this is the whole cycle:
+
+```bash
+skrepka comments DOC --output comments.json     # read the threads
+skrepka patch DOC ops.json --dry-run            # try the edits on
+skrepka patch DOC ops.json                      # apply them
+skrepka reply DOC --file replies.json           # reply in the threads
+```
+
+The third line is the only one that changes the document. The second says, edit by edit, what would happen, and writes nothing: trying it on is cheap, so there is no risk in trying. The threads stay alive, and only a human closes them.
+
 ## Getting started
+
+You need macOS or Linux: the file I/O guards rely on Unix mechanisms, so Windows is not supported.
 
 1. Install skrepka: `pipx install skrepka`.
 2. Set up Google access: `skrepka init`. First-time setup takes 15 to 30 minutes; the walkthrough with screenshots is in [docs/QUICKSTART.md](docs/QUICKSTART.md).
@@ -37,6 +52,7 @@ You create your own Google Cloud project and act under your own account. skrepka
 | [docs/QUICKSTART.md](docs/QUICKSTART.md) | Step-by-step Google authorization |
 | [docs/PLUGIN.md](docs/PLUGIN.md) | Connecting the skills to your agent |
 | [docs/LIMITATIONS.md](docs/LIMITATIONS.md) | What skrepka deliberately does not do |
+| [docs/LIMITATIONS-TECHNICAL.md](docs/LIMITATIONS-TECHNICAL.md) | The same in detail: commands, reason codes, API behaviour |
 | [PRIVACY.md](PRIVACY.md) | What data goes where |
 | [SECURITY.md](SECURITY.md) | Threat model and how to report a vulnerability |
 

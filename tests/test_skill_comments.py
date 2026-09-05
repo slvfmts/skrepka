@@ -249,8 +249,10 @@ def test_authorship_false_is_named_as_two_different_things(sections):
     # неподтверждённым авторством. Исполнитель спланировал ответы по файлу,
     # а узнал разницу только на отправке.
     flat = _flat(sections["1. Прочитать"])
-    assert "две разные вещи" in flat
-    assert "authorship_unspecified" in flat
+    # С T14 различие есть в самой записи, и навык обязан звать читать ЕГО,
+    # а не выводить авторство из `author.me`, где два состояния слиты.
+    assert "читай по полю `authorship`" in flat
+    assert "unspecified" in flat and "foreign" in flat
     assert "skipped_authorship_unknown" in flat
 
 

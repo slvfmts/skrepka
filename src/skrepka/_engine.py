@@ -1285,7 +1285,7 @@ def post_process_images(docs_service, drive_service, doc_id, images, folder_id=N
 # xlink:href="http://…">` or `file:///etc/passwd` in an SVG would make skrepka
 # fetch it — breaking the "no outbound connections except Google" promise in
 # SECURITY.md. 0.9 refuses .svg instead of rendering it unsandboxed; convert to
-# PNG yourself (docs/LIMITATIONS.md).
+# PNG yourself (docs/LIMITATIONS-TECHNICAL.md).
 _UPLOAD_IMAGE_EXTS = frozenset({
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff",
 })
@@ -13111,63 +13111,67 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     # upload command
-    up = sub.add_parser("upload", help="Upload .md file as Google Doc")
-    up.add_argument("file", help="Path to .md file")
-    up.add_argument("--folder", help="Google Drive folder ID")
-    up.add_argument("--title", help="Document title (default: filename without extension)")
-    up.add_argument("--no-highlights", action="store_true", help="Skip highlight post-processing")
+    up = sub.add_parser("upload", help="Создать Google-документ из .md")
+    up.add_argument("file", help="Путь к .md")
+    up.add_argument("--folder", help="Идентификатор папки на Диске")
+    up.add_argument("--title", help="Название документа (по умолчанию — имя файла)")
+    up.add_argument("--no-highlights", action="store_true",
+                    help="Не расставлять выделения постобработкой")
 
     # comments command
-    cm = sub.add_parser("comments", help="List comments on a Google Doc")
-    cm.add_argument("file_id", help="Google Doc file ID or URL")
+    cm = sub.add_parser("comments", help="Показать комментарии документа")
+    cm.add_argument("file_id", help="Идентификатор или ссылка на Google-документ")
     cm.add_argument("--output", default=None,
-                    help="Write the full JSON to a file and print a short "
+                    help="Записать полный JSON в файл и напечатать "
                          "receipt (large threads can exceed agent output "
                          "limits and get silently truncated)")
 
     # reply command
     rp = sub.add_parser("reply",
-                        help="Post a reply to a comment, or a batch of them")
-    rp.add_argument("file_id", help="Google Doc file ID or URL")
-    rp.add_argument("comment_id", nargs="?", help="Comment ID to reply to")
-    rp.add_argument("text", nargs="?", help="Reply text")
+                        help="Ответить в тред или отправить пачку ответов")
+    rp.add_argument("file_id", help="Идентификатор или ссылка на Google-документ")
+    rp.add_argument("comment_id", nargs="?", help="Идентификатор треда")
+    rp.add_argument("text", nargs="?", help="Текст ответа")
     rp.add_argument("--file", help='Batch form: JSON with {"replies": '
                                    '[{"comment_id": "...", "text": "..."}]} — '
                                    'each reply lands in its own second')
     rp.add_argument("--dry-run", action="store_true",
-                    help="With --file: show what would be sent and what is "
-                         "skipped, write nothing")
+                    help="С --file: показать, что уйдёт и что будет "
+                         "пропущено, ничего не записывая")
     rp.add_argument("--include-foreign", action="store_true",
-                    help="With --file: reply in threads started by somebody "
-                         "else too (by default only your own)")
-    rp.add_argument("--output", help="Write the JSON result to this file")
+                    help="С --file: отвечать и в чужие треды тоже (по "
+                         "умолчанию только в свои)")
+    rp.add_argument("--output", help="Записать квитанцию в этот файл")
     rp.add_argument("--resolve", action="store_true",
-                    help="Also mark the thread as resolved")
+                    help="Заодно закрыть тред. Агенту нельзя: закрывает "
+                         "тред человек")
     rp.add_argument("--yes", action="store_true",
-                    help="Confirm the resolve without a prompt (only with "
-                         "--resolve; closing a thread is the person's call)")
+                    help="Подтвердить закрытие без вопроса (только с "
+                         "--resolve; закрывает тред человек)")
 
     # resolve command
-    rs = sub.add_parser("resolve", help="Resolve a comment thread")
-    rs.add_argument("file_id", help="Google Doc file ID or URL")
-    rs.add_argument("comment_id", help="Comment ID to resolve")
+    rs = sub.add_parser("resolve", help="Закрыть тред комментария (решение человека)")
+    rs.add_argument("file_id", help="Идентификатор или ссылка на Google-документ")
+    rs.add_argument("comment_id", help="Идентификатор треда")
     rs.add_argument("--text", default=None,
-                    help="Optional note (default: 'Resolved.')")
+                    help="Необязательная приписка (по умолчанию «Resolved.»)")
     rs.add_argument("--yes", action="store_true",
-                    help="Confirm without a prompt (closing a thread is the "
-                         "person's call, not the agent's)")
+                    help="Подтвердить без вопроса (закрывает тред человек, "
+                         "не агент)")
 
     # comment command (document-level, unanchored)
-    cc = sub.add_parser("comment", help="Create a document-level comment (no anchor)")
-    cc.add_argument("file_id", help="Google Doc file ID or URL")
-    cc.add_argument("text", help="Comment text")
+    cc = sub.add_parser("comment",
+                        help="Оставить комментарий ко всему документу")
+    cc.add_argument("file_id", help="Идентификатор или ссылка на Google-документ")
+    cc.add_argument("text", help="Текст комментария")
 
     # patch command (structural edits with comment preflight)
-    pt = sub.add_parser("patch", help="Apply structural edits to a Google Doc")
-    pt.add_argument("file_id", help="Google Doc file ID or URL")
-    pt.add_argument("ops", help="Path to ops.json with list of operations")
+    pt = sub.add_parser("patch",
+                        help="Внести правки, не убивая комментарии")
+    pt.add_argument("file_id", help="Идентификатор или ссылка на Google-документ")
+    pt.add_argument("ops", help="Путь к ops.json со списком правок")
     pt.add_argument("--tab", dest="tab_id", default=None,
-                    help="Tab ID (required if doc has multiple tabs)")
+                    help="Идентификатор вкладки. Нужен, только если вкладок несколько")
     pt.add_argument("--dry-run", action="store_true",
                     help="Показать вердикт по каждой правке, ничего не "
                          "записывая. `would_apply` — применится; `unknown` — "
@@ -13176,39 +13180,46 @@ def main():
                          "`summary.verdict`; код возврата 3 бывает только на "
                          "`refusals`")
     pt.add_argument("--output", default=None,
-                    help="Записать полную квитанцию холостого прогона в файл "
-                         "и напечатать короткую (только с --dry-run)")
+                    help="Записать полную квитанцию в файл и напечатать "
+                         "короткую. Работает и у холостого прогона, и у "
+                         "записи: длинную квитанцию вывод агента режет")
 
     # mark command (named ranges)
-    mk = sub.add_parser("mark", help="Create a named range around a text fragment")
-    mk.add_argument("file_id", help="Google Doc file ID or URL")
-    mk.add_argument("name", help="Named range identifier")
-    mk.add_argument("--quote", required=True, help="Text fragment to wrap")
+    mk = sub.add_parser("mark",
+                        help="Пометить фрагмент именованным диапазоном")
+    mk.add_argument("file_id", help="Идентификатор или ссылка на Google-документ")
+    mk.add_argument("name", help="Имя диапазона")
+    mk.add_argument("--quote", required=True, help="Фрагмент текста")
     mk.add_argument("--tab", dest="tab_id", default=None,
-                    help="Tab ID (required if doc has multiple tabs)")
+                    help="Идентификатор вкладки. Нужен, только если вкладок несколько")
     mk.add_argument("--occurrence", type=int, default=1,
-                    help="1-based match index if quote is non-unique (default: 1)")
+                    help="Номер вхождения, если цитата неоднозначна (с 1)")
 
     # download command
-    dl = sub.add_parser("download", help="Download a Google Doc")
-    dl.add_argument("file_id", help="Google Doc file ID or URL")
+    dl = sub.add_parser("download", help="Выгрузить документ в файл")
+    dl.add_argument("file_id", help="Идентификатор или ссылка на Google-документ")
     dl.add_argument("--format", default="md", choices=list(EXPORT_MIMETYPES.keys()),
-                    help="Export format (default: md)")
-    dl.add_argument("--output", help="Output file path (default: auto from title)")
-    dl.add_argument("--images-dir", help="Directory for images (md format only)")
+                    help="Формат выгрузки (по умолчанию md)")
+    dl.add_argument("--output",
+                    help="Путь к файлу (по умолчанию — из названия)")
+    dl.add_argument("--images-dir", help="Каталог для картинок (только md)")
 
     # suggestions command
-    sg = sub.add_parser("suggestions", help="List suggestions on a Google Doc")
-    sg.add_argument("file_id", help="Google Doc file ID or URL")
+    sg = sub.add_parser("suggestions",
+                        help="Показать предложенные правки")
+    sg.add_argument("file_id", help="Идентификатор или ссылка на Google-документ")
     sg.add_argument("--output", default=None,
-                    help="Write the full JSON to a file and print a short "
-                         "receipt (large diffs can exceed agent output "
-                         "limits and get silently truncated)")
+                    help="Записать полный JSON в файл и напечатать "
+                         "короткую квитанцию: длинную разницу вывод "
+                         "агента режет молча")
 
     # sync command (three-way merge)
-    sy = sub.add_parser("sync", help="Three-way merge local .md into a Google Doc")
-    sy.add_argument("file_id", help="Google Doc file ID or URL")
-    sy.add_argument("file", help="Path to edited .md (sidecar must sit next to it)")
+    sy = sub.add_parser("sync",
+                        help="Слить правки из локального .md обратно "
+                             "в документ (экспериментальная)")
+    sy.add_argument("file_id", help="Идентификатор или ссылка на Google-документ")
+    sy.add_argument("file",
+                    help="Путь к правленому .md (сайдкар лежит рядом)")
 
     # update command
     upd = sub.add_parser(
@@ -13216,11 +13227,11 @@ def main():
         help="Положить содержимое новым документом (--create-new) либо "
              "заменить существующий целиком (--replace-existing, разрушает "
              "все треды). Режим обязателен; точечные правки делает `patch`")
-    upd.add_argument("file_id", help="Google Doc file ID or URL")
-    upd.add_argument("file", help="Path to .md file with new content")
-    upd.add_argument("--title", help="New document title")
+    upd.add_argument("file_id", help="Идентификатор или ссылка на Google-документ")
+    upd.add_argument("file", help="Путь к .md с новым содержимым")
+    upd.add_argument("--title", help="Новое название документа")
     upd.add_argument("--no-highlights", action="store_true",
-                     help="Skip highlight post-processing")
+                     help="Не расставлять выделения постобработкой")
     upd.add_argument(
         "--create-new", action="store_true",
         help="Положить содержимое НОВЫМ документом рядом, в ту же папку. "
@@ -13240,23 +13251,23 @@ def main():
         # The one channel that reaches an agent reading --help before it ever
         # sees a refusal. Naming only the price taught agents that losing the
         # threads was the only way to do the job (#24) — it never was.
-        help="Proceed although every comment thread is destroyed. Rarely the "
-             "right call: `patch` applies edits and keeps the threads alive, "
-             "including rewriting a commented fragment whole (unless the doc "
-             "has closed threads). If you hold a freshly written .md, "
-             "`download` the doc, move your changes into the downloaded file "
-             "(its sidecar must stay next to it) and `sync` — it keeps OPEN "
-             "threads, a closed one may be unhooked with its words archived "
-             "beside the .md. What `patch` "
-             "cannot place is a list for the person, not a reason to use this "
-             "flag. The backup made first holds text and styles only — not "
-             "the comments.")
+        help="Согласиться на то, что все треды будут уничтожены. Нужно "
+             "редко: `patch` вносит правки и оставляет треды живыми, включая "
+             "полную перезапись прокомментированного фрагмента. Если у вас "
+             "уже написан новый .md — выгрузите документ, перенесите правки "
+             "в выгруженный файл (сайдкар должен лежать рядом) и слейте "
+             "через `sync`: он сохраняет ОТКРЫТЫЕ треды. Чего не умеет "
+             "`patch` — это список для человека, а не повод брать этот флаг. "
+             "Снимаемый архив держит текст и оформление, комментариев в нём "
+             "нет.")
 
     # upload-file command (raw upload, any file type, no conversion)
-    uf = sub.add_parser("upload-file", help="Upload file(s) as-is (no Google Doc conversion)")
-    uf.add_argument("file", nargs="+", help="Path(s) to file(s)")
-    uf.add_argument("--folder", help="Google Drive folder ID or URL")
-    uf.add_argument("--title", help="Name override (only when uploading a single file)")
+    uf = sub.add_parser("upload-file",
+                        help="Залить файлы как есть, без превращения в "
+                             "Google-документ")
+    uf.add_argument("file", nargs="+", help="Пути к файлам")
+    uf.add_argument("--folder", help="Папка на Диске: идентификатор или ссылка")
+    uf.add_argument("--title", help="Имя файла (только когда файл один)")
 
     args = parser.parse_args()
     if args.command == "upload":
