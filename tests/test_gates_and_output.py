@@ -323,9 +323,10 @@ def test_update_without_acknowledge_loss_blocks_before_any_write(
     # the agent has to be able to name the document it is asking about
     assert blocked["document"] == "doc"
     # asking comes before the flag, and consent does not travel between docs
-    reason = blocked["reason"]
-    assert reason.index("ask the person") < reason.index("--acknowledge-loss")
-    assert "does not carry over" in reason
+    consent = blocked["consent"]
+    assert consent.index("ask the person") < consent.index(
+        "--acknowledge-loss")
+    assert "does not carry over" in consent
 
 
 def test_update_blocks_on_named_ranges_alone(engine, monkeypatch, tmp_path,
@@ -560,13 +561,19 @@ def test_destructive_refusal_names_both_shapes_of_the_task(
 
     with pytest.raises(SystemExit):
         engine.update_doc("doc1", str(md))
-    reason = json.loads(capsys.readouterr().out)["reason"]
-    assert "rewrites a commented fragment whole" in reason
-    assert "sidecar must stay beside it" in reason
-    assert "those belong to `patch`" in reason
-    assert "not a reason to come back here" in reason
+    blocked = json.loads(capsys.readouterr().out)
+    # Проверяется ВЕСЬ отказ, а не одно поле: приёмка 05.09 разложила его по
+    # полям, и утверждение, уехавшее в соседнее поле, потерянным не считается.
+    # А вот исчезнувшее — считается, и это ровно то, что стоило #24.
+    whole = json.dumps(blocked, ensure_ascii=False)
+    assert "rewrites a commented fragment whole" in whole
+    assert "sidecar must stay beside it" in whole
+    assert "those belong to `patch`" in whole
+    assert "not a reason to come back here" in whole
     # the order the earlier round pinned: ask the person, THEN the flag
-    assert reason.index("ask the person") < reason.index("--acknowledge-loss")
+    consent = blocked["consent"]
+    assert consent.index("ask the person") < consent.index(
+        "--acknowledge-loss")
 
 
 def test_comments_can_tell_whose_thread_it_is(engine, monkeypatch, capsys):

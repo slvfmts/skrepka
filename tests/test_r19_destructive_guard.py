@@ -121,11 +121,19 @@ def test_no_mode_writes_nothing_and_names_both_paths(engine, monkeypatch,
     assert "--create-new" in out["create_new"]
     assert "--replace-existing" in out["replace"]
     # Совет, поставленный живым инцидентом #24: назвать не только цену, но и
-    # путь, на котором треды остаются живы.
-    assert "`patch`" in out["reason"]
-    assert "download" in out["reason"] and "sync" in out["reason"]
-    assert out["reason"].index("ask the person") < out["reason"].index(
+    # путь, на котором треды остаются живы. Оба пути лежат в `probably_neither`
+    # с приёмки 05.09 — раньше всё это было одним абзацем на 210 слов.
+    both = " ".join(out["probably_neither"])
+    assert "`patch`" in both
+    assert "download" in both and "sync" in both
+    assert "rewrites a commented fragment whole" in both
+    assert "those belong to `patch`" in both
+    assert "not a reason to come back here" in both
+    assert "invisible" in out["replace_destroys"]
+    assert out["consent"].index("ask the person") < out["consent"].index(
         "--acknowledge-loss")
+    # Само `reason` теперь короткое — ради этого разложение и делалось.
+    assert len(out["reason"]) < 250
 
 
 def test_both_modes_at_once_is_refused(engine, monkeypatch, tmp_path, capsys):

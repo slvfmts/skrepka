@@ -12575,30 +12575,40 @@ def _check_replace_base(base_path, file_id, doc, doc_tab):
            f"right now — {hint}", reason="concurrent_edit", details=detail)
 
 
-# The guidance an agent must read before it reaches for this command at all.
-# Every clause here was put in by a live incident and none of it may be
-# dropped: #24 measured that naming only the PRICE taught agents that losing
-# the threads was the only way to do the job — it never was. Held in one
-# constant because two refusals now show it (mode not chosen, flags missing),
-# and two copies mean fixing one of them some day.
-_UPDATE_ALTERNATIVES = (
-    "Use `patch` for iterative edits — since 0.10.0 it also rewrites a "
-    "commented fragment whole without losing the thread, unless the doc has "
-    "closed threads. If you hold a freshly written .md instead of a list of "
-    "edits: `download` this doc, move your changes into the downloaded file "
-    "(its sidecar must stay beside it) and `sync` — that path keeps the OPEN "
-    "threads (a closed one may be unhooked, its words archived beside the .md "
-    "first), but it refuses outright when the new text rewrites commented "
-    "paragraphs, and those belong to `patch`. Whatever is left unapplied is a "
-    "list to show the person, not a reason to come back here."
+# Всё, что агент обязан прочесть, прежде чем вообще браться за эту команду.
+# Каждое утверждение здесь поставлено живым случаем, и выбросить нельзя ни
+# одно: #24 замерил, что названная ОДНА ТОЛЬКО ЦЕНА учит агента, будто потеря
+# тредов — единственный способ сделать работу. Способов два, и оба живые.
+#
+# Разложено по полям, а не слито в абзац (приёмка 05.09). Прежняя редакция
+# была одним куском на 210 слов, где пять разных сообщений — что делает
+# команда, что теряется, про `patch`, про `download` + `sync` и как спрашивать
+# согласие — читателю приходилось разбирать самому. Ни одно из них не
+# потерялось при разложении; проверь по тестам, прежде чем править.
+_UPDATE_ALTERNATIVES = [
+    ("`patch` — iterative edits, and the threads stay alive. Since 0.10.0 it "
+     "also rewrites a commented fragment whole without losing the thread, "
+     "unless the doc has closed threads."),
+    ("`download` this doc, move your changes into the downloaded file (its "
+     "sidecar must stay beside it), then `sync` — this is the path for a "
+     "freshly written .md. It keeps the OPEN threads (a closed one may be "
+     "unhooked, its words archived beside the .md first), but it refuses "
+     "outright when the new text rewrites commented paragraphs, and those "
+     "belong to `patch`. Whatever is left unapplied is a list to show the "
+     "person, not a reason to come back here."),
+]
+
+_UPDATE_REPLACE_DESTROYS = (
+    "a full replace via drive.files().update makes ALL comments invisible "
+    "ghosts in the UI and destroys named ranges, and there is no rollback to "
+    "the same link"
 )
 
 _UPDATE_CONSENT_ORDER = (
-    "If a full replace is really wanted: ask the person in plain words about "
-    "THIS document, name what it loses, and wait for an explicit yes before "
-    "rerunning with --acknowledge-loss. A yes given for another document, or "
-    "earlier in this session, does not carry over — ask again for each "
-    "document."
+    "ask the person in plain words about THIS document, name what it loses, "
+    "and wait for an explicit yes before passing --acknowledge-loss. A yes "
+    "given for another document, or earlier in this session, does not carry "
+    "over — ask again for each document."
 )
 
 
@@ -12613,13 +12623,13 @@ def _update_mode_required(meta, comments_count, named_ranges):
     """
     print(json.dumps({
         "error": "update needs an explicit mode",
-        "reason": (
-            "this command either creates a NEW document or destroys the "
-            "existing one together with every comment thread: a full replace "
-            "via drive.files().update makes ALL comments invisible ghosts in "
-            "the UI and destroys named ranges. Which of the two it is, the "
-            "person decides — there is no default here. "
-            + _UPDATE_ALTERNATIVES + " " + _UPDATE_CONSENT_ORDER),
+        "reason": ("this command either creates a NEW document or destroys "
+                   "the existing one together with every comment thread. "
+                   "Which of the two it is, the person decides — there is no "
+                   "default here."),
+        "replace_destroys": _UPDATE_REPLACE_DESTROYS,
+        "probably_neither": _UPDATE_ALTERNATIVES,
+        "consent": _UPDATE_CONSENT_ORDER,
         "document": meta.get("name"),
         "comments": comments_count,
         "named_ranges": sorted(named_ranges),
@@ -12737,7 +12747,10 @@ def update_doc(file_id, file_path, title=None, no_highlights=False,
             f"being replaced is the state you wrote against; "
             f"`--acknowledge-loss` proves the person was asked about THIS "
             f"document. skrepka supplies neither on your behalf. "
-            f"{_UPDATE_ALTERNATIVES} {_UPDATE_CONSENT_ORDER}")
+            f"{_UPDATE_REPLACE_DESTROYS.capitalize()}. "
+            f"You probably want neither flag: "
+            + " ".join(_UPDATE_ALTERNATIVES)
+            + f" {_UPDATE_CONSENT_ORDER}")
 
     base_doc = _check_replace_base(base, file_id, pre_doc,
                                    _collect_tabs(pre_doc)[0][2])
