@@ -3,6 +3,7 @@ must never be written THROUGH a symlink planted at the target or any parent
 component, and must land atomically with 0600. These tests are the security
 core — if one fails, the symlink-overwrite attack is open again."""
 
+import json
 import os
 import stat
 
@@ -171,14 +172,49 @@ def test_refuses_filesystem_root():
 
 # --- engine call sites actually use the hardened path ---
 
-def test_emit_json_refuses_symlinked_output(tmp_path):
+def test_emit_json_refuses_symlinked_output(tmp_path, capsys):
+    """Файл-жертва не переписан — это главное и не менялось.
+
+    Изменился ВИД отказа: с r19/T14 это машинная квитанция, а не трассировка.
+    Половина вызовов `_emit_json` приходит ПОСЛЕ записи в документ, и агент,
+    увидевший трассировку, повторит операцию.
+    """
     import skrepka._engine as engine
     victim = tmp_path / "victim"
     victim.write_text("SECRET")
     (tmp_path / "out.json").symlink_to(victim)
-    with pytest.raises(safeio.SafeIOError):
+    with pytest.raises(SystemExit):
         engine._emit_json({"a": 1}, output=str(tmp_path / "out.json"))
     assert victim.read_text() == "SECRET"
+    out = json.loads(capsys.readouterr().out)
+    assert out["reason"] == "output_path_refused"
+
+
+def test_emit_json_after_a_write_says_the_document_already_changed(tmp_path,
+                                                                   capsys):
+    """Квитанция о состоявшейся записи: сбой файла не должен читаться как
+    «ничего не произошло, повтори»."""
+    import skrepka._engine as engine
+    (tmp_path / "out.json").symlink_to(tmp_path / "victim")
+    with pytest.raises(SystemExit):
+        engine._emit_json({"a": 1}, output=str(tmp_path / "out.json"),
+                          after_write=True)
+    assert "УЖЕ применена" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_symlinked_directory_is_explained_not_dumped(tmp_path):
+    """`/tmp` на macOS — ссылка на `/private/tmp`, и человек видел
+    «'tmp' is not a directory». Объяснение обязано назвать ссылку и годный
+    путь (найдено живым прогоном, T13)."""
+    import skrepka._engine as engine
+    link = tmp_path / "ссылка"
+    real = tmp_path / "настоящий"
+    real.mkdir()
+    link.symlink_to(real)
+    why = engine._output_problem(str(link / "out.json"))
+    assert why and "символическая ссылка" in why
+    assert str(real / "out.json") in why
+    assert engine._output_problem(str(real / "out.json")) is None
 
 
 def test_write_sidecar_refuses_symlink_and_is_atomic(tmp_path):

@@ -567,11 +567,22 @@ def test_output_file_gets_the_full_receipt(engine, monkeypatch, tmp_path,
     assert json.loads(capsys.readouterr().out)["written"] == str(out_path)
 
 
-def test_output_without_dry_run_is_refused(engine, tmp_path, capsys):
-    with pytest.raises(SystemExit):
-        engine.patch_doc("d1", _ops_file(tmp_path, [{"op": "x"}]),
-                         output=str(tmp_path / "r.json"))
-    assert "--dry-run" in capsys.readouterr().out
+def test_output_alone_does_not_turn_a_write_into_a_dry_run(
+        engine, monkeypatch, tmp_path, capsys):
+    """`--output` перестал требовать `--dry-run` (T14), и вот чего это НЕ
+    значит: сам по себе флаг не делает прогон холостым.
+
+    Раньше здесь стоял тест на отказ. Он пережил снятие отказа, потому что
+    проверял подстроку «--dry-run» в выводе, а её печатает и совсем другая
+    ошибка, — то есть доказывал не то, что утверждал.
+    """
+    service = _wire(engine, monkeypatch, _doc())
+    with pytest.raises(AssertionError, match="batchUpdate"):
+        engine.patch_doc("d1", _ops_file(tmp_path, [
+            {"op": "replace_quote", "quote": "Alpha", "with": "Beta"}]),
+            output=str(tmp_path / "r.json"))
+    capsys.readouterr()
+    assert service.writes == 1
 
 
 @pytest.mark.parametrize("name", [

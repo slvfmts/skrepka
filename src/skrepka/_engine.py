@@ -104,6 +104,7 @@ _REASON_CODES = frozenset((
     "unsupported_structure",        # конструкция, которую skrepka не правит
     "schema_invalid",               # операция не того вида: не объект,
                                     # поле не того типа
+    "output_path_refused",          # по пути `--output` писать нельзя
     "concurrent_edit",              # документ изменился под правкой
     "comment_thread_unresolvable",  # тред не адресуется: закрыт, удалён,
                                     # без якоря или его якорь не размещён
@@ -221,10 +222,57 @@ def _require_consent(operation, confirmed, remedy):
             f"person. If you are that person, rerun with --yes. {remedy}")
 
 
-def _emit_json(payload, output=None, summary=None):
+def _first_symlink_component(dirpath):
+    """Первый компонент пути, который на деле символическая ссылка."""
+    walked = os.sep
+    for part in dirpath.split(os.sep):
+        if not part:
+            continue
+        walked = os.path.join(walked, part)
+        if os.path.islink(walked):
+            return walked
+    return None
+
+
+def _output_problem(path):
+    """Почему по этому пути нельзя писать, словами. `None` — можно.
+
+    Проверка отдельная от самой записи, потому что её зовут ДО того, как
+    что-то ушло в Google: узнать про негодный путь после записи в документ
+    значит потерять квитанцию о том, что уже случилось.
+
+    Защита отвергает символическую ссылку в любом компоненте: `--output`
+    называет агент, и подменённая ссылка увела бы файл в чужое место. На
+    macOS под это попадает `/tmp` — он ссылка на `/private/tmp`, — и человек
+    видел трассировку вместо объяснения (найдено живым прогоном, T13).
+    """
+    try:
+        fd = safeio.secure_open_parent(path)
+    except safeio.SafeIOError as exc:
+        parent = os.path.dirname(os.path.abspath(path)) or os.sep
+        link = _first_symlink_component(parent)
+        if link:
+            good = os.path.join(os.path.realpath(parent),
+                                os.path.basename(path))
+            return (f"в пути есть символическая ссылка ({link} → "
+                    f"{os.path.realpath(link)}), а писать по такому пути "
+                    f"skrepka отказывается: подменённая ссылка увела бы файл "
+                    f"в чужое место. Возьмите настоящий путь, например "
+                    f"{good}")
+        return str(exc)
+    os.close(fd)
+    return None
+
+
+def _emit_json(payload, output=None, summary=None, after_write=False):
     """Print payload as JSON, or (with output=PATH) write it to a file and
     print a short receipt instead. Protects agents whose tool output gets
-    truncated from acting on a cut-off list (see agents/CONTRACT.md)."""
+    truncated from acting on a cut-off list (see agents/CONTRACT.md).
+
+    `after_write=True` — квитанция о том, что УЖЕ записано в документ. Тогда
+    сбой записи файла обязан сказать это вслух: агент, увидевший ошибку без
+    такой оговорки, повторит операцию и применит правки дважды.
+    """
     text = json.dumps(payload, ensure_ascii=False, indent=2)
     if not output:
         print(text)
@@ -232,7 +280,22 @@ def _emit_json(payload, output=None, summary=None):
     # hardened write: refuse a symlinked target or any symlinked parent
     # component, atomic replace (safeio, r3 #9) — an --output path the agent
     # was handed must never overwrite an unrelated file through a symlink
-    written_path = safeio.atomic_write(output, text + "\n")
+    try:
+        written_path = safeio.atomic_write(output, text + "\n")
+    except safeio.SafeIOError as exc:
+        # Трассировка здесь стоила бы больше, чем кажется: половина вызовов
+        # приходит ПОСЛЕ записи в документ, и агент, увидевший её, повторит
+        # операцию.
+        #
+        # `_output_problem` объясняет только то, что видно по КАТАЛОГУ. Сам
+        # файл может быть отвергнут позже — например, он симлинк, — и тогда
+        # объяснения нет, а сообщение защиты есть.
+        why = _output_problem(output) or str(exc)
+        tail = ("" if not after_write else
+                " ВНИМАНИЕ: правка в документ УЖЕ применена — не повторяйте "
+                "её, прочитайте документ и разберитесь по нему.")
+        _error(f"не могу записать {output}: {why}.{tail}",
+               reason="output_path_refused")
     receipt = {"written": written_path,
                "bytes": len(text.encode("utf-8")) + 1}
     if summary:
@@ -1741,16 +1804,28 @@ def list_comments(file_id, output=None):
     unspecified = 0
     for c in comments:
         c["resolved"] = bool(c.get("resolved"))
+        # Авторство треда считается ДО нормализации и ТОЙ ЖЕ функцией, какой
+        # шлюз решает на отправке. Иначе чтение и отправка судят разной
+        # логикой: `comments` обещает тред, в котором `reply` потом откажет.
+        # Живой прогон навыка чужим исполнителем (T13) на это и наткнулся —
+        # он спланировал ответы по файлу и узнал правду в конце.
+        c["authorship"] = {"mine": "mine", "foreign": "foreign"}.get(
+            _reply_author_state(c), "unspecified")
+        if c["authorship"] == "unspecified":
+            # Единица счёта — тред, как и у соседнего `mine`: тогда
+            # mine + foreign + unspecified сходится с числом тредов, и по
+            # нулю в `mine` видно, настоящий он или это неизвестность.
+            unspecified += 1
         for entry in [c] + list(c.get("replies") or []):
             author = entry.get("author")
-            if isinstance(author, dict) and "me" not in author:
-                # Absent means «Google did not say», not «somebody else» — and
-                # the whole «отвечай только на мои комментарии» capability
-                # stands on this field. It is normalized so nothing crashes,
-                # and the count is reported so a scoped request can be checked
-                # against a number instead of being silently narrowed to zero.
+            if isinstance(author, dict) and author.get("me") is None:
+                # Absent means «Google did not say», not «somebody else» — и
+                # решение по этому полю больше не принимается: оно осталось
+                # совместимым представлением, а состояние живёт в
+                # `authorship`. Нормализуется, чтобы ничего не падало;
+                # явный `null` сюда тоже попадает, иначе обещание «не
+                # упадёт» держалось бы только для отсутствующего ключа.
                 author["me"] = False
-                unspecified += 1
 
     # a link that opens the document with this thread expanded (#20): naming
     # a thread by id left the person to find it by eye
@@ -1791,8 +1866,11 @@ def list_comments(file_id, output=None):
                # so a scoped request («отработай мои комментарии») can be
                # checked against a number, not against a display name the
                # agent had to guess
+               # Считается тем же полем, что и вердикт по каждому треду:
+               # иначе сводка и записи расходятся, а `author` не-объект
+               # ронял здесь всю выдачу трейсбеком (нашёл тест T14).
                "mine": sum(1 for c in comments
-                           if (c.get("author") or {}).get("me")),
+                           if c["authorship"] == "mine"),
                "tab_exact": attribution_counts["exact"],
                "tab_unknown": attribution_counts["unknown"],
                "document_level": attribution_counts["document"],
@@ -8529,6 +8607,19 @@ def dry_run_patch(file_id, ops_path, tab_id=None, output=None):
     return receipt
 
 
+def _emit_patch_receipt(result, output):
+    """Квитанция записи — одной схемой в stdout и в файл.
+
+    Частичный исход уходит тем же путём, что и полный: агент, не получивший
+    файла на коде возврата 3, пошёл бы разбираться по обрезанному выводу —
+    ровно то, что запрещает `agents/CONTRACT.md` §2.6.
+    """
+    _emit_json(result, output=output, after_write=True,
+               summary={"action": result["action"],
+                        "ops_applied": result.get("ops_applied"),
+                        "doc_id": result.get("doc_id")})
+
+
 def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None):
     """Apply structural patch operations to a Google Doc.
 
@@ -8542,11 +8633,16 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None):
     if dry_run:
         return dry_run_patch(file_id, ops_path, tab_id=tab_id, output=output)
     if output:
-        # `--output` существует ради холостого прогона: его квитанция — это
-        # список вердиктов на весь файл, и она обрезается в выводе агента.
-        # Молча принять флаг у настоящей записи значило бы пообещать файл,
-        # которого не будет.
-        _error("--output работает только вместе с --dry-run")
+        # Путь проверяется ДО первого обращения к Google, и это не
+        # придирчивость: узнать про негодный путь ПОСЛЕ записи в документ
+        # значит потерять квитанцию о том, что уже случилось, — а
+        # `anchor_effects` в ней единственный источник знания о том, что
+        # стало с текстом под каждым задетым комментарием. Переполучить её
+        # нельзя: запись уже произошла.
+        problem = _output_problem(output)
+        if problem:
+            _error(f"не могу записать {output}: {problem}",
+                   reason="output_path_refused")
     file_id = _extract_doc_id(file_id)
 
     if not os.path.exists(ops_path):
@@ -8810,9 +8906,9 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None):
                      "error": skipped[i]},
                     *early_diag.get(i, (None, None)))
                 for i in sorted(skipped)]
-            print(json.dumps(result, ensure_ascii=False, indent=2))
+            _emit_patch_receipt(result, output)
             sys.exit(3)
-        print(json.dumps(result, ensure_ascii=False))
+        _emit_patch_receipt(result, output)
         return
 
     # ---- commented-doc path: per-op pinned batches ----
@@ -9028,9 +9124,9 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None):
     # Неотправленный обязательный ответ — тоже частичный исход: текст в
     # документе есть, а сказать о нём заказчику не вышло.
     if failed_at is not None or refused or result.get("text_applied_reply_pending"):
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        _emit_patch_receipt(result, output)
         sys.exit(3)
-    print(json.dumps(result, ensure_ascii=False))
+    _emit_patch_receipt(result, output)
 
 
 # ---------------------------------------------------------------------------

@@ -505,9 +505,20 @@ def test_list_comments_always_carries_resolved_and_authorship(engine,
     assert out[0]["replies"][0]["author"]["me"] is False
     assert out[1]["author"]["me"] is True
     # «Google did not say» is not «somebody else»: a scoped request has to be
-    # checkable against a number instead of being silently narrowed to zero
-    assert receipt["authorship_unspecified"] == 2
+    # checkable against a number instead of being silently narrowed to zero.
+    # Единица счёта — ТРЕД, как и у соседнего `mine`: у первого треда автор
+    # без `me`, у второго `me: true`, и неизвестный автор ОТВЕТА на счёт не
+    # влияет — отвечают в тред, а не в реплику.
+    assert receipt["authorship_unspecified"] == 1
     assert receipt["mine"] == 1
+    assert receipt["comments"] == 2
+    # Состояние живёт в записи, а не только в сводке: планировать ответы
+    # агент будет по ней.
+    assert out[0]["authorship"] == "unspecified"
+    assert out[1]["authorship"] == "mine"
+    # …и представление совместимости при этом остаётся прежним, поэтому по
+    # `author.me` отличить неизвестность от чужого треда по-прежнему нельзя.
+    assert out[0]["author"]["me"] is False
 
 
 def test_thread_link_needs_both_ids(engine):
