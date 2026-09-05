@@ -125,6 +125,16 @@ def test_the_other_unknowns_are_never_bare(sections):
     assert "НЕ отказ" not in body
 
 
+def test_uncertain_is_not_sold_as_absence_of_refusals(sections):
+    # Найдено живой приёмкой: отказ, стоящий после правки с неизвестным
+    # исходом, понижается до `not_simulated`, и весь файл получает
+    # `uncertain`. Агент, прочитавший это как «отказов нет», применит файл с
+    # опечаткой и узнает о ней от писателя.
+    flat = _flat(sections["3. Примерить"])
+    assert "не значит «отказов нет»" in flat
+    assert "not_simulated" in flat
+
+
 def test_exit_code_is_not_left_to_guessing(sections):
     body = sections["3. Примерить"]
     assert "Код возврата" in body
