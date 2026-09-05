@@ -10,7 +10,7 @@
 
 | Навык | Когда срабатывает |
 |---|---|
-| `skrepka-comments` | «отработай комментарии»: прочитать треды → ответить → поправить текст (`comments` → `reply` → `patch`) |
+| `skrepka-comments` | «отработай комментарии»: прочитать треды → примерить правку → поправить текст → ответить (`comments` → `patch --dry-run` → `patch` → `reply`) |
 | `skrepka-transfer` | «выгрузи в markdown / залей правки обратно» (`download` ↔ `sync`/`update`) |
 | `skrepka-publish` | «опубликуй файл в Drive»: `.md` как гугл-док или любой файл как есть (`upload` / `upload-file`) |
 | `skrepka-suggestions` | «разбери предложенные правки»: суммировать tracked changes и рекомендовать (принять — только руками в UI) |
