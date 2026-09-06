@@ -129,3 +129,48 @@ def test_dry_run_output_still_works(engine, monkeypatch, tmp_path, capsys):
     capsys.readouterr()
     assert service.writes == 0
     assert json.loads(target.read_text())["action"] == "dry-run"
+
+
+# ---------------------------------------------------------------------------
+# Найдено ревью швов (T15)
+# ---------------------------------------------------------------------------
+
+def test_the_leaf_is_checked_too_not_only_its_directory(engine, monkeypatch,
+                                                        tmp_path, capsys):
+    """Каталог годен, а сам файл — симлинк. Проверка, которая смотрит только
+    на каталог, пропускает такой путь: документ меняется, и лишь ПОТОМ
+    выясняется, что квитанцию писать некуда. Именно её и нельзя переполучить.
+    """
+    service = _wire(engine, monkeypatch)
+    victim = tmp_path / "victim"
+    victim.write_text("SECRET")
+    target = tmp_path / "receipt.json"
+    target.symlink_to(victim)
+    with pytest.raises(SystemExit):
+        engine.patch_doc("d1", _ops(tmp_path, [
+            {"op": "replace_quote", "quote": "Alpha", "with": "Gamma"}]),
+            output=str(target))
+    assert json.loads(capsys.readouterr().out)["reason"] == "output_path_refused"
+    assert service.reads == 0 and service.writes == 0
+    assert victim.read_text() == "SECRET"
+
+
+def test_a_directory_under_the_output_name_is_refused(engine, monkeypatch,
+                                                      tmp_path, capsys):
+    service = _wire(engine, monkeypatch)
+    (tmp_path / "receipt.json").mkdir()
+    with pytest.raises(SystemExit):
+        engine.patch_doc("d1", _ops(tmp_path, [
+            {"op": "replace_quote", "quote": "Alpha", "with": "Gamma"}]),
+            output=str(tmp_path / "receipt.json"))
+    assert "каталог" in json.loads(capsys.readouterr().out)["error"]
+    assert service.reads == 0
+
+
+def test_an_ordinary_missing_file_is_still_fine(engine, monkeypatch, tmp_path):
+    """Ограда узкая: обычный несуществующий путь — нормальный случай, и
+    отказывать на нём значило бы отобрать флаг у всех."""
+    assert engine._output_problem(str(tmp_path / "нет-такого.json")) is None
+    # …и перезапись СВОЕГО прежнего файла тоже нормальна
+    (tmp_path / "старый.json").write_text("{}")
+    assert engine._output_problem(str(tmp_path / "старый.json")) is None

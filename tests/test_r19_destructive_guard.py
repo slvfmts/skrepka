@@ -22,10 +22,14 @@ def _resp(payload):
 class FakeDrive:
     """Drive, который считает каждый вызов и умеет ломаться где попросят."""
 
-    def __init__(self, *, export=b"PK-docx", explode_on=(), copy_ok=True):
+    def __init__(self, *, export=b"PK-docx", explode_on=(), copy_ok=True,
+                 http_status_on_update=None):
         self.calls = []
         self._export = export
         self._explode_on = set(explode_on)
+        # Отдельно от `explode_on`: там обрыв связи, а здесь Drive ОТВЕТИЛ, и
+        # весь вопрос в том, что означает его ответ.
+        self._http_status_on_update = http_status_on_update
         self._copy_ok = copy_ok
 
     def files(self):
@@ -53,6 +57,11 @@ class FakeDrive:
         self.calls.append("update")
         if "update" in self._explode_on:
             raise _Boom("transport died mid-upload")
+        if self._http_status_on_update is not None:
+            from googleapiclient.errors import HttpError
+            status = self._http_status_on_update
+            resp = type("R", (), {"status": status, "reason": "boom"})()
+            raise HttpError(resp, b'{"error": {"message": "boom"}}')
         return _resp({})
 
     def create(self, **_):
@@ -505,3 +514,53 @@ def test_the_archive_retakes_itself_when_its_two_reads_disagree(
     _replace(engine, tmp_path, _base(tmp_path, engine), drive)
     assert drive.calls.count("export") == 2
     assert json.loads(capsys.readouterr().out)["action"] == "replaced"
+
+
+# ---------------------------------------------------------------------------
+# Исход записи классифицируется по СТАТУСУ, а не по типу исключения (T15)
+#
+# Найдено ревью швов: `patch` считал 5xx после отправки неизвестностью, а
+# `update` объявлял «не применилось» любую HttpError. Разрушительная команда,
+# сказавшая «документ цел», когда треды уже уничтожены, — худший исход из
+# возможных, и он же самый правдоподобный: 500 от Drive приходит и после того,
+# как замена зафиксирована.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_server_error_after_the_upload_is_an_unknown_outcome(
+        engine, monkeypatch, tmp_path, capsys, status):
+    drive = FakeDrive(http_status_on_update=status)
+    _wire(monkeypatch, engine, drive, comments=[{"id": "c1"}])
+    with pytest.raises(SystemExit) as exc:
+        _replace(engine, tmp_path, _base(tmp_path, engine), drive)
+    assert exc.value.code == 3
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "outcome-unknown", status
+    assert out["archive"]["manifest"]
+
+
+@pytest.mark.parametrize("status", [400, 403, 404, 412])
+def test_a_rejected_request_is_honestly_not_applied(engine, monkeypatch,
+                                                    tmp_path, capsys, status):
+    """4xx — запрос отвергнут ДО фиксации, документ цел. Сказать здесь
+    «неизвестно» значило бы гонять человека разбирать целый документ."""
+    drive = FakeDrive(http_status_on_update=status)
+    _wire(monkeypatch, engine, drive, comments=[{"id": "c1"}])
+    with pytest.raises(SystemExit) as exc:
+        _replace(engine, tmp_path, _base(tmp_path, engine), drive)
+    assert exc.value.code == 3
+    assert json.loads(capsys.readouterr().out)["action"] == "not-applied", status
+
+
+def test_an_unreadable_status_falls_to_unknown(engine, monkeypatch, tmp_path,
+                                               capsys):
+    """Статуса нет или он не число — считаем исход неизвестным.
+
+    Fail-closed здесь означает «не молчать»: назвать документ целым, не зная
+    этого, дороже лишней проверки глазами.
+    """
+    drive = FakeDrive(http_status_on_update="не-число")
+    _wire(monkeypatch, engine, drive, comments=[{"id": "c1"}])
+    with pytest.raises(SystemExit):
+        _replace(engine, tmp_path, _base(tmp_path, engine), drive)
+    assert json.loads(capsys.readouterr().out)["action"] == "outcome-unknown"

@@ -582,3 +582,28 @@ def test_a_selection_that_grabbed_a_space_is_quoted_without_it(engine):
 def test_a_selection_of_only_spaces_earns_no_reply(engine):
     """«Убрал «»» выглядит поломкой, а не ответом."""
     assert engine._intent_text("   ", "слово") is None
+
+
+def test_no_resume_command_when_the_outbox_was_never_written(
+        engine, monkeypatch, tmp_path, capsys, store):
+    """Найдено ревью швов (T15): квитанция звала возобновить по файлу,
+    которого нет.
+
+    Файл ответов не записался — значит возобновлять нечем. Прежняя квитанция
+    всё равно выдавала `resume` с путём к нему: агент получал «файл не
+    найден» и уже не знал, где взять обязательные ответы, — а они здесь же,
+    в `replies` этой самой квитанции.
+    """
+    monkeypatch.setattr(engine, "_write_pending_outbox",
+                        lambda p, i: (None, "каталог только для чтения"))
+    _stand(engine, monkeypatch)
+    _code, receipt, _path = _run(engine, tmp_path, capsys, [_around()])
+    auto = receipt["auto_replies"]
+
+    assert auto["stopped_because"] == "reply_outbox_not_written"
+    assert "resume" not in auto, auto.get("resume")
+    # Вместо команды — что делать, и сами тексты на месте.
+    assert "возобновлять нечем" in auto["recovery"]
+    assert auto["replies"] and all(r["state"] == "not_attempted"
+                                   for r in auto["replies"])
+    assert any(r.get("text") for r in auto["replies"])

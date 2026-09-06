@@ -261,6 +261,17 @@ def _output_problem(path):
                     f"{good}")
         return str(exc)
     os.close(fd)
+    # Каталог годен — остаётся сам файл. Без этой проверки `--output` у
+    # ЗАПИСИ обещал больше, чем делал: путь принимался, документ менялся, а
+    # квитанция терялась на симлинке или каталоге под тем же именем. Ровно тот
+    # случай, ради которого проверка и стоит до обращения к Google.
+    if os.path.lexists(path) and not (os.path.isfile(path)
+                                      and not os.path.islink(path)):
+        what = ("символическая ссылка" if os.path.islink(path)
+                else "каталог" if os.path.isdir(path) else "не обычный файл")
+        return (f"по этому пути уже лежит {what}, а перезаписывать такое "
+                f"skrepka отказывается — так подменённое имя увело бы запись "
+                f"в чужой файл. Возьмите другое имя")
     return None
 
 
@@ -7730,7 +7741,12 @@ def _send_reply_intents(drive_service, file_id, ops_path, intents):
         out["complete"] = clean
         resumable = [r for r in records.values()
                      if r.get("state") in ("pending", "not_attempted")]
-        if resumable and not clean:
+        # Команда возобновления предлагается, только если файл ответов
+        # действительно лежит. Иначе квитанция звала запустить `reply --file`
+        # по несуществующему пути: агент получал «файл не найден» вместо
+        # обязательных ответов и уже не знал, где их взять — а они здесь же,
+        # в `replies` этой самой квитанции (найдено ревью швов, T15).
+        if resumable and not clean and os.path.exists(outbox):
             # Пропущенные терминально — закрытый тред, удалённый — сюда НЕ
             # попадают: повторять их нельзя, и звать к этому командой значит
             # звать сделать вред.
@@ -7744,7 +7760,14 @@ def _send_reply_intents(drive_service, file_id, ops_path, intents):
         # они обязаны остаться в основной квитанции.
         for rec in records.values():
             rec["state"] = "not_attempted"
-        return result("reply_outbox_not_written", {"outbox_error": err})
+        return result("reply_outbox_not_written", {
+            "outbox_error": err,
+            # Возобновлять нечем, и это сказано вместо команды, которая не
+            # сработает: сами намерения целы и лежат в `replies`.
+            "recovery": ("файл ответов не записан, возобновлять нечем. Тексты "
+                         "ответов целы в `replies` этой квитанции — соберите "
+                         "их в файл сами и отправьте `reply --file`."),
+        })
 
     journal_path = _reply_journal_path(outbox)
     _REPLY_JOURNAL_FATAL = False
@@ -12982,7 +13005,17 @@ def update_doc(file_id, file_path, title=None, no_highlights=False,
             fileId=file_id, body=update_meta, media_body=media,
             supportsAllDrives=True).execute()
     except HttpError as e:
-        outcome = "not-applied"
+        # Классифицируется по СТАТУСУ, а не по типу исключения. 5xx приходит и
+        # после того, как Drive принял замену: ошибка на стороне сервера не
+        # означает, что запись не легла. Объявить такой исход «не применилось»
+        # значит сказать человеку, что документ цел, когда все треды уже
+        # уничтожены, — а это ровно то, ради чего T12 и заводила третий исход.
+        # «Не применилось» остаётся только за отказом самого запроса: 4xx,
+        # где Drive отверг его до фиксации. Незнакомый статус идёт к
+        # неизвестности, потому что fail-closed здесь — не молчать.
+        status = getattr(getattr(e, "resp", None), "status", None)
+        outcome = ("not-applied" if isinstance(status, int)
+                   and 400 <= status < 500 else "outcome-unknown")
         write_error = e.reason if hasattr(e, "reason") else str(e)
     except Exception as e:                                      # noqa: BLE001
         # Обрыв связи после того, как байты уже легли, выглядит отсюда так же,

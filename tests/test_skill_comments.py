@@ -263,3 +263,29 @@ def test_choosing_the_addressing_is_stated_before_the_edit_is_built(sections):
     assert "адресуй её тредом" in flat
     assert "совпадает с ним ровно" in flat
 
+
+# ---------------------------------------------------------------------------
+# Найдено ревью швов (r19/T15)
+# ---------------------------------------------------------------------------
+
+def test_the_writing_route_takes_output(fences):
+    """Контракт запрещает действовать по обрезанному выводу и велит брать
+    `--output`. Пока у записи флага не было, маршрут ему противоречил; теперь
+    флаг есть, и маршрут обязан его показывать."""
+    write = [b for b in fences
+             if re.search(r"skrepka patch\b", b) and "--dry-run" not in b]
+    assert write and all("--output" in b for b in write), write
+
+
+def test_exit_three_is_not_sold_as_partial_success(sections):
+    flat = _flat(sections["6. Когда пошло не так"])
+    assert "прошло не всё" in flat
+    assert "применённых может быть и ноль" in flat
+    assert "ops_applied" in flat
+
+
+def test_the_promise_is_bound_to_the_revision(sections):
+    flat = _flat(sections["3. Примерить"])
+    assert "revision_id_before" in flat
+    assert "не сверяет" in flat
+
