@@ -9,6 +9,7 @@
 в документе нет. Разбор уходил в их поиск (пост-мортем 20 августа).
 """
 import json
+import pathlib
 
 import pytest
 
@@ -86,9 +87,12 @@ def test_the_code_contract_survives_optimised_python(tmp_path):
         "except SystemExit:\n"
         "    print('LEAKED')\n",
         encoding="utf-8")
+    # Корень репозитория — от этого файла, а не зашитым путём. С зашитым
+    # `/Users/slava/dev/skrepka` тест проходил только на одной машине и три
+    # недели держал CI красным на каждом пуше, пока его не остановил выпуск.
+    root = pathlib.Path(__file__).resolve().parent.parent
     out = subprocess.run([_sys.executable, "-O", str(script)],
-                         capture_output=True, text=True,
-                         cwd="/Users/slava/dev/skrepka")
+                         capture_output=True, text=True, cwd=root)
     assert "RAISED" in out.stdout, out.stdout + out.stderr
 
 
