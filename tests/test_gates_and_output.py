@@ -305,6 +305,57 @@ def _stub_update_preflight(monkeypatch, engine, comments, named_ranges=()):
                                                       in named_ranges}})
 
 
+def test_update_does_not_count_ghosts_as_comments_to_lose(
+        engine, monkeypatch, tmp_path, capsys):
+    """08.09: the refusal counted twelve threads nobody could see, the agent
+    asked about losing them, and the pressure ended in deleting them. A ghost
+    is not on the document for the person, so it is not in the count."""
+    import io
+    import zipfile
+
+    def thread(cid, author, created):
+        return {"id": cid, "author": {"displayName": author},
+                "createdTime": created, "replies": [],
+                "quotedFileContent": {"value": "текст"}}
+
+    live = thread("live", "A", "2026-01-01T00:00:01Z")
+    ghost = thread("ghost", "B", "2026-01-01T00:00:02Z")
+    w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("word/document.xml",
+                   f'<w:document xmlns:w="{w}"><w:body><w:p>'
+                   f'<w:commentRangeStart w:id="0"/><w:r><w:t>текст</w:t>'
+                   f'</w:r><w:commentRangeEnd w:id="0"/></w:p></w:body>'
+                   f'</w:document>')
+        z.writestr("word/comments.xml",
+                   f'<w:comments xmlns:w="{w}"><w:comment w:id="0" '
+                   f'w:author="A" w:date="2026-01-01T00:00:01Z"/>'
+                   f'</w:comments>')
+    calls = []
+    drive = _fake_update_drive(calls)
+    files_cls = type(drive.files())
+
+    class _Export:
+        def execute(self):
+            return buf.getvalue()
+
+    files_cls.export = lambda self, **kw: _Export()
+    _stub_update_preflight(monkeypatch, engine, [live, ghost])
+    monkeypatch.setattr(engine, "_census_comments", lambda d, f: (
+        [live, ghost], [live, ghost], "fp",
+        engine._key_owners_universe([live, ghost])))
+    monkeypatch.setattr(engine, "get_drive_service", lambda c: drive)
+    md = tmp_path / "doc.md"
+    md.write_text("# hi\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc:
+        engine.update_doc("doc1", str(md))
+    assert exc.value.code == 2
+    assert calls == []
+    assert json.loads(capsys.readouterr().out)["comments"] == 1
+
+
 def test_update_without_acknowledge_loss_blocks_before_any_write(
         engine, monkeypatch, tmp_path, capsys):
     calls = []

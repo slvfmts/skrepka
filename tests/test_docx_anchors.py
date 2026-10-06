@@ -1228,16 +1228,18 @@ def test_a_soft_break_does_not_hide_an_opaque_paragraph(engine, make_docx):
     assert not any("matched 0 times" in p for p in mproblems)
 
 
-def test_the_remedy_for_a_thread_missing_from_the_export_is_doable(engine):
-    """«Переоткрыть» is nonsense for a thread that was never closed, and
-    telling the person to delete somebody's comment is not ours to say. What
-    actually unblocks it: the thread is the newest thing in the document, so
-    one reply anywhere gives the next run its bearings (#34, #46)."""
-    missing = engine._anchor_map_remedy(
-        "comment AAAB «x» https://... is missing from the export "
-        "(ghost thread or stale export — indistinguishable)")
-    assert "Ответьте в любой другой тред" in missing
-    assert "переоткр" not in missing.lower()
+def test_no_remedy_ever_talks_about_ghosts(engine):
+    """A ghost never reaches a refusal any more, so no remedy may send anyone
+    after one: not «wait a minute», not «reply in another thread», not
+    «delete the comment» (06.10: all three were impossible at once)."""
+    for shown in ("comments.xml entry 3 has 0 anchor spans in document.xml",
+                  "export contains comment entries unknown to the API",
+                  "comment c1 «x» shares every (author, second) key",
+                  "something else entirely"):
+        remedy = engine._anchor_map_remedy(shown).lower()
+        assert "призрак" not in remedy
+        assert "не доехал до выгрузки" not in remedy
+        assert "удалить" not in remedy
 
 
 # ---------------------------------------------------------------------------

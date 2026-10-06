@@ -364,15 +364,16 @@ def test_accounting_happy_with_reply(engine):
     assert metrics["anchor_spans"] == 2
 
 
-def test_accounting_missing_entry_blocks(engine):
+def test_accounting_missing_entry_is_a_ghost(engine):
     anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z"),
                 api_comment("c2", "A", "2026-01-01T00:00:02Z")]
     records = [{"docx_id": "0", "author": "A",
                 "date_sec": "2026-01-01T00:00:01Z"}]
-    problems, _ = engine._account_anchored_comments(
+    problems, metrics = engine._account_anchored_comments(
         anchored, records, _spans("0"),
         universe=engine._key_owners_universe(anchored))
-    assert any("missing from the export" in p for p in problems)
+    assert problems == []
+    assert metrics["ghost_threads_ignored"] == 1
 
 
 def test_accounting_extra_docx_entry_blocks(engine):
@@ -419,8 +420,15 @@ def test_accounting_deleted_reply_not_expected(engine):
 
 
 # ---------------------------------------------------------------------------
-# r10 (#34): a thread that vanished stops holding the document hostage
+# 2026-10-06: a ghost has no say in the work at all
 # ---------------------------------------------------------------------------
+#
+# Four live documents were frozen by threads nobody could see: 09.08 (Avito,
+# five edits), 01.09 (Severstal), 08.09 (Avito — it ended with a person's
+# comments deleted to unblock the tool), 06.10 (Tochka, 13 of 13 edits
+# refused, the edit went out through the raw API with no protection at all).
+# Each time skrepka demanded proof that the thread was a ghost. It no longer
+# does: an open thread with no record in the export is a ghost, full stop.
 
 def _vanished_case(engine, quote):
     """One thread missing from the export, one live thread newer than it."""
@@ -433,145 +441,36 @@ def _vanished_case(engine, quote):
     return anchored, records, engine._key_owners_universe(anchored)
 
 
-def test_a_vanished_thread_whose_text_is_gone_stops_blocking(engine):
-    """Living case 2026-08-09: five edits refused as one because a thread had
-    lost its anchor when the customer moved a block. Losing a comment without
-    closing it is normal practice, and a ghost has no anchor left to protect."""
+def _assert_ignored(problems, metrics, n=1):
+    assert problems == []
+    assert metrics["ghost_threads_ignored"] == n
+    # no list of ghosts to name, link or fence anywhere downstream
+    assert "ghosts" not in metrics
+
+
+def test_a_vanished_thread_whose_text_is_gone_is_ignored(engine):
     anchored, records, universe = _vanished_case(engine, "Вариант 1")
     problems, metrics = engine._account_anchored_comments(
         anchored, records, _spans("0"), universe=universe, file_id="DOC",
         doc_tab=make_doc(["Совсем другой текст"]))
-    assert problems == []
-    assert [g["id"] for g in metrics["ghosts"]] == ["c1"]
-    assert metrics["ghosts"][0]["link"].endswith("disco=c1")
-    assert engine._fence_off_ghosts(metrics["ghosts"]) == []
+    _assert_ignored(problems, metrics)
 
 
-def test_a_vanished_thread_whose_text_is_still_here_is_fenced(engine):
-    """The two signs disagree: the export lost it, the document still holds
-    the text it was attached to. Being wrong here must cost a local refusal,
-    not a thread — so the place is fenced and the rest stays editable."""
+def test_a_vanished_thread_whose_text_is_still_here_is_ignored_too(engine):
+    """Its old words standing in the document do not bring it back: the
+    export is fresh, and a thread with an anchor would be in it. Before, this
+    place was fenced and the person was told to go and look at the thread."""
     anchored, records, universe = _vanished_case(engine, "Вариант 1")
-    _p, metrics = engine._account_anchored_comments(
+    problems, metrics = engine._account_anchored_comments(
         anchored, records, _spans("0"), universe=universe, file_id="DOC",
         doc_tab=make_doc(["до", "Вариант 1", "после"]))
-    blocked = engine._fence_off_ghosts(metrics["ghosts"])
-    assert [(s, e) for s, e, _l in blocked] == [(4, 13)]
-    assert "пропал из выгрузки" in blocked[0][2]
-    assert "disco=c1" in blocked[0][2]
+    _assert_ignored(problems, metrics)
 
 
-def test_dates_are_compared_as_moments_not_as_strings(engine):
-    """Found in review: '2026-01-01T01:00:00+05:00' is EARLIER than
-    '2026-01-01T00:00:00-05:00' and lexicographically later. Whether a thread
-    counts as a ghost must not depend on how Google spelled the offset."""
-    assert engine._rfc3339_epoch("2026-01-01T01:00:00+05:00") < \
-        engine._rfc3339_epoch("2026-01-01T00:00:00-05:00")
-    # unreadable rather than assumed-UTC: guessing decides a ghost verdict
-    assert engine._rfc3339_epoch("2026-01-01T00:00:00") is None
-    assert engine._rfc3339_epoch("") is None
-
-    gone = api_comment("c1", "A", "2026-01-01T01:00:00+05:00")
-    gone["quotedFileContent"] = {"value": "Вариант 1"}
-    live = api_comment("c2", "B", "2026-01-01T00:00:00-05:00")
-    anchored = [gone, live]
-    _p, metrics = engine._account_anchored_comments(
-        anchored, [{"docx_id": "0", "author": "B",
-                    "date_sec": "2026-01-01T00:00:00-05:00"}],
-        _spans("0"), universe=engine._key_owners_universe(anchored),
-        doc_tab=make_doc(["ничего похожего"]))
-    assert [g["id"] for g in metrics["ghosts"]] == ["c1"]
-
-
-def test_a_vanished_thread_whose_text_hid_in_a_footnote_still_blocks(engine):
-    """The fence walks the body; `replaceAllText` reaches headers, footers and
-    footnotes too. Old text surviving out there is a place we cannot fence,
-    so the verdict is withheld (found in review)."""
-    anchored, records, universe = _vanished_case(engine, "Вариант 1")
-    tab = make_doc(["ничего похожего"])
-    tab["footnotes"] = {"f1": {"content": [
-        {"paragraph": {"elements": [
-            {"textRun": {"content": "Вариант 1\n"}}]}}]}}
-    problems, metrics = engine._account_anchored_comments(
-        anchored, records, _spans("0"), universe=universe, doc_tab=tab)
-    assert any("missing from the export" in p for p in problems)
-    assert "ghosts" not in metrics
-
-
-def test_the_newest_thread_missing_from_the_export_still_blocks(engine):
-    """Nothing in the export was created after it, so the snapshot may simply
-    have been cut off before it existed — there lag really is
-    indistinguishable from a ghost, and the refusal stands."""
-    gone = api_comment("c1", "A", "2026-01-01T00:00:09Z")
-    live = api_comment("c2", "B", "2026-01-01T00:00:01Z")
-    anchored = [gone, live]
-    problems, metrics = engine._account_anchored_comments(
-        anchored, [{"docx_id": "0", "author": "B",
-                    "date_sec": "2026-01-01T00:00:01Z"}],
-        _spans("0"), universe=engine._key_owners_universe(anchored),
-        doc_tab=make_doc(["ничего похожего"]))
-    assert any("missing from the export" in p for p in problems)
-    assert "ghosts" not in metrics
-
-
-def test_a_thread_that_never_held_text_does_not_block(engine):
-    """Measured 2026-08-16: a comment created through the API never attaches
-    to document text, yet Drive stores the `anchor` it was handed verbatim and
-    skrepka counts anything with `anchor` as anchored. Such a thread has no
-    text anchor to lose — and it used to freeze every replace in the document,
-    which is what any other tool leaving comments through the API does to a
-    document."""
-    anchored, records, universe = _vanished_case(engine, None)
-    problems, metrics = engine._account_anchored_comments(
-        anchored, records, _spans("0"), universe=universe,
-        doc_tab=make_doc(["что угодно"]))
-    assert problems == []
-    assert [g["id"] for g in metrics["ghosts"]] == ["c1"]
-    # nothing to fence with, and nothing that needs fencing
-    assert engine._fence_off_ghosts(metrics["ghosts"]) == []
-
-
-def test_a_quoteless_thread_keeps_the_sign_while_the_export_has_records(
-        engine):
-    """The #46 waiver is narrow on purpose: it applies only to an export with
-    NO records at all, the one shape where sign 1 can never speak. Here the
-    export does carry a record, just not a newer one — so the cheap second
-    opinion is still available and is still required."""
-    gone = api_comment("c1", "A", "2026-01-01T00:00:09Z")
-    gone["quotedFileContent"] = {}
-    live = api_comment("c2", "B", "2026-01-01T00:00:01Z")
-    anchored = [gone, live]
-    problems, metrics = engine._account_anchored_comments(
-        anchored, [{"docx_id": "0", "author": "B",
-                    "date_sec": "2026-01-01T00:00:01Z"}],
-        _spans("0"), universe=engine._key_owners_universe(anchored),
-        doc_tab=make_doc(["что угодно"]))
-    assert any("missing from the export" in p for p in problems)
-    assert "ghosts" not in metrics
-
-
-def test_a_document_whose_comments_are_all_api_made_is_not_frozen(engine):
-    """The shape #46 is actually about: another tool left every comment
-    through the Drive API, so `word/comments.xml` is absent entirely. Before,
-    the freshness sign had nothing to speak with and every replace was
-    refused."""
-    made_by_api = [api_comment("c1", "A", "2026-01-01T00:00:01Z"),
-                   api_comment("c2", "A", "2026-01-01T00:00:02Z")]
-    for c in made_by_api:
-        c["quotedFileContent"] = {}
-    problems, metrics = engine._account_anchored_comments(
-        made_by_api, [], [],
-        universe=engine._key_owners_universe(made_by_api),
-        doc_tab=make_doc(["обычный абзац"]))
-    assert problems == []
-    assert sorted(g["id"] for g in metrics["ghosts"]) == ["c1", "c2"]
-    assert engine._fence_off_ghosts(metrics["ghosts"]) == []
-
-
-def test_a_thread_with_a_quote_still_waits_for_the_freshness_sign(engine):
-    """The waiver is for quote-less threads only. A thread that HAS a quote is
-    a real text anchor that vanished, and there sign 1 is the only thing
-    telling a ghost from an export older than the thread."""
+def test_the_newest_thread_missing_from_the_export_is_ignored(engine):
+    """The case of 06.10: nothing in the export is newer than the ghost, so
+    the old «freshness witness» never spoke and the document stayed frozen
+    for good. The canary already proves the export is fresh."""
     gone = api_comment("c1", "A", "2026-01-01T00:00:09Z")
     gone["quotedFileContent"] = {"value": "пропавший фрагмент"}
     live = api_comment("c2", "B", "2026-01-01T00:00:01Z")
@@ -580,9 +479,86 @@ def test_a_thread_with_a_quote_still_waits_for_the_freshness_sign(engine):
         anchored, [{"docx_id": "0", "author": "B",
                     "date_sec": "2026-01-01T00:00:01Z"}],
         _spans("0"), universe=engine._key_owners_universe(anchored),
+        doc_tab=make_doc(["пропавший фрагмент"]))
+    _assert_ignored(problems, metrics)
+
+
+def test_a_document_whose_only_open_threads_are_ghosts_is_not_frozen(
+        engine):
+    """06.10 exactly: the person closed every thread they had read, two were
+    left open with their text rewritten. The export carries no comments at
+    all, and nothing in it can ever be «later»."""
+    ghosts = [api_comment("yt0", "A", "2026-10-05T08:16:00Z"),
+              api_comment("yt4", "A", "2026-10-05T08:16:01Z")]
+    ghosts[0]["quotedFileContent"] = {"value": "к обещанным срокам"}
+    ghosts[1]["quotedFileContent"] = {"value": "Вы "}
+    closed = api_comment("old", "A", "2026-10-05T08:00:00Z", resolved=True)
+    anchored = ghosts + [closed]
+    problems, metrics = engine._account_anchored_comments(
+        anchored, [], [], universe=engine._key_owners_universe(anchored),
+        doc_tab=make_doc(["Вы узнаете", "до которых не доходили руки"]))
+    _assert_ignored(problems, metrics, n=2)
+
+
+def test_a_vanished_thread_whose_text_hid_in_a_footnote_is_ignored(engine):
+    """A live anchor in a footnote leaves its record in the export (the
+    outside-body branch), so a thread without a record is not one of them."""
+    anchored, records, universe = _vanished_case(engine, "Вариант 1")
+    tab = make_doc(["ничего похожего"])
+    tab["footnotes"] = {"f1": {"content": [
+        {"paragraph": {"elements": [
+            {"textRun": {"content": "Вариант 1\n"}}]}}]}}
+    problems, metrics = engine._account_anchored_comments(
+        anchored, records, _spans("0"), universe=universe, doc_tab=tab)
+    _assert_ignored(problems, metrics)
+
+
+def test_a_thread_that_never_held_text_is_ignored(engine):
+    anchored, records, universe = _vanished_case(engine, None)
+    problems, metrics = engine._account_anchored_comments(
+        anchored, records, _spans("0"), universe=universe,
         doc_tab=make_doc(["что угодно"]))
-    assert any("missing from the export" in p for p in problems)
-    assert "ghosts" not in metrics
+    _assert_ignored(problems, metrics)
+
+
+def test_a_document_whose_comments_are_all_api_made_is_not_frozen(engine):
+    made_by_api = [api_comment("c1", "A", "2026-01-01T00:00:01Z"),
+                   api_comment("c2", "A", "2026-01-01T00:00:02Z")]
+    for c in made_by_api:
+        c["quotedFileContent"] = {}
+    problems, metrics = engine._account_anchored_comments(
+        made_by_api, [], [],
+        universe=engine._key_owners_universe(made_by_api),
+        doc_tab=make_doc(["обычный абзац"]))
+    _assert_ignored(problems, metrics, n=2)
+
+
+def test_a_ghost_does_not_take_a_live_thread_down_with_it(engine):
+    """The live thread is still accounted for and mapped; only the ghost is
+    skipped."""
+    anchored, records, universe = _vanished_case(engine, "Вариант 1")
+    problems, metrics = engine._account_anchored_comments(
+        anchored, records, _spans("0"), universe=universe,
+        doc_tab=make_doc(["что угодно"]))
+    assert problems == []
+    assert metrics["api_threads_accounted"] == 2
+    assert metrics["anchor_spans"] == 1
+    assert metrics["ghost_threads_ignored"] == 1
+
+
+def test_a_ghost_sharing_a_key_with_a_live_thread_is_still_a_ghost(engine):
+    """Its own key is absent; the present record under the shared key is the
+    live thread's — a thread leaves the export whole (C11a)."""
+    gone = api_comment("c1", "A", "2026-01-01T00:00:01Z",
+                       replies=[{"createdTime": "2026-01-01T00:00:05Z",
+                                 "author": {"displayName": "B"}}])
+    live = api_comment("c2", "B", "2026-01-01T00:00:05Z")
+    anchored = [gone, live]
+    problems, metrics = engine._account_anchored_comments(
+        anchored, [{"docx_id": "0", "author": "B",
+                    "date_sec": "2026-01-01T00:00:05Z"}],
+        _spans("0"), universe=engine._key_owners_universe(anchored))
+    _assert_ignored(problems, metrics)
 
 
 def test_accounting_resolved_absent_from_export_is_clean(engine):
@@ -625,12 +601,17 @@ def test_accounting_excludes_resolved_on_every_path(engine):
     assert metrics["api_anchored_resolved"] == 1
 
 
-def test_accounting_live_thread_still_blocks_when_missing(engine):
-    """Regression guard: excluding resolved must not weaken ghost detection."""
-    anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z")]
-    problems, _ = engine._account_anchored_comments(
+def test_accounting_open_thread_missing_is_counted_as_a_ghost(engine):
+    """Excluding resolved threads and ignoring ghosts are separate counts: a
+    closed thread is not a ghost and an open one without a record is."""
+    anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z"),
+                api_comment("c2", "A", "2026-01-01T00:00:02Z",
+                            resolved=True)]
+    problems, metrics = engine._account_anchored_comments(
         anchored, [], [], universe=engine._key_owners_universe(anchored))
-    assert any("missing from the export" in p for p in problems)
+    assert problems == []
+    assert metrics["ghost_threads_ignored"] == 1
+    assert metrics["api_anchored_resolved"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1021,8 +1002,13 @@ def test_witness_pairwise_disjoint_but_no_unique_key_refused(engine):
     anchored = [api_comment("t1", "A", a, replies=[rep(b)]),
                 api_comment("t2", "A", a, replies=[rep(c)]),
                 api_comment("t3", "A", b, replies=[rep(d)])]
+    # t2 and t3 are in the export, and their records carry both of t1's
+    # keys. Were nothing of t1's in the export, it would simply be a ghost.
+    records = [{"docx_id": str(i), "author": "A", "date_sec": t}
+               for i, t in enumerate((a, c, b, d))]
     problems, _ = engine._account_anchored_comments(
-        anchored, [], [], universe=engine._key_owners_universe(anchored))
+        anchored, records, _spans("0", "1", "2", "3"),
+        universe=engine._key_owners_universe(anchored))
     assert any("t1" in p and "shares every" in p for p in problems)
 
 
@@ -1093,18 +1079,6 @@ def test_comment_label_truncates_and_survives_a_missing_quote(engine):
     long = {"id": "c1", "quotedFileContent": {"value": "я" * 80}}
     assert engine._comment_label(long) == "c1 «" + "я" * 40 + "…»"
     assert engine._comment_label({"id": "c2"}) == "c2 (без цитаты)"
-
-
-def test_missing_thread_refusal_names_the_thread(engine):
-    """The old message was «'slv fmts' @ 2026-07-30T12:46:33Z» — useless on a
-    doc where one person wrote everything inside one minute (#10)."""
-    anchored = [api_comment("c1", "A", "2026-01-01T00:00:01Z")]
-    anchored[0]["quotedFileContent"] = {"value": "хранит своё"}
-    problems, _ = engine._account_anchored_comments(
-        anchored, [], [], universe=engine._key_owners_universe(anchored))
-    msg = next(p for p in problems if "missing from the export" in p)
-    assert "c1 «хранит своё»" in msg
-    assert "'A' @" not in msg
 
 
 def test_scope_leaves_a_coordinateless_problem_global(engine):
@@ -1528,24 +1502,32 @@ def _no_content_mutation(docs):
     return True
 
 
-def test_e2e_unmatched_comment_blocks_before_batch(engine, monkeypatch,
-                                                   tmp_path, capsys):
-    """(1) API has an anchored comment the export does not contain
-    (ghost or stale export) → no main batch, canary cleaned up."""
+def test_e2e_a_ghost_does_not_stop_sync(engine, monkeypatch, tmp_path,
+                                        capsys):
+    """(1) API has an open anchored comment the export does not contain —
+    a ghost. Its old quote is even the very text being edited. The sync goes
+    on as if it were not there (owner, 2026-10-06)."""
     doc = make_doc(BASE_TEXTS)
-    docs = DocsStub(doc)
+    merged = make_doc(["Alpha", "Bravo edited", "Charlie"], rev="R2")
+    docs = DocsStub(doc, merged_doc=merged)
+    ghost = api_comment("c1", "A", CREATED)
+    ghost["quotedFileContent"] = {"value": "Bravo"}
     drive = DriveStub(
-        [api_comment("c1", "A", CREATED)],
-        _docx_builder(docs, [(t, []) for t in BASE_TEXTS], []))
+        [ghost],
+        _docx_builder(docs, [(t, []) for t in BASE_TEXTS], []),
+        html=b"<p>Alpha</p><p>Bravo edited</p><p>Charlie</p>")
     wire(engine, monkeypatch, docs, drive)
     md = make_workdir(engine, tmp_path, doc, BASE_MD,
                       "Alpha\n\nBravo edited\n\nCharlie")
-    with pytest.raises(SystemExit):
-        engine.sync_doc("doc1", md)
-    err = json.loads(capsys.readouterr().out)["error"]
-    assert "missing from the export" in err
-    assert _no_content_mutation(docs)
-    assert docs.canary_text is None  # cleaned up
+    engine.sync_doc("doc1", md)
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "synced"
+    assert out["replaced"] == 1
+    assert out["anchor_accounting"]["ghost_threads_ignored"] == 1
+    assert out["comments_on_doc"] == 0  # the person sees none
+    assert docs.main_applied
+    assert "ghost" not in json.dumps(
+        {k: v for k, v in out.items() if k != "anchor_accounting"})
 
 
 def test_e2e_matched_no_overlap_applies(engine, monkeypatch, tmp_path,
@@ -1663,22 +1645,22 @@ def test_e2e_named_range_at_doc_end_blocks_canary_insert(engine, monkeypatch,
 # patch integration (same helper)
 # ---------------------------------------------------------------------------
 
-def test_patch_mixed_live_and_missing_refused(engine, monkeypatch, capsys):
+def test_patch_mixed_live_and_ghost_applies(engine, monkeypatch, capsys):
+    """A live thread on Charlie, a ghost whose old quote is the very text
+    being replaced. The edit goes through; the live anchor is still mapped."""
     doc = make_doc(BASE_TEXTS)
     docs = DocsStub(doc)
+    ghost = api_comment("c2", "B", "2026-07-13T17:59:59.100Z")
+    ghost["quotedFileContent"] = {"value": "Bravo"}
     drive = DriveStub(
-        [api_comment("c1", "A", CREATED),
-         api_comment("c2", "B", "2026-07-13T17:59:59.100Z")],
+        [api_comment("c1", "A", CREATED), ghost],
         _docx_builder(docs, [("Charlie", [("0", 0, 7)])],
                       [("0", "A", CREATED_SEC)]))
     monkeypatch.setattr(engine.time, "sleep", lambda s: None)
     op = {"op": "replace_quote", "quote": "Bravo", "with": "Zulu"}
-    with pytest.raises(SystemExit):
-        engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
-    err = json.loads(capsys.readouterr().out)["error"]
-    assert "missing from the export" in err
-    assert _no_content_mutation(docs)
-    assert docs.canary_text is None
+    engine._apply_op_anchor_safe(docs, drive, "doc1", op, None)
+    main = semantic_batch(docs)
+    assert "deleteContentRange" in main[1]  # the edit, by index
 
 
 def test_patch_replace_applies_with_canary_first(engine, monkeypatch):
@@ -2652,13 +2634,12 @@ def test_a_replace_covering_a_crossing_anchor_is_still_refused(engine,
     assert "удаляет границу абзаца" in out["refused"][0]["error"]
 
 
-def test_a_ghost_is_named_in_the_receipt_and_the_patch_goes_on(engine,
-                                                               monkeypatch,
-                                                               tmp_path,
-                                                               capsys):
-    """#34 end to end: one vanished thread used to refuse every replace in the
-    document. It is now named once — not per operation — and removing it stays
-    the person's decision (CONTRACT §2.2)."""
+def test_ghosts_leave_no_trace_in_the_patch_receipt(engine, monkeypatch,
+                                                    tmp_path, capsys):
+    """Before, a ghost was named in `ghost_threads` with a link and «remove
+    it by hand» — an invitation for the agent to bring a thread the person
+    cannot see into the conversation. The person does not care about it, so
+    the receipt does not mention it."""
     doc = make_doc(BASE_TEXTS)
     docs = DocsStub(doc)
     gone = api_comment("c2", "B", "2026-07-13T17:00:00.000Z")
@@ -2678,9 +2659,58 @@ def test_a_ghost_is_named_in_the_receipt_and_the_patch_goes_on(engine,
     engine.patch_doc("doc1", str(ops))
     out = json.loads(capsys.readouterr().out)
     assert out["ops_applied"] == 2
-    assert [g["id"] for g in out["ghost_threads"]] == ["c2"]
-    assert "disco=c2" in out["ghost_threads"][0]["link"]
-    assert "Убрать его можно вручную" in out["ghost_threads"][0]["note"]
+    assert "ghost_threads" not in out
+    assert "disco=c2" not in json.dumps(out)
+
+
+def test_tochka_2026_10_06_two_ghosts_and_no_live_thread(engine, monkeypatch,
+                                                         tmp_path, capsys):
+    """The document of 06.10: every thread the person read is closed, two
+    are left open with their text rewritten in the UI. 13 of 13 edits were
+    refused, the work went out through the raw API. Here: edits across the
+    whole document, one of them over text a ghost's quote still matches —
+    all applied, nothing refused, no word about ghosts."""
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    yt0 = api_comment("yt0", "A", "2026-07-13T08:16:00.000Z")
+    yt0["quotedFileContent"] = {"value": "к обещанным срокам"}
+    yt4 = api_comment("yt4", "A", "2026-07-13T08:16:01.000Z")
+    yt4["quotedFileContent"] = {"value": "Bravo"}
+    closed = api_comment("old", "A", "2026-07-13T08:00:00.000Z",
+                         resolved=True)
+    drive = DriveStub(
+        [yt0, yt4, closed],
+        _docx_builder(docs, [(t, []) for t in BASE_TEXTS], []))
+    wire(engine, monkeypatch, docs, drive)
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "replace_quote", "quote": "Alpha", "with": "Yankee"},
+        {"op": "replace_quote", "quote": "Bravo", "with": "Zulu"},
+        {"op": "replace_quote", "quote": "Charlie", "with": "Xray"},
+    ]), encoding="utf-8")
+
+    engine.patch_doc("doc1", str(ops))
+    out = json.loads(capsys.readouterr().out)
+    assert out["ops_applied"] == 3
+    assert not out.get("refused")
+    assert "ghost" not in json.dumps(out)
+    # Edited like a document without comments: ONE atomic batch, the canary
+    # delete first, not one canary per operation (code review r2).
+    assert out["strategy"] == "index-atomic"
+    assert out["closed_threads_unmapped"] == ["old"]
+    canaries = [b for b in docs.batches
+                if len(b) == 1 and "insertText" in b[0]
+                and "skrepka-canary" in b[0]["insertText"]["text"]]
+    assert len(canaries) == 1  # one proof for the whole file
+    main = semantic_batch(docs)
+    assert len(docs.batches) == 2  # the canary, then everything at once
+    assert written_text(main).count("Yankee") == 1
+    assert "Zulu" in written_text(main) and "Xray" in written_text(main)
+    assert docs.canary_text is None  # deleted by the batch itself
+    # ...and it is the canary that goes first, at the very end of the body
+    body_end = doc["body"]["content"][-1]["endIndex"]
+    assert main[0]["deleteContentRange"]["range"]["startIndex"] == \
+        body_end - 1
 
 
 # ---------------------------------------------------------------------------
@@ -3765,3 +3795,273 @@ def test_exact_anchor_still_gets_the_surviving_character_answer(engine):
     why = engine._why_no_rewrite(**kw)
     assert "точном совпадении" not in why
     assert "уцелеть" in why.lower()
+
+
+# ---------------------------------------------------------------------------
+# Code review r1 (2026-10-06): order, unreadable records, insert-only sync
+# ---------------------------------------------------------------------------
+
+def test_two_threads_sharing_one_present_record_are_judged_alike_in_any_order(
+        engine):
+    """c1 = {a, x}, c2 = {b, x}, the export carries only x. Each thread's own
+    record is missing, so both are absent (a thread leaves the export whole).
+    The old «at least one witness present» test let whichever came second
+    inherit x and pass for live — the API's listing order chose which anchor
+    a `comment_id` edit would land on."""
+    def thread(cid, own):
+        return api_comment(cid, "A", own, replies=[
+            {"createdTime": "2026-01-01T00:00:09Z",
+             "author": {"displayName": "B"}}])
+
+    c1 = thread("c1", "2026-01-01T00:00:01Z")
+    c2 = thread("c2", "2026-01-01T00:00:02Z")
+    records = [{"docx_id": "0", "author": "B",
+                "date_sec": "2026-01-01T00:00:09Z"}]
+    for order in ([c1, c2], [c2, c1]):
+        universe = engine._key_owners_universe(order)
+        problems, metrics = engine._account_anchored_comments(
+            order, records, _spans("0"), universe=universe)
+        assert metrics["ghost_threads_ignored"] == 2
+        assert engine._attribute_records_to_threads(
+            order, records, universe) == {}
+
+
+def test_plain_export_with_an_unreadable_record_cannot_call_ghosts(engine):
+    """A record with no readable key matches no thread and would make every
+    one of them look absent; the writer refuses on it, so the plain-export
+    reading says «cannot tell» instead of «all ghosts» (code review)."""
+    import io
+    import zipfile
+    w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("word/comments.xml",
+                   f'<w:comments xmlns:w="{w}"><w:comment w:id="0" '
+                   f'w:author="" w:date=""/></w:comments>')
+
+    class Drive:
+        def files(self):
+            class F:
+                def export(self, **kw):
+                    return _Req(buf.getvalue())
+            return F()
+
+    live = api_comment("c1", "A", "2026-01-01T00:00:01Z")
+    assert engine._ghosts_by_plain_export(
+        Drive(), "doc1", [live], engine._key_owners_universe([live])) is None
+
+
+def test_insert_only_sync_does_not_count_ghosts_either(engine):
+    """No replace, no delete — no accounting map. The count still leaves the
+    ghosts out, by one plain read (code review)."""
+    import io
+    import zipfile
+
+    class Drive:
+        def files(self):
+            class F:
+                def export(self, **kw):
+                    buf = io.BytesIO()
+                    w = ("http://schemas.openxmlformats.org/"
+                         "wordprocessingml/2006/main")
+                    with zipfile.ZipFile(buf, "w") as z:
+                        z.writestr(
+                            "word/document.xml",
+                            f'<w:document xmlns:w="{w}"><w:body><w:p><w:r>'
+                            f'<w:t>x</w:t></w:r></w:p></w:body></w:document>')
+                    return _Req(buf.getvalue())
+            return F()
+
+    ghost = api_comment("c1", "A", "2026-01-01T00:00:01Z")
+    closed = api_comment("c2", "A", "2026-01-01T00:00:02Z", resolved=True)
+    anchored = [ghost, closed]
+    universe = engine._key_owners_universe(anchored)
+    assert engine._sync_ghost_count(None, Drive(), "doc1", anchored,
+                                    universe) == 1
+    assert engine._sync_ghost_count(
+        {"metrics": {"ghost_threads_ignored": 3}}, None, "doc1", anchored,
+        universe) == 3
+
+
+def test_a_live_thread_on_the_fresh_map_sends_the_file_the_per_op_way(
+        engine, monkeypatch, tmp_path, capsys):
+    """The plain export said «only ghosts», the canary-proven map found a
+    live anchor after all — the canary is cleaned up and the file goes the
+    usual per-op way, protection and all. The atomic route is an
+    optimisation that must never cost a live thread."""
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    live = api_comment("c1", "A", CREATED)
+    drive = DriveStub(
+        [live],
+        _docx_builder(docs, [("Alpha", []), ("Bravo", [("0", 0, 5)]),
+                             ("Charlie", [])],
+                      [("0", "A", CREATED_SEC)]))
+    wire(engine, monkeypatch, docs, drive)
+    monkeypatch.setattr(engine, "_ghosts_by_plain_export",
+                        lambda *a, **k: (["c1"], {"c1"}))
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "replace_quote", "quote": "Alpha", "with": "Yankee"},
+    ]), encoding="utf-8")
+
+    engine.patch_doc("doc1", str(ops))
+    out = json.loads(capsys.readouterr().out)
+    assert out["strategy"] != "index-atomic"
+    assert out["ops_applied"] == 1
+    assert docs.canary_text is None
+
+
+def _plain_drive(records):
+    import io
+    import zipfile
+    w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    rows = "".join(f'<w:comment w:id="{i}" w:author="{a}" w:date="{d}"/>'
+                   for i, (a, d) in enumerate(records))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("word/comments.xml",
+                   f'<w:comments xmlns:w="{w}">{rows}</w:comments>')
+
+    class Drive:
+        def files(self):
+            class F:
+                def export(self, **kw):
+                    return _Req(buf.getvalue())
+            return F()
+    return Drive()
+
+
+def test_plain_export_with_a_closed_threads_record_cannot_call_ghosts(engine):
+    """The writer reads a closed thread's record in the export as stale and
+    refuses; the plain reading must not promise «all ghosts» on it."""
+    open_one = api_comment("c1", "A", "2026-01-01T00:00:01Z")
+    closed = api_comment("c2", "B", "2026-01-01T00:00:02Z", resolved=True)
+    anchored = [open_one, closed]
+    assert engine._ghosts_by_plain_export(
+        _plain_drive([("B", "2026-01-01T00:00:02Z")]), "doc1", anchored,
+        engine._key_owners_universe(anchored)) is None
+
+
+def test_plain_export_with_an_unclaimed_record_cannot_call_ghosts(engine):
+    """c1 = {a, x}, c2 = {b, x}, the export carries x: both are ghosts, and
+    x is an anchor nobody can name — the writer keeps it protected, so the
+    dry run must not promise `would_apply` around it."""
+    def thread(cid, own):
+        return api_comment(cid, "A", own, replies=[
+            {"createdTime": "2026-01-01T00:00:09Z",
+             "author": {"displayName": "B"}}])
+
+    anchored = [thread("c1", "2026-01-01T00:00:01Z"),
+                thread("c2", "2026-01-01T00:00:02Z")]
+    assert engine._ghosts_by_plain_export(
+        _plain_drive([("B", "2026-01-01T00:00:09Z")]), "doc1", anchored,
+        engine._key_owners_universe(anchored)) is None
+
+
+def test_atomic_route_stops_when_comments_move_before_the_write(
+        engine, monkeypatch, tmp_path, capsys):
+    """The proof holds only for the comments it was built on. A new comment
+    between the map and the write stops the batch, nothing is applied, and
+    the canary is taken away — the same check the per-op path makes."""
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    ghost = api_comment("g1", "A", "2026-07-13T08:16:00.000Z")
+    drive = DriveStub(
+        [ghost], _docx_builder(docs, [(t, []) for t in BASE_TEXTS], []),
+        comments_after=[ghost,
+                        api_comment("c9", "Z", "2026-07-14T00:00:00.5Z")],
+        switch_after_lists=1)
+    wire(engine, monkeypatch, docs, drive)
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "replace_quote", "quote": "Alpha", "with": "Yankee"},
+    ]), encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        engine.patch_doc("doc1", str(ops))
+    err = json.loads(capsys.readouterr().out)["error"]
+    assert "comments changed" in err
+    assert _no_content_mutation(docs)
+    assert docs.canary_text is None
+
+
+# ---------------------------------------------------------------------------
+# Code review r3: the canary is never left behind on the way to a fallback
+# ---------------------------------------------------------------------------
+
+def test_a_canary_that_cannot_be_cleaned_stops_the_patch(engine, monkeypatch,
+                                                        tmp_path, capsys):
+    """The fresh map found a live anchor, and the canary could not be taken
+    away. Going on the per-op way would edit a document with a stray service
+    line in it, so nothing more is written and the person is told."""
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    docs.fail_cleanup = True
+    drive = DriveStub(
+        [api_comment("c1", "A", CREATED)],
+        _docx_builder(docs, [("Alpha", []), ("Bravo", [("0", 0, 5)]),
+                             ("Charlie", [])],
+                      [("0", "A", CREATED_SEC)]))
+    wire(engine, monkeypatch, docs, drive)
+    monkeypatch.setattr(engine, "_ghosts_by_plain_export",
+                        lambda *a, **k: (["c1"], {"c1"}))
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "replace_quote", "quote": "Alpha", "with": "Yankee"},
+    ]), encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        engine.patch_doc("doc1", str(ops))
+    err = json.loads(capsys.readouterr().out)["error"]
+    assert "осталась служебная строка" in err
+    assert _no_content_mutation(docs)
+
+
+def test_an_empty_insert_does_not_spend_a_canary(engine, monkeypatch,
+                                                 tmp_path, capsys):
+    """It writes nothing, so there is nothing to prove a map for."""
+    doc = make_doc(BASE_TEXTS)
+    docs = DocsStub(doc)
+    ghost = api_comment("g1", "A", "2026-07-13T08:16:00.000Z")
+    drive = DriveStub(
+        [ghost], _docx_builder(docs, [(t, []) for t in BASE_TEXTS], []))
+    wire(engine, monkeypatch, docs, drive)
+    ops = tmp_path / "ops.json"
+    ops.write_text(json.dumps([
+        {"op": "insert_after_quote", "quote": "Bravo", "text": ""},
+    ]), encoding="utf-8")
+    try:
+        engine.patch_doc("doc1", str(ops))
+    except SystemExit:
+        pass
+    capsys.readouterr()
+    assert not any(
+        "insertText" in r and "skrepka-canary" in r["insertText"]["text"]
+        for b in docs.batches for r in b)
+
+
+def test_plain_export_with_a_marker_but_no_record_cannot_call_ghosts(engine):
+    """The text carries a comment marker comments.xml has no entry for — an
+    anchor nobody can name, which the writer fences."""
+    import io
+    import zipfile
+    w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("word/document.xml",
+                   f'<w:document xmlns:w="{w}"><w:body><w:p>'
+                   f'<w:commentRangeStart w:id="9"/><w:r><w:t>текст</w:t>'
+                   f'</w:r><w:commentRangeEnd w:id="9"/></w:p></w:body>'
+                   f'</w:document>')
+
+    class Drive:
+        def files(self):
+            class F:
+                def export(self, **kw):
+                    return _Req(buf.getvalue())
+            return F()
+
+    c1 = api_comment("c1", "A", "2026-01-01T00:00:01Z")
+    assert engine._ghosts_by_plain_export(
+        Drive(), "doc1", [c1], engine._key_owners_universe([c1])) is None

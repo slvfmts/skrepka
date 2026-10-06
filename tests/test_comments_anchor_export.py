@@ -194,28 +194,25 @@ def test_comments_distinguishes_export_record_ghost_and_unknown(
         "record_count": 1,
         "export_freshness": "unproven",
     }
-    assert rows["ghost"]["anchor_export"] == {
-        "status": "ghost",
-        "reason": ("record_missing_after_newer_export_record_and_"
-                   "quote_absent_from_document"),
-        "export_freshness": "unproven",
-    }
-    assert rows["still-there"]["anchor_export"]["status"] == "unknown"
-    assert rows["still-there"]["anchor_export"]["reason"] == (
-        "record_missing_but_quote_still_present")
-    assert rows["newest"]["anchor_export"]["reason"] == (
-        "record_missing_export_freshness_unproven")
+    # Every open thread without a record is a ghost — whether its old text
+    # is still in the document and whether anything in the export is newer
+    # no longer matters (owner, 2026-10-06).
+    for ghost in ("ghost", "still-there", "newest"):
+        assert rows[ghost]["anchor_export"] == {
+            "status": "ghost",
+            "reason": "record_missing_from_export",
+        }
     assert rows["shared-1"]["anchor_export"]["reason"] == (
-        "shared_or_missing_export_identity")
+        "shared_export_identity")
     assert rows["shared-2"]["anchor_export"]["reason"] == (
-        "shared_or_missing_export_identity")
+        "shared_export_identity")
     assert rows["document"]["anchor_export"]["status"] == "not_applicable"
     assert rows["resolved"]["anchor_export"]["reason"] == (
         "resolved_threads_omitted_from_export")
 
     assert receipt["anchor_record_present"] == 2
-    assert receipt["anchor_ghost"] == 1
-    assert receipt["anchor_unknown"] == 4
+    assert receipt["anchor_ghost"] == 3
+    assert receipt["anchor_unknown"] == 2
     assert len(services.export_calls) == 1
     assert services.batch_calls == []
     assert services.write_calls == []
@@ -261,8 +258,10 @@ def test_export_failure_keeps_comments_and_marks_anchor_unknown(
     assert services.batch_calls == []
 
 
-def test_shared_reply_record_cannot_turn_missing_unique_witness_into_ghost(
-        engine):
+def test_a_shared_reply_record_belongs_to_the_other_thread(engine):
+    """The thread's own key is absent. A thread leaves the export whole
+    (C11a), so the present record under the key it shares with a neighbour
+    is the neighbour's, and this one is a ghost."""
     comment = _comment(
         "c1", "A", "2026-01-01T00:00:01Z", "deleted text")
     comment["replies"] = [{
@@ -283,11 +282,11 @@ def test_shared_reply_record_cannot_turn_missing_unique_witness_into_ghost(
         file_id="doc1",
     )
 
-    assert status["status"] == "unknown"
-    assert status["reason"] == "ambiguous_record_may_belong_to_thread"
+    assert status["status"] == "ghost"
+    assert status["reason"] == "record_missing_from_export"
 
 
-def test_reopened_thread_requires_export_newer_than_reopen(
+def test_reopened_thread_missing_from_the_export_is_a_ghost(
         engine, monkeypatch, capsys):
     target = _comment(
         "c1", "A", "2026-01-01T00:00:01Z", "old anchored text")
@@ -308,9 +307,8 @@ def test_reopened_thread_requires_export_newer_than_reopen(
 
     rows = {row["id"]: row for row in json.loads(capsys.readouterr().out)}
     assert rows["c1"]["anchor_export"] == {
-        "status": "unknown",
-        "reason": "record_missing_export_freshness_unproven",
-        "export_freshness": "unproven",
+        "status": "ghost",
+        "reason": "record_missing_from_export",
     }
     assert all("action" not in reply for reply in rows["c1"]["replies"])
     assert services.batch_calls == []
@@ -476,14 +474,14 @@ def test_paginated_second_page_collisions_and_later_records_are_counted(
     engine.list_comments("doc1")
 
     rows = {row["id"]: row for row in json.loads(capsys.readouterr().out)}
-    assert rows["shared"]["anchor_export"]["reason"] == (
-        "shared_or_missing_export_identity")
+    # none of its keys is in the export: gone whole, shared key or not
+    assert rows["shared"]["anchor_export"]["status"] == "ghost"
     assert rows["ghost"]["anchor_export"]["status"] == "ghost"
     assert [call.get("pageToken") for call in services.comment_calls] == [
         None, "p2", None, "p2"]
 
 
-def test_quote_in_nested_child_tab_prevents_ghost_and_gets_exact_tab(
+def test_quote_in_nested_child_tab_gets_exact_tab(
         engine, monkeypatch, capsys):
     target = _comment(
         "c1", "A", "2026-01-01T00:00:01Z", "child-only quote")
@@ -511,9 +509,8 @@ def test_quote_in_nested_child_tab_prevents_ghost_and_gets_exact_tab(
     row = {row["id"]: row for row in json.loads(capsys.readouterr().out)}["c1"]
     assert row["tab_id"] == "child"
     assert row["tab_attribution"]["status"] == "exact"
-    assert row["anchor_export"]["status"] == "unknown"
-    assert row["anchor_export"]["reason"] == (
-        "record_missing_but_quote_still_present")
+    # the export carries every tab (M19-1): absent from it is absent
+    assert row["anchor_export"]["status"] == "ghost"
 
 
 def test_comments_evidence_path_has_no_hidden_writes(
@@ -531,3 +528,22 @@ def test_comments_evidence_path_has_no_hidden_writes(
     assert len(services.comment_calls) == 2
     assert len(services.get_calls) == 2
     assert len(services.export_calls) == 1
+
+
+def test_a_ghost_sharing_a_second_does_not_make_a_live_thread_unknown(
+        engine, monkeypatch, capsys):
+    """The ghost's reply landed in the same second as the live thread. With
+    the ghost struck out of key ownership the live thread owns its key again
+    and reads as present — the ghost has no say in how it is described."""
+    ghost = _comment("ghost", "A", "2026-01-01T00:00:01Z", "deleted text")
+    ghost["replies"] = [{"id": "r1", "author": {"displayName": "S"},
+                         "createdTime": "2026-01-01T00:00:05Z"}]
+    live = _comment("live", "S", "2026-01-01T00:00:05Z", "live text")
+    _wire(engine, monkeypatch, [ghost, live], _doc("live text\n"),
+          _docx([("0", "S", "2026-01-01T00:00:05Z")]))
+
+    engine.list_comments("doc1")
+
+    rows = {row["id"]: row for row in json.loads(capsys.readouterr().out)}
+    assert rows["ghost"]["anchor_export"]["status"] == "ghost"
+    assert rows["live"]["anchor_export"]["status"] == "record_present"

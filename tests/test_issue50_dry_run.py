@@ -588,7 +588,7 @@ def test_output_alone_does_not_turn_a_write_into_a_dry_run(
 @pytest.mark.parametrize("name", [
     "_fresh_anchor_snapshot", "_cleanup_canary", "_apply_op_anchor_safe",
     "_execute_index_replace", "_send_reply_intents", "_fold_reply_intents",
-    "_docx_comment_records", "_write_control", "mark_range",
+    "_write_control", "mark_range",
 ])
 def test_writer_export_and_reply_are_unreachable(engine, monkeypatch,
                                                  tmp_path, name):
@@ -1057,3 +1057,140 @@ def test_verdict_reaches_the_short_console_receipt(engine, monkeypatch,
         {"op": "replace_quote", "quote": "Alpha", "with": "Beta"}]),
         output=str(tmp_path / "receipt.json"))
     assert json.loads(capsys.readouterr().out)["verdict"] == "uncertain"
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-06: документ, где остались одни призраки, прогнозируется честно
+# ---------------------------------------------------------------------------
+
+def _docx_with(records):
+    import io
+    import zipfile
+    w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    rows = "".join(
+        f'<w:comment w:id="{i}" w:author="{a}" w:date="{d}"/>'
+        for i, (a, d) in enumerate(records))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("word/document.xml",
+                   f'<w:document xmlns:w="{w}"><w:body><w:p><w:r><w:t>x'
+                   f'</w:t></w:r></w:p></w:body></w:document>')
+        if records:
+            z.writestr("word/comments.xml",
+                       f'<w:comments xmlns:w="{w}">{rows}</w:comments>')
+    return buf.getvalue()
+
+
+class _ExportOnlyDrive:
+    """Drive, у которого есть ТОЛЬКО выгрузка: любой другой вызов — падение."""
+
+    def __init__(self, payload):
+        self.payload, self.exports = payload, 0
+
+    def files(self):
+        drive = self
+
+        class _Files:
+            def export(self, **kw):
+                drive.exports += 1
+
+                class _R:
+                    def execute(self_inner):
+                        if isinstance(drive.payload, Exception):
+                            raise drive.payload
+                        return drive.payload
+                return _R()
+        return _Files()
+
+
+def _thread(cid, author, created, resolved=False):
+    return {"id": cid, "author": {"displayName": author},
+            "createdTime": created, "resolved": resolved, "replies": [],
+            "quotedFileContent": {"value": "старый текст"}}
+
+
+def _wire_export(engine, monkeypatch, doc, anchored, payload):
+    service = _wire(engine, monkeypatch, doc, anchored=anchored)
+    drive = _ExportOnlyDrive(payload)
+    monkeypatch.setattr(engine, "get_drive_service", lambda _: drive)
+    universe = engine._key_owners_universe(anchored)
+    monkeypatch.setattr(engine, "_census_comments",
+                        lambda *_: (list(anchored), list(anchored), "fp",
+                                    universe))
+    return service, drive
+
+
+def _dry(engine, tmp_path, capsys, ops):
+    try:
+        engine.dry_run_patch("d1", _ops_file(tmp_path, ops))
+    except SystemExit:
+        pass
+    return json.loads(capsys.readouterr().out)
+
+
+def test_only_ghosts_left_means_replaces_would_apply(engine, monkeypatch,
+                                                     tmp_path, capsys):
+    """06.10: «накануне холостой прогон отвечал unknown на всё», и агент
+    перестал его запускать. Документ, где остались одни призраки и закрытые
+    треды, писатель правит как обычный — так и надо предсказывать."""
+    threads = [_thread("yt0", "A", "2026-10-05T08:16:00Z"),
+               _thread("yt4", "A", "2026-10-05T08:16:01Z"),
+               _thread("old", "A", "2026-10-05T08:00:00Z", resolved=True)]
+    service, drive = _wire_export(engine, monkeypatch, _doc(), threads,
+                                  _docx_with([]))
+    out = _dry(engine, tmp_path, capsys, [
+        {"op": "replace_quote", "quote": "Alpha", "with": "Beta"}])
+    assert out["operations"][0]["status"] == "would_apply"
+    assert out["writes_performed"] == 0
+    assert drive.exports == 1
+    assert service.writes == 0
+
+
+def test_a_live_thread_in_the_export_keeps_the_dry_run_honest(
+        engine, monkeypatch, tmp_path, capsys):
+    threads = [_thread("live", "A", "2026-10-05T08:16:00Z"),
+               _thread("ghost", "B", "2026-10-05T08:16:01Z")]
+    _service, _drive = _wire_export(
+        engine, monkeypatch, _doc(), threads,
+        _docx_with([("A", "2026-10-05T08:16:00Z")]))
+    out = _dry(engine, tmp_path, capsys, [
+        {"op": "replace_quote", "quote": "Alpha", "with": "Beta"}])
+    assert out["operations"][0]["status"] == "unknown"
+
+
+def test_an_unreadable_export_leaves_the_dry_run_where_it_was(
+        engine, monkeypatch, tmp_path, capsys):
+    threads = [_thread("t", "A", "2026-10-05T08:16:00Z")]
+    _wire_export(engine, monkeypatch, _doc(), threads,
+                 RuntimeError("export offline"))
+    out = _dry(engine, tmp_path, capsys, [
+        {"op": "replace_quote", "quote": "Alpha", "with": "Beta"}])
+    assert out["operations"][0]["status"] == "unknown"
+
+
+def test_ghost_only_doc_is_planned_like_a_clean_one(engine):
+    """Документ, где остались одни призраки, писатель правит одним атомарным
+    пакетом по одному снимку — как документ без комментариев. Прогноз тот же:
+    поздняя правка не зависит от ранней, и стратегия называется атомарной
+    (живой прогон на документе Точки давал `not_simulated` второй правке)."""
+    prepared = engine.prepare_patch(_doc("Alpha Beta Omega"), [
+        {"op": "replace_quote", "quote": "Alpha", "with": "Omega"},
+        {"op": "replace_quote", "quote": "Omega", "with": "Delta"},
+    ], anchored=True, comments=[{"id": "g1"}])
+    prepared["anchors_live"] = False
+    verdicts = engine.compile_index_plan(prepared)
+    assert [v["status"] for v in verdicts] == ["would_apply", "would_apply"]
+    assert engine._dry_receipt("d1", prepared, verdicts)["doc_strategy"] == \
+        "index-atomic"
+
+
+def test_a_file_with_nothing_for_the_clean_batch_stays_per_op(
+        engine, monkeypatch, tmp_path, capsys):
+    """Only a thread-addressed edit: the writer has nothing to put in a
+    clean batch and stays on the per-op path, so the forecast names that
+    path too (code review r3)."""
+    threads = [_thread("g1", "A", "2026-10-05T08:16:00Z")]
+    _wire_export(engine, monkeypatch, _doc(), threads, _docx_with([]))
+    out = _dry(engine, tmp_path, capsys, [
+        {"op": "replace_anchor", "comment_id": "g1", "with": "Beta"}])
+    assert out["doc_strategy"] == "anchor-safe-per-op"

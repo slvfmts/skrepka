@@ -885,37 +885,6 @@ def _count_quote_occurrences(doc_tab, quote):
     return _count_in_buffer(buf, quote)
 
 
-def _count_text_in_aux_segments(doc_tab, text):
-    """Occurrences of `text` in the tab's headers, footers and footnotes.
-
-    Nothing to do with the writer any more: since 0.17.0 an edit is addressed
-    by absolute range, so where else a string occurs cannot affect it. What
-    still needs this is ghost accounting, which asks a different question —
-    «is the old quote still SOMEWHERE in this tab». `_text_buffer` walks the
-    body only, so a quote surviving in a running header would otherwise read
-    as gone, and a live thread would be declared a ghost.
-    """
-    if not text or "\x00" in text:
-        return 0
-    total = 0
-    for key in ("headers", "footers", "footnotes"):
-        for container in (doc_tab.get(key) or {}).values():
-            if not isinstance(container, dict):
-                continue
-            total += _plain_text(container.get("content", [])).count(text)
-    return total
-
-
-def _count_quote_in_tab(doc_tab, text):
-    """How many times `text` occurs in the tab, body and aux segments alike.
-
-    Used by ghost accounting to answer «is this quote still present», never
-    as a precondition for a write: the index writer does not search.
-    """
-    return (_count_quote_occurrences(doc_tab, text)
-            + _count_text_in_aux_segments(doc_tab, text))
-
-
 def _write_control(revision_id):
     """Build writeControl block for batchUpdate with required revision pinning.
 
@@ -1662,17 +1631,26 @@ def _comment_tab_attribution(comment, tabs=None, catalog_problem=None,
     }
 
 
+# A ghost carries no `export_freshness`: that field is a caution for reading
+# `record_present` («the record was there, the anchor may have moved since»),
+# and next to a ghost it read as «do not conclude yet» — while the conclusion
+# is the whole point. Nothing is to be done about a ghost (owner, 2026-10-06).
+_GHOST_EXPORT_STATUS = {"status": "ghost",
+                        "reason": "record_missing_from_export"}
+
+
 def _comment_anchor_export_status(comment, *, records, universe, tabs,
                                   file_id=None, export_problem=None,
-                                  read_problem=None):
+                                  read_problem=None, ghost_ids=None):
     """Describe read-only export evidence without claiming live freshness.
 
     A plain Drive export has no canary and may be stale.  A matching record
     therefore means only ``record_present`` in THAT export, never "the anchor
-    is live now".  Absence becomes ``ghost`` only under the stricter #34
-    witness: the thread has a unique author/time identity, the export contains
-    a later record, and the stale quote is absent from every current Docs tab.
-    Every inconclusive shape stays ``unknown``.
+    is live now".  An open thread with no record in the export is a ``ghost``:
+    a thread leaves the export whole (C11a), the person does not see it, and
+    it has no say in the work (owner, 2026-10-06).  ``unknown`` is left for
+    real uncertainty — an unreadable export, or a thread whose every key is
+    shared with another thread and present.
     """
     base = {"export_freshness": "unproven"}
     if not (comment.get("quotedFileContent") or comment.get("anchor")):
@@ -1694,68 +1672,29 @@ def _comment_anchor_export_status(comment, *, records, universe, tabs,
         created = entry.get("createdTime")
         if author and created:
             keys.add((author, _trunc_seconds(created)))
-    witnesses = {key for key in keys if universe.get(key) == {cid}}
-    if not witnesses:
+    if not keys:
         return {**base, "status": "unknown",
-                "reason": ("shared_or_missing_export_identity")}
-
-    present = [
-        record for record in records
-        if (record.get("author"), record.get("date_sec")) in witnesses
-    ]
-    if present:
+                "reason": "export_identity_unreadable"}
+    if ghost_ids is not None and cid in ghost_ids:
+        return _GHOST_EXPORT_STATUS.copy()
+    witnesses = {key for key in keys if universe.get(key) == {cid}}
+    exported = {(record.get("author"), record.get("date_sec"))
+                for record in records}
+    if witnesses & exported:
         return {**base, "status": "record_present",
                 "reason": "unique_thread_record_found_in_export",
-                "record_count": len(present)}
-    if any((record.get("author"), record.get("date_sec")) in keys
-           for record in records):
-        # A shared key may be this thread's reply. It cannot prove presence,
-        # but it is enough to make declaring the thread absent unsafe.
-        return {**base, "status": "unknown",
-                "reason": "ambiguous_record_may_belong_to_thread"}
-
-    quote = (comment.get("quotedFileContent") or {}).get("value") or ""
-    if not quote:
-        return {**base, "status": "unknown",
-                "reason": "anchor_without_quote_missing_from_export"}
-    if read_problem or not tabs:
-        return {**base, "status": "unknown",
-                "reason": read_problem or "document_tabs_unavailable"}
-    if any(_count_quote_in_tab(doc_tab, quote)
-           for _tab_id, _title, doc_tab in tabs):
-        return {**base, "status": "unknown",
-                "reason": "record_missing_but_quote_still_present"}
-
-    # A whole but stale export can legitimately omit a thread while it is
-    # resolved.  Seeing a record newer than the PARENT's creation is not
-    # enough after the thread has since been reopened: that record may still
-    # belong to the resolved interval.  Require evidence newer than every
-    # current entry, including the resolve/reopen action replies.  Ordinary
-    # replies are included too; the extra false-negative is the honest price
-    # of not knowing which cached comment-store snapshot Drive exported.
-    activity = []
-    for entry in [comment] + [
-            reply for reply in (comment.get("replies") or [])
-            if not reply.get("deleted")]:
-        stamp = _rfc3339_epoch(entry.get("createdTime"))
-        if stamp is None:
-            return {**base, "status": "unknown",
-                    "reason": "thread_activity_time_unreadable"}
-        activity.append(stamp)
-    if not activity:
-        return {**base, "status": "unknown",
-                "reason": "thread_activity_time_unreadable"}
-
-    doc_tabs = [doc_tab for _tab_id, _title, doc_tab in tabs]
-    verdict = _ghost_verdict(
-        comment, records, doc_tabs[0], file_id=file_id,
-        other_tabs=doc_tabs[1:], freshness_floor=max(activity))
-    if verdict is not None and not verdict.get("fenced"):
-        return {**base, "status": "ghost",
-                "reason": ("record_missing_after_newer_export_record_and_"
-                           "quote_absent_from_document")}
+                "record_count": sum(
+                    1 for record in records
+                    if (record.get("author"), record.get("date_sec"))
+                    in witnesses)}
+    if witnesses or not (keys & exported):
+        # Its own keys are absent, or none of its keys is there at all: the
+        # thread left the export whole.
+        return _GHOST_EXPORT_STATUS.copy()
+    # Every key is shared with another thread and some such key is present:
+    # that record may be this thread's or the other's.
     return {**base, "status": "unknown",
-            "reason": "record_missing_export_freshness_unproven"}
+            "reason": "shared_export_identity"}
 
 
 def list_comments(file_id, output=None):
@@ -1848,6 +1787,25 @@ def list_comments(file_id, output=None):
     attribution_counts = {"exact": 0, "unknown": 0, "document": 0}
     anchor_counts = {"record_present": 0, "ghost": 0, "unknown": 0,
                      "not_applicable": 0}
+    # Ghosts first, then everybody else judged with the ghosts struck out of
+    # key ownership — the same order the write path uses, so `comments` does
+    # not call a live thread «unknown» because a ghost shares its second.
+    open_threads = []
+    for c in comments:
+        if c.get("resolved") or not (
+                c.get("quotedFileContent") or c.get("anchor")):
+            continue
+        keys = set()
+        for entry in [c] + [r for r in (c.get("replies") or [])
+                            if not r.get("deleted")]:
+            author = (entry.get("author") or {}).get("displayName")
+            created = entry.get("createdTime")
+            if author and created:
+                keys.add((author, _trunc_seconds(created)))
+        open_threads.append((c.get("id"), keys))
+    ghost_ids, owners = _split_off_ghosts(
+        open_threads,
+        {(r.get("author"), r.get("date_sec")) for r in records}, universe)
     for c in comments:
         attribution = _comment_tab_attribution(
             c, tabs=tabs, catalog_problem=catalog_problem,
@@ -1855,14 +1813,14 @@ def list_comments(file_id, output=None):
         c.update(attribution)
         attribution_counts[attribution["tab_attribution"]["status"]] += 1
         anchor_export = _comment_anchor_export_status(
-            c, records=records, universe=universe, tabs=tabs,
+            c, records=records, universe=owners, tabs=tabs,
             file_id=file_id, export_problem=export_problem,
-            read_problem=read_problem)
+            read_problem=read_problem, ghost_ids=ghost_ids)
         c["anchor_export"] = anchor_export
         anchor_counts[anchor_export["status"]] += 1
         for reply in c.get("replies") or []:
-            # The Drive action is needed only for the internal freshness
-            # floor.  Keep the historical public comments schema unchanged.
+            # The Drive action is not part of the historical public comments
+            # schema; keep it out.
             reply.pop("action", None)
         # Same rule for the raw Drive `anchor`: it is requested so that a
         # thread with no quote can be classified as document-level, and it is
@@ -3875,8 +3833,8 @@ def _docx_comment_records(docx_bytes):
     a duplicate or missing id makes the comments.xml ⇄ document.xml join
     unusable, so it is a problem (caller fails closed). A missing
     comments.xml part is an empty record list (valid for a doc whose
-    anchored comments are all ghosts — accounting then fails closed on
-    the API side of the equality, which is the intent).
+    anchored comments are all ghosts — accounting then counts every one of
+    them as a ghost and lets the work go on).
     """
     import io
     import zipfile
@@ -3980,154 +3938,68 @@ def _rfc3339_epoch(ts):
     return parsed.timestamp()
 
 
-def _ghost_verdict(c, records, doc_tab, file_id=None, other_tabs=(),
-                   freshness_floor=None):
-    """Is this witness-less thread provably a ghost? None when it is not.
+def _split_off_ghosts(threads, exported, universe):
+    """Which open threads are ghosts, and who owns each key without them.
 
-    A thread the API calls live whose records are absent from the export is
-    «a ghost or a stale export», and until #34 the two were treated as
-    indistinguishable — so ANY vanished comment froze every replace in the
-    document. Losing a comment without closing it is not a malfunction: the
-    text got rewritten, the paragraph deleted, the block moved. A ghost has no
-    anchor left, so blocking the document buys it nothing.
+    `threads` is [(comment_id, set of its live entry keys)], `exported` the
+    keys present in the export. Every entry of a thread — parent, replies,
+    even the resolve/reopen action replies — is its own record, and a thread
+    leaves the export whole (C11a, FINDINGS «Резолв и переоткрытие»). So a
+    thread is a ghost when none of its keys is in the export, or when a key
+    that belongs to it alone (a witness) is missing: had the thread been
+    exported, that record would be there, and nobody else could have put it.
 
-    Two signs, independent of each other, and both must agree:
+    Ghosts are then struck out of key ownership and the rest judged again. A
+    ghost sharing a second with a live thread must not rob that thread of its
+    witness — that would make the ghost a reason to refuse, and ghosts have
+    no say in the work (owner, 2026-10-06). The test is monotone — striking
+    a ghost out only ever turns more keys into witnesses, and «a witness is
+    missing» stays true once true — so the result does not depend on the
+    order the API listed the threads in (code review: «at least one witness
+    present» was not monotone, and two threads sharing one present record
+    each could be the survivor). A thread with no readable key is never
+    declared a ghost here; there is nothing to judge it by.
 
-    1. the export carries a record created LATER than this thread. The export
-       is a snapshot of the comment store at some instant T; a record dated D
-       proves T ≥ D, so a D later than this thread's creation leaves lag with
-       nothing to explain. When the missing thread is the newest thing in the
-       document the sign stays silent and the refusal stands — there lag
-       really is indistinguishable;
-    2. the text the comment was attached to is no longer in the document. This
-       one does not come from the export at all — it is read from the API and
-       the current snapshot, so a converter fault cannot forge it.
-
-    Sign 1 rests on the export being assembled whole rather than in pieces —
-    the same assumption the text canary already rests on, and NOT a measured
-    fact. The review held a P0 on it: in a chain of three coincidences (thread
-    alive, its text changed since, its record dropped by the converter) an
-    edit could kill a live thread. The owner took that trade knowingly on
-    2026-08-16 — see internal/DECISIONS.md — against the cost of the opposite,
-    which happens routinely.
-
-    When the stale quote IS still found in the document, the verdict carries
-    those places: they get fenced, so an edit there is refused while the rest
-    of the document stays editable. The fence proves nothing about where the
-    anchor is; it only makes being wrong cost a local refusal instead of a
-    thread.
+    Returns (ghost_ids, owners) — `owners` is `universe` without the ghosts.
     """
-    if doc_tab is None:
-        return None  # nothing to check sign 2 against — fail closed
-    created = (freshness_floor if freshness_floor is not None
-               else _rfc3339_epoch(c.get("createdTime")))
-    if created is None:
-        return None
-    later = []
-    for r in records:
-        stamp = _rfc3339_epoch(r.get("date_sec"))
-        # `is not None`, not `or 0`: a record whose date cannot be read must
-        # be visibly not-later, not silently zero (found in review)
-        if stamp is not None and stamp > created:
-            later.append(r)
-    quote = (c.get("quotedFileContent") or {}).get("value")
-    if not quote:
-        # No quoted text at all, and no record in the export. Measured
-        # 2026-08-16: a comment created through the API never attaches to
-        # document text — but Drive stores the `anchor` field it was given
-        # verbatim, and skrepka counts anything carrying `anchor` as anchored.
-        # Such a thread has no text anchor to lose, yet it used to freeze
-        # every replace in the document, which is what any other tool leaving
-        # comments through the API does to a document today.
-        #
-        # A genuinely text-anchored comment always carries the quote (it is
-        # filled at creation and survives losing the anchor — the living ghost
-        # of 2026-08-09 still had it). One anchored to an IMAGE might not —
-        # and that was the whole doubt, because an image anchor is real. It is
-        # measured now (2026-08-16, #46): a comment on a picture carries no
-        # quote and DOES leave a record in the export, markers and all, so it
-        # never reaches this branch at all.
-        #
-        # Sign 1 is waived here for EXACTLY the shape that needed it waived:
-        # an export with no records at all. That is what a document whose
-        # comments were all left through the API looks like — no record can
-        # ever be «later», the sign stays silent forever, and every replace is
-        # refused for threads that have nothing to lose (#46).
-        #
-        # When the export DOES carry records, the sign costs nothing and stays
-        # on. Narrower than the first version of this fix, and deliberately:
-        # a quote can in principle be missing for a reason nobody has measured,
-        # and where there is a cheap second opinion it is worth keeping
-        # (code review r11).
-        if records and not later:
-            return None
-        return {"id": c.get("id"),
-                "link": _thread_link(file_id, c.get("id")),
-                "quote": None,
-                "fenced": []}
-    if not later:
-        return None
-    # The quote may simply live in ANOTHER TAB. Sign 2 asks whether the text
-    # is gone from the DOCUMENT, and reading it in the target tab alone makes
-    # every thread of every neighbouring tab look dead: the quote is not
-    # there, the fence comes out empty, and the person is told their comment
-    # vanished while its protection is quietly dropped (r12, round 2).
-    for other in other_tabs:
-        if (_count_quote_occurrences(other, quote)
-                or _count_text_in_aux_segments(other, quote)):
-            return None
-    if _count_text_in_aux_segments(doc_tab, quote):
-        # The old text survives in a header, a footer or a footnote, where the
-        # fence cannot reach — `_text_buffer` walks the body only, while
-        # `replaceAllText` does not. Nothing to fence with, so fail closed
-        # (found in review).
-        return None
-    return {"id": c.get("id"),
-            "link": _thread_link(file_id, c.get("id")),
-            "quote": quote[:60],
-            "fenced": _locate_comment_in_tab(doc_tab, c)}
-
-
-def _fence_off_ghosts(ghosts):
-    """Blocked ranges for vanished threads whose old text is still here.
-
-    A ghost with nothing left to find fences nothing and costs the person
-    nothing. One whose quote still matches somewhere gets those places fenced:
-    if the thread is in fact alive and simply missing from the export, this is
-    where it most likely still sits.
-    """
-    blocked = []
-    for g in ghosts:
-        for cs, ce in g.get("fenced") or ():
-            who = (f"треда {g['id']} {g['link']}" if g.get("link")
-                   else f"комментария {g.get('id')}")
-            blocked.append((cs, ce, (
-                f"комментарий {who} пропал из выгрузки документа, а текст, на "
-                f"котором он висел («{g.get('quote', '')[:40]}»), ещё здесь — "
-                f"поэтому правка этого места отклонена, а остальной документ "
-                f"правится. Откройте тред по ссылке и посмотрите: если "
-                f"комментарий действительно потерял привязку, удалите его — "
-                f"место освободится; если он на месте, этот фрагмент правится "
-                f"в интерфейсе")))
-    return blocked
+    owners = {k: set(v) for k, v in universe.items()}
+    ghosts = set()
+    changed = True
+    while changed:
+        changed = False
+        for cid, keys in threads:
+            if cid in ghosts or not keys:
+                continue
+            if (not any(k in exported for k in keys)
+                    or any(k not in exported and owners.get(k) == {cid}
+                           for k in keys)):
+                ghosts.add(cid)
+                for holders in owners.values():
+                    holders.discard(cid)
+                changed = True
+    return ghosts, owners
 
 
 def _account_anchored_comments(anchored, records, spans, *, universe,
                                file_id=None, marker_census=None,
                                doc_tab=None, other_tabs=()):
-    """Prove every live anchored THREAD keeps at least one anchor in the export.
+    """Map every open anchored THREAD that is in the export to its anchor.
 
-    Ghosted threads vanish from the export ENTIRELY (C11a), and a stale export
-    missing a fresh comment looks exactly the same — so every live anchored
-    thread must be shown to be present. Keys are
+    Ghosted threads vanish from the export ENTIRELY (C11a). The export the
+    write path hands here was taken after the canary went in, and the comment
+    list did not move around it (fp1 == fp2) — so an open thread with no
+    record in it existed when the export was made and has no anchor: a ghost.
+    Ghosts have no say in the work at all (owner, 2026-10-06, after four
+    documents frozen by the opposite): they are counted and skipped. Keys are
     (author.displayName, createdTime→seconds); `universe` maps each key to the
     set of comment ids that produced it across EVERYTHING the API can see,
     deleted and resolved included.
 
-      * a thread with no witness key — one that belongs to it alone — cannot
-        be identified in the export at all, so it is refused;
-      * a thread whose witness never appears in comments.xml is a ghost or a
-        stale export;
+      * a thread none of whose own (witness) keys is in comments.xml is a
+        ghost — when a key it shares is present, that record is the other
+        thread's, since a thread leaves the export whole;
+      * a thread with no witness key at all, one of whose shared keys IS in
+        the export, cannot be told from its namesake, so it is refused (M27);
       * a record key no live thread claims means the export is stale;
       * every record must join to exactly one anchor span via w:id.
 
@@ -4156,8 +4028,9 @@ def _account_anchored_comments(anchored, records, spans, *, universe,
     """
     from collections import Counter
 
-    problems, ghosts = [], []
-    in_other_tabs = 0
+    problems = []
+    ghosts_ignored = 0
+    unreadable = set()  # threads with an entry we cannot key
     signatures = []  # (thread, Counter of its live entry keys)
     resolved_n = 0
     for c in anchored:
@@ -4176,9 +4049,7 @@ def _account_anchored_comments(anchored, records, spans, *, universe,
             author = (entry.get("author") or {}).get("displayName")
             created = entry.get("createdTime")
             if not author or not created:
-                problems.append(
-                    f"comment {_comment_label(c, file_id)} has an entry without "
-                    f"author/createdTime — cannot account for it")
+                unreadable.add(c.get("id"))
                 continue
             sig[(author, _trunc_seconds(created))] += 1
         signatures.append((c, sig))
@@ -4198,12 +4069,32 @@ def _account_anchored_comments(anchored, records, spans, *, universe,
     live_keys = set()
     for _c, sig in signatures:
         live_keys |= set(sig)
+    # A thread none of whose own records is in the export is a ghost. The
+    # export was taken after the canary went in and the comment list did not
+    # move around it (fp1 == fp2), so the thread existed when the export was
+    # made and left no anchor in it. The person does not see it, for them it
+    # does not exist, and it has no say in the work — no refusal, no fence,
+    # no advice, no line in the receipt (owner, 2026-10-06; four documents
+    # were frozen by the opposite).
+    ghost_ids, owners = _split_off_ghosts(
+        [(c.get("id"), set(sig)) for c, sig in signatures],
+        set(docx_keys), universe)
     for c, sig in signatures:
+        if c.get("id") in ghost_ids:
+            ghosts_ignored += 1
+            continue
+        if c.get("id") in unreadable:
+            # Only for a thread that is in the export: an unkeyable entry of
+            # a ghost is a ghost's entry.
+            problems.append(
+                f"comment {_comment_label(c, file_id)} has an entry without "
+                f"author/createdTime — cannot account for it")
         # Uniqueness is measured against the WHOLE API-visible universe, not
         # just live threads (codex r3): a leftover export record left by a
         # deleted reply or a resolved thread would otherwise pass for the
-        # witness of a ghost.
-        witnesses = [k for k in sig if universe.get(k) == {c.get("id")}]
+        # witness of a ghost. Ghosts alone are struck out of it — see
+        # `_split_off_ghosts`.
+        witnesses = [k for k in sig if owners.get(k) == {c.get("id")}]
         if not witnesses:
             problems.append(
                 f"comment {_comment_label(c, file_id)} shares every (author, second) "
@@ -4211,39 +4102,8 @@ def _account_anchored_comments(anchored, records, spans, *, universe,
                 f"the export, refusing. Reply to this thread (one at a time, "
                 f"then re-run): the reply's own second becomes its witness")
             continue
-        # At least ONE witness present is enough — a thread may have several,
-        # and requiring a particular one would flap on partial staleness.
-        if not any(docx_keys.get(k) for k in witnesses):
-            verdict = _ghost_verdict(c, records, doc_tab, file_id,
-                                     other_tabs=other_tabs)
-            if verdict is not None:
-                # Provably gone: it has no anchor left to protect, so the
-                # document is not held hostage to it (#34). Named in the
-                # receipt — removing someone's comment is the person's call
-                # (CONTRACT §2.2), never ours.
-                ghosts.append(verdict)
-                continue
-            # A thread missing from the export, whose text is not in the
-            # target tab at all but IS in another one. Whatever happened to
-            # its record, an edit confined to this tab cannot reach it, so it
-            # is neither a ghost (nobody is told their comment vanished) nor a
-            # reason to refuse (codex, final round). The quote must be absent
-            # from THIS tab entirely — if it stands here, the anchor may be
-            # here too, and then the refusal is the honest answer.
-            quote = (c.get("quotedFileContent") or {}).get("value")
-            if quote and other_tabs and not _count_quote_in_tab(
-                    doc_tab, quote):
-                if any(_count_quote_occurrences(o, quote)
-                       or _count_text_in_aux_segments(o, quote)
-                       for o in other_tabs):
-                    in_other_tabs += 1
-                    continue
-            # Not provable, so nothing is scoped: a thread missing from the
-            # export has no span in document.xml, and there are no coordinates
-            # to confine the refusal to.
-            problems.append(
-                f"comment {_comment_label(c, file_id)} is missing from the export "
-                f"(ghost thread or stale export — indistinguishable)")
+        # Every witness of a thread that reaches here is present: one missing
+        # witness makes it a ghost (`_split_off_ghosts`).
     unknown = {k for k in docx_keys if k not in live_keys}
     if unknown:
         # Global. An export record the API does not know means the export and
@@ -4323,15 +4183,11 @@ def _account_anchored_comments(anchored, records, spans, *, universe,
         "docx_comment_entries": len(records),
         "anchor_spans": len(spans),
         "anchors_outside_body": outside_body,
-        # threads whose text lives in another tab entirely: an edit
-        # confined to this tab cannot reach them
-        "threads_in_other_tabs": in_other_tabs,
+        # open threads with no record in the export: ghosts, which have no
+        # say in the work. A count for diagnosis, nothing that asks anybody
+        # to act on it.
+        "ghost_threads_ignored": ghosts_ignored,
     }
-    if ghosts:
-        # carried in the metrics rather than a third return value: every
-        # caller and test unpacks two, and a vanished thread is diagnosis,
-        # not a decision anybody downstream re-makes
-        metrics["ghosts"] = ghosts
     return problems, metrics
 
 
@@ -4552,21 +4408,6 @@ def _anchor_map_remedy(shown):
                 "одному треду чужая примета не помогает. Потом повторите "
                 "команду. Отвечать пачкой без пауз нельзя — ответы снова "
                 "попадут в одну секунду.")
-    if "missing from the export" in shown:
-        # A thread the export does not carry AND we could not prove harmless.
-        # «Переоткрыть» is nonsense for it (it was never closed), and telling
-        # the person to delete somebody's comment is not ours to say. What
-        # actually helps: it is the newest thing in the document, so nothing
-        # in the export dates later than it — one reply anywhere, or a minute
-        # of waiting, and the next run has its bearings (#34, #46).
-        return ("Комментарий, названный выше, есть в списке комментариев, но "
-                "не доехал до выгрузки документа, а более свежих записей в "
-                "ней нет — значит отличить «он потерял привязку» от «выгрузка "
-                "просто старше него» пока нечем. Ответьте в любой другой тред "
-                "или подождите минуту и повторите команду. Если этот "
-                "комментарий оставлен не через интерфейс Google Docs, он к "
-                "тексту не привязан вовсе — тогда его можно удалить, и он "
-                "перестанет мешать.")
     if any(m in shown for m in ("no comments.xml entry", "unknown to the API",
                                 "stale export", "without a w:id",
                                 "anchor spans in document.xml")):
@@ -4668,9 +4509,8 @@ def _attribute_records_to_threads(anchored, records, universe):
     anchors of one thread an operation would cover.
     """
     live = [c for c in anchored if not c.get("resolved")]
-    out = {}
+    threads = []
     for c in live:
-        cid = c.get("id")
         keys = set()
         entries = [c] + [r for r in (c.get("replies") or [])
                          if not r.get("deleted")]
@@ -4679,7 +4519,15 @@ def _attribute_records_to_threads(anchored, records, universe):
             created = entry.get("createdTime")
             if author and created:
                 keys.add((author, _trunc_seconds(created)))
-        witnesses = {k for k in keys if universe.get(k) == {cid}}
+        threads.append((c.get("id"), keys))
+    # Ghosts are struck out of key ownership exactly as the accounting does,
+    # or a live thread sharing a second with a ghost would stay unnamed here
+    # while the accounting has already let it through.
+    _ghosts, owners = _split_off_ghosts(
+        threads, {(r["author"], r["date_sec"]) for r in records}, universe)
+    out = {}
+    for cid, keys in threads:
+        witnesses = {k for k in keys if owners.get(k) == {cid}}
         if not witnesses:
             continue
         for r in records:
@@ -5074,18 +4922,13 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
         # is confined to the tables instead of the document (r8).
         global_problems, table_blocked = _fence_off_tables(
             global_problems, doc_tab)
-        # A thread that vanished from the export has no anchor left to
-        # protect, so it no longer freezes the document — but where its old
-        # text still stands is fenced, in case it is alive and merely missing
-        # (#34).
-        ghost_blocked = _fence_off_ghosts(metrics.get("ghosts") or ())
         # One interval per range. The same cell can be fenced twice — the
         # parser and the accounting report the same hidden marker separately —
         # and a duplicate costs a second walk in `_blocked_hits` for every
         # operation, a second candidate in `_narrow_replace`, and a receipt
         # that overcounts what was refused (code review r11).
         blocked = _dedupe_blocked(
-            blocked + table_blocked + amb_blocked + ghost_blocked)
+            blocked + table_blocked + amb_blocked)
         if global_problems:
             shown = "; ".join(str(p) for p in global_problems[:4])
             _abort(
@@ -5133,8 +4976,7 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
     return ({"anchors": anchors, "fp1": fp1, "canary": canary,
              "r1": canary["r1"], "metrics": metrics, "blocked": blocked,
              "attribution": attribution, "cell_anchor_tables": cell_tables,
-             "thread_places": thread_places,
-             "ghosts": metrics.get("ghosts") or []}, None)
+             "thread_places": thread_places}, None)
 
 
 def _canary_insert_ambiguous(docs_service, file_id, canary, reason):
@@ -7048,7 +6890,7 @@ def _replace_around_plan(doc_tab, r, snap, named_intervals, closed_present):
 
 
 def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
-                          warnings=None, expect_occurrences=None):
+                          expect_occurrences=None):
     """Apply ONE op on a commented doc.
 
     Inserts: fresh read, re-resolve, pinned batch (C5 verified safe).
@@ -7189,12 +7031,6 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
         if snap is None:
             last_reason = retry_reason
             continue
-        if warnings is not None:
-            # Collected for the caller to print ONCE. A vanished thread is a
-            # property of the document, not of this operation — repeating it
-            # per op would be ten copies of the same line on a ten-edit file.
-            for g in snap.get("ghosts") or ():
-                warnings.setdefault(g.get("id"), g)
         canary = snap["canary"]
 
         def _canary_msg(msg, cleaned):
@@ -8196,7 +8032,8 @@ def _dry_decide_by_thread(index, source, op, anchored, thread_state):
 
 
 def decide_op(item, *, doc_tab, anchored, thread_state=None,
-              early=None, blocked_all=None, blocked_writers=None):
+              early=None, blocked_all=None, blocked_writers=None,
+              anchors_live=None):
     """Вердикт по одной операции — без писателя, выгрузки и канарейки.
 
     Два глобальных ограждения писателя действуют на РАЗНОЕ, и путать их
@@ -8253,6 +8090,14 @@ def decide_op(item, *, doc_tab, anchored, thread_state=None,
     # строится вовсе, а все их ограды — предложения по точке — решаются по
     # снимку. Настоящая замена без карты неразрешима.
     if r["kind"] == "insert" or item["insertion"]:
+        return _dry_verdict(index, source, "would_apply")
+    if anchors_live is False:
+        # Every open thread with a quote is missing from the export — ghosts,
+        # closed threads or both. The writer still takes the per-op path and
+        # still builds the map, but it will find nothing on it to protect,
+        # and ghosts have no say in the work (owner, 2026-10-06). Before
+        # this, a document left with only ghosts got `unknown` on every
+        # replace, and the agent stopped trusting the dry run (06.10).
         return _dry_verdict(index, source, "would_apply")
     return _dry_verdict(index, source, "unknown",
                         reason="fresh_anchor_map_requires_canary")
@@ -8497,15 +8342,18 @@ def compile_index_plan(prepared):
                           thread_state=prepared.get("thread_state"),
                           early=early.get(it["index"]),
                           blocked_all=blocked_all,
-                          blocked_writers=blocked_writers)
+                          blocked_writers=blocked_writers,
+                          anchors_live=prepared.get("anchors_live"))
                 for it in items]
 
     # Дальше — только заякоренный путь. На чистом документе все операции
     # разрешаются по ОДНОМУ снимку и уходят одним атомарным батчем в обратном
     # порядке индексов, поэтому вердикт поздней правки не может зависеть от
     # ранней. Зависимость по уникальности была свойством `replaceAllText`,
-    # который искал текст в момент записи; его больше нет.
-    if not anchored:
+    # который искал текст в момент записи; его больше нет. Документ, где
+    # остались одни призраки и закрытые треды, писатель правит так же
+    # (`_no_live_anchor_snapshot`), и прогноз для него тот же.
+    if not anchored or prepared.get("anchors_live") is False:
         return verdicts
 
     _dry_thread_order_gate(items, verdicts)
@@ -8562,7 +8410,9 @@ def _dry_receipt(doc_id, prepared, verdicts):
         # Каким путём пойдёт запись, решает документ целиком, и от этого
         # зависит половина вердиктов. Без этой строки читающий квитанцию не
         # поймёт, почему обычная замена оказалась `unknown`.
-        "doc_strategy": ("anchor-safe-per-op" if prepared["anchored"]
+        "doc_strategy": ("anchor-safe-per-op"
+                         if prepared["anchored"]
+                         and prepared.get("anchors_live") is not False
                          else "index-atomic"),
         "writes_performed": 0,
         "summary": _dry_summary(verdicts),
@@ -8570,12 +8420,86 @@ def _dry_receipt(doc_id, prepared, verdicts):
     }
 
 
+def _ghosts_by_plain_export(drive_service, file_id, anchored, universe):
+    """Open anchored threads and which of them are ghosts, by one plain read.
+
+    Returns (open_ids, ghost_ids), or None when the export cannot be read —
+    then the caller keeps whatever it did before, since a guess here would be
+    a promise. A plain export has no canary and may be stale: a thread made
+    seconds ago can look like a ghost here. Used only where that costs an
+    advisory or a count, never a write.
+    """
+    threads = []
+    for c in anchored:
+        if c.get("resolved"):
+            continue
+        keys = set()
+        for entry in [c] + [r for r in (c.get("replies") or [])
+                            if not r.get("deleted")]:
+            author = (entry.get("author") or {}).get("displayName")
+            created = entry.get("createdTime")
+            if author and created:
+                keys.add((author, _trunc_seconds(created)))
+        threads.append((c.get("id"), keys))
+    if not threads:
+        return [], set()
+    try:
+        docx_bytes = drive_service.files().export(
+            fileId=file_id,
+            mimeType="application/vnd.openxmlformats-officedocument"
+                     ".wordprocessingml.document").execute()
+        records, problems = _docx_comment_records(docx_bytes)
+        spans, span_problems, _census = _parse_docx_anchor_spans(docx_bytes)
+    except Exception:                                           # noqa: BLE001
+        return None
+    if problems or span_problems:
+        return None
+    # A comment marker in the text with no record in comments.xml is an
+    # anchor nobody can name; the writer fences it. Not «all ghosts» then.
+    if {sp.get("docx_id") for sp in spans} - {r["docx_id"] for r in records}:
+        return None
+    exported = {(r["author"], r["date_sec"]) for r in records}
+    if any(not a or _rfc3339_epoch(d) is None for a, d in exported):
+        return None
+    ghosts, _owners = _split_off_ghosts(threads, exported, universe)
+    # Every record must belong to an open thread that is not a ghost — the
+    # same reading the writer makes. A record of a closed thread is a stale
+    # export there («unknown to the API»), and a record whose every claimant
+    # turned out a ghost is an anchor nobody can name, which the writer
+    # keeps protected. Either way the honest answer here is «cannot tell»,
+    # not «all ghosts» (code review, rounds 1 and 2).
+    owned = set()
+    for cid, keys in threads:
+        if cid not in ghosts:
+            owned |= keys
+    if exported - owned:
+        return None
+    return [cid for cid, _keys in threads], ghosts
+
+
+def _dry_anchors_live(drive_service, file_id, anchored, universe):
+    """Is any open anchored thread actually in the document?
+
+    False when every open thread with a quote is a ghost (or there is none),
+    True when at least one is in the export, None when the export cannot be
+    read — then the dry run stays at `unknown` on replaces, as before.
+    """
+    split = _ghosts_by_plain_export(drive_service, file_id, anchored,
+                                    universe)
+    if split is None:
+        return None
+    open_ids, ghosts = split
+    return any(cid not in ghosts for cid in open_ids)
+
+
 def dry_run_patch(file_id, ops_path, tab_id=None, output=None):
     """Холостой прогон `patch`: только чтение, ни одной записи.
 
     Снимок берётся читающими вызовами, и других здесь нет. Ни писатель, ни
-    выгрузка docx, ни канарейка, ни отправка ответов в этот граф вызовов не
-    входят.
+    канарейка, ни отправка ответов в этот граф вызовов не входят. Выгрузка
+    docx — одна, читающая и только на заякоренном документе: по ней видно,
+    остались ли в документе живые треды или одни призраки
+    (`_dry_anchors_live`).
     """
     file_id = _extract_doc_id(file_id)
 
@@ -8607,12 +8531,26 @@ def dry_run_patch(file_id, ops_path, tab_id=None, output=None):
         docs_service = get_docs_service(creds)
         drive_service = get_drive_service(creds)
         doc = _safe_get_doc(docs_service, file_id)
-        raw, anchored, _fp, _universe = _census_comments(
+        raw, anchored, _fp, universe = _census_comments(
             drive_service, file_id)
     except Exception as exc:                                    # noqa: BLE001
         _error(f"dry-run read failed: {exc}")
     prepared = prepare_patch(doc, ops, tab_id=tab_id,
                              anchored=bool(anchored), comments=raw)
+    if anchored:
+        prepared["anchors_live"] = _dry_anchors_live(
+            drive_service, file_id, anchored, universe)
+        early = _dry_early_refusals(prepared["items"],
+                                    prepared["doc_tab"] or {})
+        if prepared["anchors_live"] is False and not any(
+                _op_writes_on_clean_path(
+                    it["resolved"], it["noop"],
+                    it["late_bound"] or it["index"] in early
+                    or it["deferred"] is not None)
+                for it in prepared["items"]):
+            # Nothing for the clean-doc batch to carry: the writer stays on
+            # the per-op path, and so does the forecast.
+            prepared["anchors_live"] = None
     verdicts = compile_index_plan(prepared)
     receipt = _dry_receipt(file_id, prepared, verdicts)
     _emit_json(receipt, output=output,
@@ -8641,6 +8579,78 @@ def _emit_patch_receipt(result, output):
                summary={"action": result["action"],
                         "ops_applied": result.get("ops_applied"),
                         "doc_id": result.get("doc_id")})
+
+
+def _op_writes_on_clean_path(r, noop, excluded):
+    """Will the clean-doc batch carry a request for this op? One predicate
+    for the writer and the dry run, so the strategy they name is the same.
+    An empty insert writes nothing, though it is not a `noop` on the writer's
+    books (code review r3)."""
+    if r is None or noop or excluded:
+        return False
+    return not (r["kind"] == "insert" and not r.get("text"))
+
+
+def _no_live_anchor_snapshot(docs_service, drive_service, file_id, doc,
+                             doc_tab, tid, anchored, fp1, universe):
+    """A canary-proven map showing no live anchor at all, or None.
+
+    A document whose comments are only ghosts and closed threads has nothing
+    on it to protect: ghosts have no anchor, closed threads are not in the
+    export for any path to protect. It is to be edited like a document with
+    no comments — ONE atomic batch, not one canary per operation (owner,
+    2026-10-06: ghosts have no say in the work; code review: the per-op
+    path was the last difference). Proving it takes the same canary the
+    per-op path uses, once.
+
+    A plain export is read first and the canary is spent only when it shows
+    no live thread. Any doubt — an unreadable export, a live thread on the
+    fresh map, a fence, a race — cleans up and returns None, and the caller
+    goes the per-op way as before. On success the canary STAYS: the caller
+    deletes it as the first request of its batch, pinned to `snap["r1"]`.
+    """
+    split = _ghosts_by_plain_export(drive_service, file_id, anchored,
+                                    universe)
+    if split is None:
+        return None
+    open_ids, ghosts = split
+    if any(cid not in ghosts for cid in open_ids):
+        return None
+    body_content = (doc_tab.get("body", {}) or {}).get("content", [])
+    body_end = body_content[-1]["endIndex"] if body_content else 2
+    named_intervals = _named_range_intervals(doc_tab)
+    global _RAISE_ERRORS
+    before = _RAISE_ERRORS
+    _RAISE_ERRORS = True
+    try:
+        snap, _why = _fresh_anchor_snapshot(
+            docs_service, drive_service, file_id, doc, doc_tab, anchored,
+            named_intervals, body_end, fp1=fp1, universe=universe, tid=tid)
+    except PatchOpError as e:
+        # The snapshot cleans its canary before raising; when it could not —
+        # or could not even tell whether the canary landed — the message says
+        # so in words. Then nothing more is written: the per-op path would
+        # go on editing a document with a stray service line in it (code
+        # review r3).
+        if "ВНИМАНИЕ" in str(e):
+            _RAISE_ERRORS = before
+            _error(str(e))
+        return None
+    finally:
+        _RAISE_ERRORS = before
+    if snap is None:
+        return None
+    m = snap["metrics"]
+    live = m.get("api_threads_accounted", 0) - m.get("ghost_threads_ignored",
+                                                     0)
+    if live or snap["anchors"] or snap["blocked"]:
+        if not _cleanup_canary(docs_service, file_id, snap["canary"]):
+            _error(f"служебную строку убрать не удалось, правки не "
+                   f"отправлены. ВНИМАНИЕ: в конце документа осталась "
+                   f"служебная строка «{snap['canary']['text']}» — удалите "
+                   f"её вручную (данные не потеряны).")
+        return None
+    return snap
 
 
 def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None):
@@ -8833,18 +8843,31 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None):
     finally:
         _RAISE_ERRORS = False
 
-    _all, anchored, _, _ = _census_comments(drive_service, file_id)
+    _all, anchored, fp1, universe = _census_comments(drive_service, file_id)
+    # A document whose comments are only ghosts and closed threads is edited
+    # like one with no comments at all — one atomic batch (owner, 2026-10-06).
+    # The proof costs a canary, so it is spent only when there is something
+    # to write.
+    no_live = None
+    if anchored and any(_op_writes_on_clean_path(
+            r, noops[i], i in early_refusals or i in late_bound)
+            for i, r in enumerate(resolved)):
+        no_live = _no_live_anchor_snapshot(
+            docs_service, drive_service, file_id, doc, doc_tab, tid,
+            anchored, fp1, universe)
 
-    if not anchored:
+    if not anchored or no_live is not None:
         # ---- clean-doc path: single atomic index-based batch ----
-        # Second census immediately before the destructive batch narrows the
-        # race window (a comment added in between would change the strategy).
-        _, anchored2, _, _ = _census_comments(drive_service, file_id)
-        if anchored2:
-            _error(
-                "an anchored comment appeared while preparing the patch; "
-                "re-run — the doc now requires the anchor-safe strategy"
-            )
+        if no_live is None:
+            # Second census immediately before the destructive batch narrows
+            # the race window (a comment added in between would change the
+            # strategy).
+            _, anchored2, _, _ = _census_comments(drive_service, file_id)
+            if anchored2:
+                _error(
+                    "an anchored comment appeared while preparing the patch; "
+                    "re-run — the doc now requires the anchor-safe strategy"
+                )
         # A deferred op cannot be rescued here: this path writes ONE atomic
         # batch against the planning snapshot, with no live re-read to resolve
         # it against later. It joins the refusals, and the batch carries the
@@ -8855,9 +8878,12 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None):
             # нечего по определению: карты не существует, потому что не
             # существует якорей.
             skipped.setdefault(i, (
-                f"в документе нет заякоренных комментариев — правку по "
-                f"треду адресовать не к чему. "
-                f"({_op_source_label(ops[i], None)})"))
+                ("тред не привязан к тексту документа — правку по нему "
+                 "адресовать не к чему. "
+                 if no_live is not None else
+                 "в документе нет заякоренных комментариев — правку по "
+                 "треду адресовать не к чему. ")
+                + f"({_op_source_label(ops[i], None)})"))
             early_diag.setdefault(i, ("comment_thread_unresolvable",
                                       {"comment_id":
                                        ops[i].get("comment_id")}))
@@ -8894,19 +8920,67 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None):
                 requests += _scope_requests(
                     [{"insertText": {"location": {"index": r["start"]},
                                      "text": r["text"]}}], r["tab_id"])
+        pin = revision_id
+        if no_live is not None:
+            canary = no_live["canary"]
+
+            def _canary_left(msg):
+                if not _cleanup_canary(docs_service, file_id, canary):
+                    msg += (f" ВНИМАНИЕ: в конце документа осталась "
+                            f"служебная строка «{canary['text']}» — удалите "
+                            f"её вручную (данные не потеряны).")
+                return msg
+
+            if not requests:
+                left = _canary_left("")
+                if left:
+                    _error("правки ничего не записали. " + left.strip())
+            else:
+                # The comments must not have moved between the census the
+                # map was built on and this write — same check as the per-op
+                # path and `sync`.
+                try:
+                    fp2 = _comments_fingerprint(drive_service, file_id)
+                except Exception as e:                          # noqa: BLE001
+                    _error(_canary_left(
+                        f"final comment census failed (nothing applied): "
+                        f"{getattr(e, 'reason', e)}"))
+                if fp2 != no_live["fp1"]:
+                    _error(_canary_left(
+                        "comments changed while preparing the patch — "
+                        "re-run (nothing applied)"))
+                # The canary sits strictly at the end, so deleting it first
+                # restores the planning coordinates for every other request.
+                requests = [_canary_delete_request(canary)] + requests
+                pin = no_live["r1"]
         if requests:
             try:
                 docs_service.documents().batchUpdate(
                     documentId=file_id,
                     body={"requests": requests,
-                          "writeControl": _write_control(revision_id)},
+                          "writeControl": _write_control(pin)},
                 ).execute()
             except HttpError as e:
                 reason = e.reason if hasattr(e, "reason") else str(e)
+                status = getattr(getattr(e, "resp", None), "status", None)
+                if no_live is not None and (status is None or status >= 500):
+                    msg, _state = _ambiguous_batch_outcome(
+                        docs_service, file_id, no_live["canary"],
+                        f"batchUpdate failed: {reason}")
+                    _error(msg)
+                if no_live is not None:
+                    reason = _canary_left(reason)
                 _error(
                     f"batchUpdate failed (possibly revision conflict): {reason}. "
                     f"Re-read the doc and retry."
                 )
+            except Exception as e:                              # noqa: BLE001
+                if no_live is None:
+                    raise
+                msg, _state = _ambiguous_batch_outcome(
+                    docs_service, file_id, no_live["canary"],
+                    f"batchUpdate failed (transport): {e}")
+                _error(msg)
         result = {
             "action": "patched" if not skipped else "partially-patched",
             "strategy": "index-atomic",
@@ -8921,6 +8995,12 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None):
             # названию стратегии.
             "affected_comment_ids": [],
         }
+        if no_live is not None:
+            # Closed threads are not in the export, so no path maps them —
+            # the per-op receipt names them the same way (`unknown_ids`).
+            closed = [c.get("id") for c in anchored if c.get("resolved")]
+            if closed:
+                result["closed_threads_unmapped"] = closed
         if skipped:
             result["refused"] = [
                 _with_diag(
@@ -8952,7 +9032,6 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None):
         )
 
     applied, op_notes, refused = [], [], []
-    ghosts = {}
     # Треды, которых уже коснулись правки этого прогона. Правка по треду,
     # чей разговор уже сдвинут соседней операцией, отклоняется: её адрес —
     # тред, и любой текст под ним для неё законен, так что она молча накрыла
@@ -9007,7 +9086,6 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None):
             try:
                 note = _apply_op_anchor_safe(
                     docs_service, drive_service, file_id, op, tab_id,
-                    warnings=ghosts,
                     # Номер вхождения осмыслен только вместе с числом копий,
                     # а копию мог унести любой сосед по файлу.
                     expect_occurrences=(
@@ -9120,21 +9198,6 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None):
             # об одном прогоне.
             result["action"] = "partially-patched"
             result["text_applied_reply_pending"] = True
-    if ghosts:
-        # Named, never removed: deleting somebody's comment is the person's
-        # decision (CONTRACT §2.2). Before #34 each of these stopped every
-        # replace in the document instead.
-        result["ghost_threads"] = [
-            {"id": g.get("id"), "link": g.get("link"), "quote": g.get("quote"),
-             "note": ("комментарий пропал из документа — якоря у него больше "
-                      "нет, на правки он не влияет. Убрать его можно вручную: "
-                      "«Удалить» в панели комментариев"
-                      if not g.get("fenced") else
-                      "комментарий пропал из выгрузки, но текст, на котором он "
-                      "висел, ещё в документе — правки этого места отклонены, "
-                      "остальной документ правится. Посмотрите тред по ссылке: "
-                      "он либо потерял привязку, либо цел, и это видно глазами")}
-            for g in ghosts.values()]
     if refused:
         result["refused"] = refused
     if failed_at is not None:
@@ -11656,6 +11719,20 @@ def _style_requests_for_block(el, start_index, preserve=None):
     return reqs
 
 
+def _sync_ghost_count(snap, drive_service, file_id, anchored, universe):
+    """How many of the document's comments are ghosts — not on it for the
+    person (owner, 2026-10-06). The accounting already knows when it ran (a
+    replace or a delete); an insert- or style-only sync has no map, so one
+    plain read answers, and an unreadable one counts none."""
+    if snap is not None:
+        return snap["metrics"].get("ghost_threads_ignored", 0)
+    if not any(not c.get("resolved") for c in anchored):
+        return 0
+    split = _ghosts_by_plain_export(drive_service, file_id, anchored,
+                                    universe)
+    return len(split[1]) if split else 0
+
+
 def sync_doc(file_id, md_path, tab_id=None):
     """Three-way merge of an edited local markdown back into a Google Doc.
 
@@ -12471,7 +12548,8 @@ def sync_doc(file_id, md_path, tab_id=None):
         "deleted": len(deleted) - len(moved_src),
         "style_only": len(style_only),
         "styled_blocks": styled,
-        "comments_on_doc": len(all_comments),
+        "comments_on_doc": len(all_comments) - _sync_ghost_count(
+            snap, drive_service, file_id, anchored, universe),
         "advanced": advanced,
     }
     if snap is not None:
@@ -12874,8 +12952,17 @@ def update_doc(file_id, file_path, title=None, no_highlights=False,
         _error(f"cannot access file: {e.reason if hasattr(e, 'reason') else e}")
     folder_id = (meta.get("parents") or [None])[0]
 
-    all_comments, _anchored, _fp, _u = _census_comments(drive_service,
-                                                        file_id)
+    all_comments, anchored, _fp, universe = _census_comments(drive_service,
+                                                             file_id)
+    # What the person would actually lose: a ghost is not in the document for
+    # them, and counting it here made agents ask about comments nobody can
+    # see (08.09: twelve such threads, and the pressure ended in deleting
+    # them). Best effort — if the export cannot be read, the count stays the
+    # API's.
+    split = _ghosts_by_plain_export(drive_service, file_id, anchored,
+                                    universe)
+    ghost_n = len(split[1]) if split else 0
+    comments_n = len(all_comments) - ghost_n
     named_ranges = []
     try:
         pre_doc = _safe_get_doc(docs_service, file_id)
@@ -12888,7 +12975,7 @@ def update_doc(file_id, file_path, title=None, no_highlights=False,
                f"{e.reason if hasattr(e, 'reason') else e}")
 
     if not create_new and not replace_existing:
-        _update_mode_required(meta, len(all_comments), named_ranges)
+        _update_mode_required(meta, comments_n, named_ranges)
 
     if create_new:
         # Ничего не разрушается, поэтому ни базы, ни согласия здесь не нужно.
@@ -13064,7 +13151,7 @@ def update_doc(file_id, file_path, title=None, no_highlights=False,
             "--acknowledge-loss consumed a one-time consent: this document, "
             "this run. Before replacing any other document, ask the person "
             "again, name that document, and wait for a fresh explicit yes."),
-        "comments_lost": len(all_comments),
+        "comments_lost": comments_n,
         "named_ranges_lost": sorted(named_ranges),
     }
     if outcome != "replaced":

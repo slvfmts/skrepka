@@ -545,27 +545,6 @@ def test_the_snapshot_keeps_only_the_target_tabs_anchors(engine, monkeypatch):
 
 # --- узкие места: призрак и метки ---------------------------------------
 
-def test_a_thread_alive_in_another_tab_is_not_called_a_ghost(engine):
-    """Знак «текста больше нет» — про ДОКУМЕНТ, а не про целевую вкладку.
-
-    Читая только целевую вкладку, вердикт объявляет мёртвым любой тред
-    соседней: цитаты здесь нет, ограда выходит пустой, и человеку пишут,
-    что его комментарий пропал, снимая с него защиту.
-    """
-    thread = {"id": "c9", "createdTime": "2026-08-18T10:00:00Z",
-              "quotedFileContent": {"value": "ПОВТОР"}}
-    records = [{"author": "Аня", "date_sec": "2026-08-18T12:00:00Z"}]
-    target = _tab_body("t.втор", "Чистовик", ["другое", ""])["documentTab"]
-    neighbour = _tab_body("t.0", "Черновик", ["ПОВТОР", ""])["documentTab"]
-
-    alone = engine._ghost_verdict(thread, records, target, "F")
-    assert alone is not None, "без соседей это ровно призрак"
-
-    with_neighbour = engine._ghost_verdict(thread, records, target, "F",
-                                           other_tabs=[neighbour])
-    assert with_neighbour is None
-
-
 def test_mark_sends_its_request_through_the_write_gate(engine, monkeypatch):
     doc = {"revisionId": "R0",
            "tabs": [_tab_body("t.0", "Черновик", ["раз", ""]),
@@ -682,33 +661,49 @@ def test_a_row_of_a_different_width_breaks_the_proof(engine, make_docx):
     assert why and "клеток сетки" in why
 
 
-def test_a_thread_living_only_in_another_tab_does_not_block(engine):
-    """Тред, пропавший из выгрузки, но чей текст жив в СОСЕДНЕЙ вкладке.
-
-    Правка, запертая в целевой вкладке, до него не дотянется, поэтому он
-    не призрак (человеку не говорят, что комментарий исчез) и не повод
-    отказывать.
-    """
+def test_a_live_thread_in_another_tab_is_never_taken_for_a_ghost(engine):
+    """Обратная сторона: тред, чья запись в выгрузке ЕСТЬ, жив, в какой бы
+    вкладке ни стоял его текст. Он учитывается, а не списывается в призраки,
+    и его якорь дальше разводится по вкладкам обычным путём."""
     thread = {"id": "c9", "createdTime": "2026-08-18T10:00:00Z",
               "author": {"displayName": "Аня"}, "replies": [],
               "quotedFileContent": {"value": "ПОВТОР"}}
     target = _tab_body("t.втор", "Чистовик", ["другое", ""])["documentTab"]
     neighbour = _tab_body("t.0", "Черновик", ["ПОВТОР", ""])["documentTab"]
     key = ("Аня", engine._trunc_seconds("2026-08-18T10:00:00Z"))
-    universe = {key: {"c9"}}
+    records = [{"docx_id": "0", "author": "Аня", "date_sec": key[1]}]
+    spans = [{"docx_id": "0", "start": 0, "end": 6, "text": "ПОВТОР"}]
 
     problems, metrics = engine._account_anchored_comments(
-        [thread], [], [], universe=universe, file_id="F", doc_tab=target,
-        other_tabs=[neighbour])
+        [thread], records, spans, universe={key: {"c9"}}, file_id="F",
+        doc_tab=target, other_tabs=[neighbour])
     assert problems == []
-    assert metrics["threads_in_other_tabs"] == 1
+    assert metrics["ghost_threads_ignored"] == 0
+    assert metrics["api_threads_accounted"] == 1
+    assert metrics["anchor_spans"] == 1
 
-    # тот же тред, но его текст стоит и в целевой вкладке — отказ остаётся
-    target2 = _tab_body("t.втор", "Чистовик", ["ПОВТОР", ""])["documentTab"]
-    problems2, _m = engine._account_anchored_comments(
-        [thread], [], [], universe=universe, file_id="F", doc_tab=target2,
-        other_tabs=[neighbour])
-    assert any("missing from the export" in str(p) for p in problems2)
+
+def test_a_thread_missing_from_the_export_does_not_block_in_any_tab(engine):
+    """Тред, пропавший из выгрузки, — призрак, где бы ни стоял его старый
+    текст: в соседней вкладке, в целевой или в обеих. Выгрузка несёт все
+    вкладки (M19-1), и тред с якорем в ней был бы. Раньше текст в целевой
+    вкладке оставлял отказ.
+    """
+    thread = {"id": "c9", "createdTime": "2026-08-18T10:00:00Z",
+              "author": {"displayName": "Аня"}, "replies": [],
+              "quotedFileContent": {"value": "ПОВТОР"}}
+    neighbour = _tab_body("t.0", "Черновик", ["ПОВТОР", ""])["documentTab"]
+    key = ("Аня", engine._trunc_seconds("2026-08-18T10:00:00Z"))
+    universe = {key: {"c9"}}
+
+    for target_text in ("другое", "ПОВТОР"):
+        target = _tab_body("t.втор", "Чистовик",
+                           [target_text, ""])["documentTab"]
+        problems, metrics = engine._account_anchored_comments(
+            [thread], [], [], universe=universe, file_id="F",
+            doc_tab=target, other_tabs=[neighbour])
+        assert problems == []
+        assert metrics["ghost_threads_ignored"] == 1
 
 
 def test_a_hidden_api_cell_with_text_breaks_the_proof(engine, make_docx):
