@@ -150,7 +150,13 @@ def test_technical_reference_points_back_and_is_current():
     tech = (ROOT / "docs" / "LIMITATIONS-TECHNICAL.md").read_text(
         encoding="utf-8")
     assert "LIMITATIONS.md" in tech
-    assert "0.18" in tech.splitlines()[2]
+    # Сверка с версией пакета, а не с зашитой строкой: строка устаревала на
+    # каждом выпуске и проверяла только то, что её не забыли поправить вместе
+    # с тестом.
+    from skrepka import __version__
+    assert f"Актуально для {__version__}." in tech.splitlines()[2]
+    human = (ROOT / "docs" / "LIMITATIONS.md").read_text(encoding="utf-8")
+    assert f"Актуально для {__version__}." in human
 
 
 def test_update_is_described_by_what_it_requires_and_costs():
