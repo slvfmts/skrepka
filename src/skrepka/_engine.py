@@ -2889,8 +2889,8 @@ def _tab_boundary_refusal(why):
             f"которые что-то удаляют, в этой вкладке отклонены. Это "
             f"свойство структуры документа, а не гонка: повтор не поможет. "
             f"Вставки (insert_*) и правки, которые только дописывают текст, "
-            f"работают — они якорей не трогают; во вкладке без комментариев "
-            f"правки идут как обычно")
+            f"работают — карта якорей им не нужна; дописать блок в конец "
+            f"вкладки можно командой `append`")
 
 
 def _prove_target_segment(outline, tabs, tid, canary_text=None):
@@ -3868,8 +3868,22 @@ def _trunc_seconds(ts):
 # и больше абзацев: «1 реакция» и по строке на поставившего — «Светлана
 # Дюмаева – 🎇 | 08.09.2026, 12:08 UTC». У неё свои маркеры в document.xml,
 # а в `comments.list` её нет вовсе: API реакции комментариями не считает.
-_REACTION_HEAD = re.compile(r"^\d+\s+\S+$")
-_REACTION_LINE = re.compile(r"^.+\s[\u2013\u2014-]\s.+\|.+$")
+_REACTION_HEAD = re.compile(r"^\d{1,4} \w+$")
+_REACTION_LINE = re.compile(
+    r"^(?P<who>[^|\u2013\u2014]+?) [\u2013\u2014-] (?P<what>[^|]+?) \| "
+    r"(?P<when>[^|]*\d[^|]*)$")
+
+
+def _emoji_only(text):
+    """Только эмодзи (и их соединители), ни буквы, ни цифры."""
+    text = text.replace(" ", "")
+    if not text:
+        return False
+    for ch in text:
+        cat = unicodedata.category(ch)
+        if cat[0] in "LN" or cat == "Zs":
+            return False
+    return True
 
 
 def _docx_reaction_ids(z):
@@ -3878,8 +3892,11 @@ def _docx_reaction_ids(z):
     Реакция — не тред: разговора у неё нет, человек ничего не теряет, и
     документ из-за неё не запирается (раньше её ключ без автора попадал в
     «неизвестные API записи» и останавливал все замены на месяц). Признак
-    узкий намеренно: нет автора И текст целиком из заголовка «N слово» и строк
-    «имя – эмодзи | дата». Комментарий живого человека автора имеет всегда.
+    узкий намеренно: нет автора, заголовок «N слово», и КАЖДАЯ следующая
+    строка — «имя – только эмодзи | дата с цифрами». Запись без автора, не
+    подошедшая под признак, не выбрасывается: учёт огораживает её место как
+    неизвестную API (`_account_anchored_comments`). Ошибка в эту сторону
+    стоит локального отказа, в обратную — потерянной защиты треда.
     `z` — открытый ZipFile выгрузки.
     """
     import xml.etree.ElementTree as ET
@@ -3905,8 +3922,9 @@ def _docx_reaction_ids(z):
             text = " ".join(text.replace("\u00a0", " ").split())
             if text:
                 paras.append(text)
+        lines = [_REACTION_LINE.match(x) for x in paras[1:]]
         if (len(paras) >= 2 and _REACTION_HEAD.match(paras[0])
-                and all(_REACTION_LINE.match(x) for x in paras[1:])):
+                and all(m and _emoji_only(m.group("what")) for m in lines)):
             found.add(cid)
     return frozenset(found)
 
@@ -4229,8 +4247,9 @@ def _account_anchored_comments(anchored, records, spans, *, universe,
         # blocks the whole document (`_scope_anchor_problems`).
         ids = sorted({r["docx_id"] for r in records
                       if (r["author"], r["date_sec"]) in unknown}, key=str)
-        problems.append(_AnchorProblem(
-            _unknown_records_text(unknown), ids))
+        problem = _AnchorProblem(_unknown_records_text(unknown), ids)
+        problem.unlisted = True
+        problems.append(problem)
     # bijection: one span per comments.xml record, joined by w:id
     span_ids = Counter()
     for s in spans:
@@ -4376,11 +4395,30 @@ def _scope_anchor_problems(problems, anchors, attribution=None, file_id=None):
             cid = (attribution or {}).get(i)
             link = _thread_link(file_id, cid)
             who = f"треда {cid} {link}" if link else f"docx id {i}"
+            if getattr(p, "unlisted", False):
+                # У такой отметки может не быть треда вовсе (реакция чужого
+                # формата, 12.10) — совет «удалите тред» был бы ложью.
+                blocked.append((s, e, (
+                    f"{_UNLISTED_RECORD_LABEL} («{t[:40]}») — {p}. Правка, "
+                    f"которая не удаляет текст под ней, пройдёт")))
+                continue
             blocked.append((s, e, (
                 f"an unaccounted comment anchor ({who}, «{t[:40]}») — {p}. "
                 f"Разберитесь с этим тредом в UI (удалить или переоткрыть) "
                 f"или правьте этот фрагмент в интерфейсе")))
     return global_problems, blocked
+
+
+_UNLISTED_RECORD_LABEL = ("отметка комментария в выгрузке, которой нет в "
+                          "списке комментариев Google")
+
+
+def _blocked_reason(label):
+    """Код отказа по огороженному месту: у отметки, которой нет в API, свой
+    код — это не машинная пометка, и `named_range_overlap` ей врал."""
+    return ("anchor_accounting_failed"
+            if str(label).startswith(_UNLISTED_RECORD_LABEL)
+            else "named_range_overlap")
 
 
 def _table_intervals(doc_tab):
@@ -6960,7 +6998,7 @@ def _replace_around_plan(doc_tab, r, snap, named_intervals, closed_present):
         _error(
             f"эта правка задевает {label} (диапазон [{bs}, {be})) — "
             f"отклонена ИМЕННО ЭТА операция. ({source})",
-            reason="named_range_overlap",
+            reason=_blocked_reason(label),
             details={"label": label, "range": [bs, be]})
     # Довод «чужой якорь задет ровно одной частью» держится на ограде внутри
     # `_rewrite_anchor_requests`, а её нет, когда якорная часть тождественна и
@@ -7057,8 +7095,24 @@ def _replace_around_plan(doc_tab, r, snap, named_intervals, closed_present):
     return reqs, split, parts
 
 
+def _require_base_revision(doc, required):
+    """`--base` на заякоренном пути: первая запись прогона идёт только с той
+    ревизии, что в сайдкаре (ревью Codex). Сверка в начале `patch` одна не
+    закрывала окно: каждая операция перечитывает документ и закрепляется за
+    тем, что нашла, — чужая правка между сверкой и первой записью стала бы
+    новой базой молча."""
+    if required and doc.get("revisionId") != required:
+        _error(
+            "документ изменился после сверки с базой и до первой записи — "
+            "правки готовились по другому тексту. Скачайте документ заново "
+            "и повторите.",
+            reason="concurrent_edit",
+            details={"base_revision": required,
+                     "live_revision": doc.get("revisionId")})
+
+
 def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
-                          expect_occurrences=None):
+                          expect_occurrences=None, require_revision=None):
     """Apply ONE op on a commented doc.
 
     Inserts: fresh read, re-resolve, pinned batch (C5 verified safe).
@@ -7080,6 +7134,7 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
     if not kind_name.startswith("replace"):
         # ---- insert path ----
         doc = _safe_get_doc(docs_service, file_id)
+        _require_base_revision(doc, require_revision)
         tid, doc_tab = _select_tab(doc, tab_id=tab_id)
         r = _resolve_op(op, doc_tab, tid)
         _check_occurrence_stability(r, expect_occurrences)
@@ -7110,6 +7165,9 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
                 f"W8 preflight read failed: "
                 f"{e.reason if hasattr(e, 'reason') else e}",
                 state="not_applied")
+        if attempt == 0:
+            # Повтор идёт после своей же канарейки, она ревизию и сдвинула.
+            _require_base_revision(doc, require_revision)
         # A multi-tab document is no longer refused here. The export
         # carries no tab id at all (M19-4), but it does carry each tab's
         # OWN elements, and `_fresh_anchor_snapshot` proves the target
@@ -7356,7 +7414,7 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
                     f"эта замена задевает {label} (диапазон [{bs}, {be})) — "
                     f"отклонена ИМЕННО ЭТА операция, остальной документ "
                     f"правится. ({r['source']})", cleaned),
-                    reason="named_range_overlap",
+                    reason=_blocked_reason(label),
                     details={"label": label, "range": [bs, be]})
             if doomed:
                 cid, spans = doomed[0]
@@ -8926,17 +8984,14 @@ def _note_revision_drift(result, docs_service, file_id, revision_before):
     result["revision_id_before"] = revision_before
     result["revision_id_after"] = after
     if after and revision_before and after != revision_before:
-        text = ("текст документа не изменился"
-                if not result.get("ops_applied")
-                else "текст изменён только применёнными правками")
         result["revision_note"] = (
-            f"ревизия документа за время прогона сменилась. Двигает её и "
-            f"сама skrepka: каждая правка, которая что-то удаляет, вставляет "
-            f"и убирает служебную строку-канарейку для проверки свежести "
-            f"выгрузки — даже если правка отказана. По skrepka {text}. "
-            f"Отличить это от чужой правки по одной ревизии нельзя: базу "
-            f"для следующей записи снимите заново (download) и сверьте "
-            f"текст, а не номер ревизии")
+            "ревизия документа за время прогона сменилась. Двигает её и "
+            "сама skrepka: каждая правка, которая что-то удаляет, вставляет "
+            "и убирает служебную строку-канарейку для проверки свежести "
+            "выгрузки — даже когда сама правка отказана. Какие правки "
+            "применены, сказано в `applied`; чья ещё запись могла сдвинуть "
+            "ревизию, по одной ревизии не определить. Базу для следующей "
+            "записи снимите заново (download)")
 
 
 def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None,
@@ -8990,11 +9045,14 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None,
 
     revision_id = doc.get("revisionId")
     tid, doc_tab = _select_tab(doc, tab_id=tab_id)
+    base_revision = None
     if base:
         # «Скачать и сверить перед записью» — механизмом, а не дисциплиной
         # (пост-мортем Авито 12.10): документ правили после выгрузки — ни
-        # одной записи.
-        _check_replace_base(base, file_id, doc, doc_tab, purpose="patch")
+        # одной записи. Чистый путь пишет одним батчем, закреплённым за этой
+        # же ревизией; заякоренный сверяет её ещё раз перед первой записью.
+        base_revision = _check_replace_base(
+            base, file_id, doc, doc_tab, purpose="patch")["revision_id"]
 
     # Resolve every op against the current snapshot (validates targets early
     # for both paths) and classify what each one actually does.
@@ -9345,6 +9403,9 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None,
     # (пост-мортем 12.10). Здесь копятся номера копий, унесённых своими
     # применёнными заменами: цитата -> [исходные номера].
     consumed_copies = {}
+    # `--base`: до первой попытки записи документ обязан стоять на ревизии из
+    # сайдкара; после неё ревизию двигает уже сама skrepka (канарейка).
+    attempted_write = False
     failed_at, failure, app_state = None, None, None
     failed_code, failed_details = None, None
     for i, op in enumerate(ops):
@@ -9390,9 +9451,12 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None,
                     docs_service, drive_service, file_id, call_op, tab_id,
                     # Номер вхождения осмыслен только вместе с числом копий,
                     # а копию мог унести любой сосед по файлу.
-                    expect_occurrences=expect)
+                    expect_occurrences=expect,
+                    require_revision=(base_revision
+                                      if not attempted_write else None))
             finally:
                 _RAISE_ERRORS = False
+                attempted_write = True
             _note_consumed_copy(op, note, consumed_copies)
             applied.append(_op_source_label(op, resolved[i]))
             if i in deferred:
@@ -9515,6 +9579,324 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None,
         _emit_patch_receipt(result, output)
         sys.exit(3)
     _emit_patch_receipt(result, output)
+
+
+# ---------------------------------------------------------------------------
+# Append (дозапись блока с оформлением в конец вкладки)
+# ---------------------------------------------------------------------------
+#
+# Самая частая правка живого деливерабла — «допиши ниже ещё вариант» — и
+# самая безопасная: выше точки вставки не меняется ни один символ. Скрепка её
+# отдавала самописным скриптам, и они ломались при каждой доработке, унося с
+# собой все защиты (пост-мортем Авито 12.10, разбор 23.08).
+
+def _append_inline(inline):
+    """Inline-токен markdown-it → (текст, [(начало, конец, метка)]) в UTF-16.
+
+    Метки: bold, italic, link:<url>. Два пробела в конце строки — мягкий
+    перенос `\\v` (как у `upload` и `download`), одиночный перевод строки
+    внутри абзаца — пробел, как в любом markdown. Всё прочее — отказ с
+    названием конструкции, а не тихое упрощение.
+    """
+    parts, spans, active, starts = [], [], [], {}
+    pos = 0
+
+    def put(text):
+        nonlocal pos
+        parts.append(text)
+        pos += _utf16_len(text)
+
+    for tok in inline.children or []:
+        t = tok.type
+        if t == "text":
+            put(tok.content)
+        elif t == "softbreak":
+            put(" ")
+        elif t == "hardbreak":
+            put("\v")
+        elif t in ("strong_open", "em_open", "link_open"):
+            mark = ("bold" if t == "strong_open" else "italic"
+                    if t == "em_open" else f"link:{tok.attrs.get('href', '')}")
+            active.append(mark)
+            starts[mark] = pos
+        elif t in ("strong_close", "em_close", "link_close"):
+            mark = ("bold" if t == "strong_close" else "italic"
+                    if t == "em_close" else
+                    next((m for m in reversed(active)
+                          if m.startswith("link:")), None))
+            if mark in active:
+                active.remove(mark)
+                if pos > starts[mark]:
+                    spans.append((starts.pop(mark), pos, mark))
+        else:
+            return None, f"«{t}» в строке «{inline.content[:40]}»"
+    return "".join(parts), spans
+
+
+def _append_blocks(md_text):
+    """Разобрать блок для дозаписи. Возвращает (блоки, ошибка).
+
+    Блок — {"kind": "p"|"h1".."h6", "text", "spans"}. Поддержано только то,
+    что `append` умеет поставить без догадок: заголовки, абзацы и их
+    строчное оформление. Список, таблица, цитата, код, картинка — отказ до
+    всякого обращения к Google: тихо превратить их в обычный абзац значило бы
+    записать не то, что просили.
+    """
+    from markdown_it import MarkdownIt
+    # Таблицы включены в разбор нарочно: без этого GFM-таблица читается
+    # обычным абзацем с вертикальными чертами и тихо ложится в документ
+    # (ревью Codex). Здесь она должна стать отказом.
+    tokens = MarkdownIt("commonmark").enable("table").parse(md_text)
+    blocks, i = [], 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.type in ("heading_open", "paragraph_open"):
+            text, spans = _append_inline(tokens[i + 1])
+            if text is None:
+                return None, f"не поддерживается: {spans}"
+            if "\n" in text:
+                return None, "перевод строки внутри абзаца"
+            kind = tok.tag if tok.type == "heading_open" else "p"
+            blocks.append({"kind": kind, "text": text, "spans": spans})
+            i += 3
+            continue
+        names = {"bullet_list_open": "маркированный список",
+                 "ordered_list_open": "нумерованный список",
+                 "table_open": "таблица", "blockquote_open": "цитата",
+                 "fence": "блок кода", "code_block": "блок кода",
+                 "html_block": "HTML", "hr": "горизонтальная линия"}
+        return None, (f"не поддерживается: {names.get(tok.type, tok.type)}. "
+                      f"append дописывает заголовки и абзацы с полужирным, "
+                      f"курсивом и ссылками")
+    if not blocks:
+        return None, "в файле нет ни одного абзаца"
+    for b in blocks:
+        bad = _OP_TEXT_FORBIDDEN.search(b["text"])
+        if bad:
+            return None, (f"символ U+{ord(bad.group()):04X} Docs не хранит "
+                          f"как написано: «{b['text'][:40]}»")
+    return blocks, None
+
+
+def _units_by_index(doc_tab):
+    """{индекс Docs -> UTF-16 единица} по всем textRun вкладки, включая
+    ячейки таблиц. Нетекстовые элементы (картинки) занимают индексы, но
+    единиц не дают — с обеих сторон сравнения одинаково."""
+    out = {}
+    for start, _end, tr in _extract_runs_full(
+            (doc_tab.get("body", {}) or {}).get("content", [])):
+        raw = (tr.get("content") or "").encode("utf-16-le")
+        for k in range(0, len(raw), 2):
+            out[start + k // 2] = raw[k:k + 2]
+    return out
+
+
+def _para_fingerprint(doc_tab, upto):
+    """Оформление абзацев вкладки, целиком лежащих до `upto` (конец старого
+    последнего абзаца): стиль абзаца, маркер списка и стиль каждого куска
+    текста. Сверка только по тексту не увидела бы, что дозапись перекрасила
+    или превратила в список старый хвост (ревью Codex)."""
+    out = []
+    for el in (doc_tab.get("body", {}) or {}).get("content", []):
+        if "paragraph" not in el or el.get("endIndex", 0) > upto:
+            continue
+        para = el["paragraph"]
+        out.append((el.get("startIndex"), el.get("endIndex"),
+                    json.dumps(para.get("paragraphStyle") or {},
+                               sort_keys=True),
+                    json.dumps(para.get("bullet") or {}, sort_keys=True),
+                    tuple((e.get("startIndex"), e.get("endIndex"),
+                           json.dumps((e.get("textRun") or {}).get(
+                               "textStyle") or {}, sort_keys=True))
+                          for e in para.get("elements", []) or [])))
+    return out
+
+
+def _append_block_styles(doc_tab, plan):
+    """Именованный стиль каждого нового абзаца — как его прочёл документ."""
+    got = []
+    for el in (doc_tab.get("body", {}) or {}).get("content", []):
+        if "paragraph" in el and el.get("startIndex", 0) >= plan[
+                "block_start"] and el.get("startIndex", 0) <= plan[
+                "block_end"]:
+            got.append((el["paragraph"].get("paragraphStyle") or {}).get(
+                "namedStyleType"))
+    return got
+
+
+def _append_plan(doc_tab, blocks):
+    """Точка вставки, текст и запросы. Чистая функция — её и проверяют тесты.
+
+    Вставка идёт в конец последнего абзаца, перед его переводом строки; если
+    он непустой, блок начинается с `\\n`, иначе первый новый абзац
+    приклеился бы к нему («6+Подтверждение участия» со стилем H2 — грабля
+    19.09 и 12.10). Стиль абзаца и текста ставится принудительно, а не
+    наследуется от последнего абзаца: от сноски, от маркера списка, от
+    полужирного хвоста.
+    """
+    content = (doc_tab.get("body", {}) or {}).get("content", [])
+    last = content[-1] if content else None
+    if not last or "paragraph" not in last:
+        return None, "вкладка не кончается абзацем — дописывать некуда"
+    elements = last["paragraph"].get("elements", []) or []
+    empty = (len(elements) == 1
+             and (elements[0].get("textRun") or {}).get("content") == "\n")
+    at = last["endIndex"] - 1
+    lead = "" if empty else "\n"
+    text = lead + "\n".join(b["text"] for b in blocks)
+
+    requests = [{"insertText": {"location": {"index": at}, "text": text}}]
+    pos = at + _utf16_len(lead)
+    first = pos
+    paras = []
+    for b in blocks:
+        end = pos + _utf16_len(b["text"])
+        paras.append((pos, end, b))
+        pos = end + 1
+    block_end = paras[-1][1]
+    for start, end, b in paras:
+        requests.append({"updateParagraphStyle": {
+            "range": {"startIndex": start, "endIndex": end + 1},
+            "paragraphStyle": {
+                "namedStyleType": _KIND_TO_NAMED_STYLE[b["kind"]]},
+            # Сброс всех ручных полей абзаца, а не только именованного
+            # стиля: иначе отступ или выравнивание хвоста уехали бы в блок.
+            "fields": ",".join(("namedStyleType",)
+                               + _PRESERVE_PARA_FIELDS)}})
+    requests.append({"deleteParagraphBullets": {
+        "range": {"startIndex": first, "endIndex": block_end + 1}}})
+    if block_end > first:
+        requests.append({"updateTextStyle": {
+            "range": {"startIndex": first, "endIndex": block_end},
+            "textStyle": {}, "fields": ",".join(_STYLE_FIELDS)}})
+    for start, _end, b in paras:
+        for s, e, mark in b["spans"]:
+            if mark.startswith("link:"):
+                style, field = {"link": {"url": mark[5:]}}, "link"
+            else:
+                style, field = {mark: True}, mark
+            requests.append({"updateTextStyle": {
+                "range": {"startIndex": start + s, "endIndex": start + e},
+                "textStyle": style, "fields": field}})
+    return {"index": at, "lead": bool(lead), "text": text,
+            "block_start": first, "block_end": block_end,
+            "requests": requests}, None
+
+
+def append_block(file_id, md_path, tab_id=None, *, dry_run=False,
+                 output=None, base=None):
+    """Дописать блок из .md в конец вкладки одним закреплённым запросом.
+
+    Гарантии: ни один индекс запроса не ниже точки вставки; запрос закреплён
+    ревизией снимка, по которому он построен; после записи вкладка
+    перечитывается, и текст выше точки вставки обязан совпасть с прежним, а
+    хвост — с блоком. Вставка на границе якоря им не поглощается (M28), так
+    что дозапись безопасна и на документе с комментариями.
+    """
+    if output:
+        problem = _output_problem(output)
+        if problem:
+            _error(f"не могу записать {output}: {problem}",
+                   reason="output_path_refused")
+    file_id = _extract_doc_id(file_id)
+    try:
+        with open(md_path, "r", encoding="utf-8") as f:
+            md_text = f.read()
+    except OSError as e:
+        _error(f"не могу прочитать {md_path}: {e}")
+    blocks, why = _append_blocks(md_text)
+    if why:
+        _error(f"блок не дописан: {why}", reason="unsupported_structure")
+    try:
+        creds = get_creds()
+        docs_service = get_docs_service(creds)
+    except Exception as e:                                      # noqa: BLE001
+        _error(f"auth failed: {e}")
+    try:
+        doc = _safe_get_doc(docs_service, file_id)
+    except HttpError as e:
+        _error(f"cannot read doc: {e.reason if hasattr(e, 'reason') else e}")
+    revision_id = doc.get("revisionId")
+    tid, doc_tab = _select_tab(doc, tab_id=tab_id)
+    if base:
+        _check_replace_base(base, file_id, doc, doc_tab, purpose="patch")
+    plan, why = _append_plan(doc_tab, blocks)
+    if why:
+        _error(f"блок не дописан: {why}", reason="unsupported_structure")
+    _refuse_on_suggestion_at(doc_tab, plan["index"], "append")
+    for ns, ne, name in _named_range_intervals(doc_tab):
+        if ne >= plan["index"]:
+            # Именованный диапазон, дотянутый до хвоста, проглотил бы
+            # дописанный блок или сдвинул границу — а он адрес будущих правок.
+            _error(f"именованный диапазон «{name}» доходит до конца вкладки "
+                   f"([{ns}, {ne})) — дописанный блок мог бы в него войти. "
+                   f"Снимите пометку или допишите блок вручную.",
+                   reason="named_range_overlap",
+                   details={"label": name, "range": [ns, ne]})
+    receipt = {
+        "action": "dry-run" if dry_run else "appended",
+        "doc_id": file_id, "tab_id": tid,
+        "revision_id_before": revision_id,
+        "base_index": plan["index"],
+        "leading_newline": plan["lead"],
+        "block_start": plan["block_start"],
+        "block_end": plan["block_end"],
+        "paragraphs": [{"style": _KIND_TO_NAMED_STYLE[b["kind"]],
+                        "text": b["text"][:60]} for b in blocks],
+    }
+    if dry_run:
+        receipt["writes_performed"] = 0
+        _emit_json(receipt, output=output,
+                   summary={"action": "dry-run", "writes_performed": 0})
+        return receipt
+    if not revision_id:
+        _error("Google не отдал ревизию документа — так отвечает документ "
+               "без права правки. Закрепить запись нечем, записи не будет.")
+    before = _units_by_index(doc_tab)
+    # Конец старой части: последний абзац, если он непустой, остаётся сам
+    # собой; пустой становится первым абзацем блока и в сверку не входит.
+    old_upto = plan["index"] + 1 if plan["lead"] else plan["index"]
+    styles_before = _para_fingerprint(doc_tab, old_upto)
+    try:
+        docs_service.documents().batchUpdate(
+            documentId=file_id,
+            body={"requests": _scope_requests(plan["requests"], tid),
+                  "writeControl": _write_control(revision_id)},
+        ).execute()
+    except HttpError as e:
+        _error(f"дозапись не прошла, документ не изменён: "
+               f"{e.reason if hasattr(e, 'reason') else e}",
+               reason=("concurrent_edit"
+                       if getattr(getattr(e, "resp", None), "status", None)
+                       == 400 else None))
+    receipt["revision_id_after"] = None
+    try:
+        after_doc = _safe_get_doc(docs_service, file_id)
+        receipt["revision_id_after"] = after_doc.get("revisionId")
+        _t, after_tab = _select_tab(after_doc, tab_id=tid)
+        after = _units_by_index(after_tab)
+        above_same = all(after.get(i) == u for i, u in before.items()
+                         if i < plan["index"])
+        tail = "".join(
+            (after.get(plan["index"] + k) or b"").decode("utf-16-le",
+                                                           "replace")
+            for k in range(_utf16_len(plan["text"])))
+        want = [_KIND_TO_NAMED_STYLE[b["kind"]] for b in blocks]
+        receipt["verified"] = {
+            "above_unchanged": (above_same and _para_fingerprint(
+                after_tab, old_upto) == styles_before),
+            "block_matches": (tail == plan["text"] and _append_block_styles(
+                after_tab, plan) == want)}
+    except Exception as e:                                      # noqa: BLE001
+        receipt["verified"] = {"error": f"перечитать не вышло: {e}"}
+    _emit_json(receipt, output=output, after_write=True,
+               summary={"action": "appended", "doc_id": file_id,
+                        "block_start": plan["block_start"],
+                        "block_end": plan["block_end"]})
+    ok = receipt["verified"]
+    if not (ok.get("above_unchanged") and ok.get("block_matches")):
+        sys.exit(3)
+    return receipt
 
 
 # ---------------------------------------------------------------------------
@@ -13616,6 +13998,25 @@ def main():
                          "короткую. Работает и у холостого прогона, и у "
                          "записи: длинную квитанцию вывод агента режет")
 
+    # append command
+    ap = sub.add_parser("append",
+                        help="Дописать блок из .md в конец вкладки")
+    ap.add_argument("file_id", help="Идентификатор или ссылка на Google-документ")
+    ap.add_argument("file", help="Путь к .md с блоком: заголовки и абзацы, "
+                                 "**полужирный**, *курсив*, ссылки; два "
+                                 "пробела в конце строки — перенос внутри "
+                                 "абзаца")
+    ap.add_argument("--tab", dest="tab_id", default=None,
+                    help="Идентификатор вкладки. Нужен, только если вкладок несколько")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Показать, куда и что ляжет, ничего не записывая")
+    ap.add_argument("--base", default=None,
+                    help="Сайдкар, который `download` положил рядом с "
+                         "выгрузкой. Если документ правили после неё — "
+                         "отказ без записи")
+    ap.add_argument("-o", "--output", default=None,
+                    help="Записать квитанцию в файл и напечатать короткую")
+
     # mark command (named ranges)
     mk = sub.add_parser("mark",
                         help="Пометить фрагмент именованным диапазоном")
@@ -13748,6 +14149,9 @@ def main():
     elif args.command == "patch":
         patch_doc(args.file_id, args.ops, tab_id=args.tab_id,
                   dry_run=args.dry_run, output=args.output, base=args.base)
+    elif args.command == "append":
+        append_block(args.file_id, args.file, tab_id=args.tab_id,
+                     dry_run=args.dry_run, output=args.output, base=args.base)
     elif args.command == "download":
         download_doc(args.file_id, fmt=args.format, output=args.output,
                      images_dir=args.images_dir)

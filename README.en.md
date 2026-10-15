@@ -18,7 +18,7 @@ Editors, copywriters, and content managers who run and sign off documents in Goo
 
 The main scenario is working through comments. You tell the agent to handle the comments; it reads the threads, replies to the point, and edits the text.
 
-skrepka also exports a document to markdown and pushes edits back, creates documents from markdown, and reviews suggested changes. Full list of scenarios in [docs/PLUGIN.md](docs/PLUGIN.md).
+skrepka also appends a formatted block to the end of a document (`append`), exports a document to markdown and pushes edits back, creates documents from markdown, and reviews suggested changes. Full list of scenarios in [docs/PLUGIN.md](docs/PLUGIN.md).
 
 ## What it looks like
 

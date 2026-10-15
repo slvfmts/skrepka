@@ -107,3 +107,41 @@ def test_several_reactors_are_one_reaction(engine):
     blob = _docx(_THREAD + many, BODY)
     records, _ = engine._docx_comment_records(blob)
     assert [r["docx_id"] for r in records] == ["3"]
+
+
+def test_a_nameless_comment_shaped_like_a_reaction_but_with_words_is_kept(
+        engine):
+    """Ревью Codex: свободный признак выбросил бы настоящий комментарий
+    без автора. Полезная нагрузка реакции — только эмодзи; слово в ней —
+    уже не реакция, и запись остаётся в учёте."""
+    words = _REACTION.replace("🎇", "посмотрите абзац выше")
+    blob = _docx(_THREAD + words, BODY)
+    records, _ = engine._docx_comment_records(blob)
+    assert sorted(r["docx_id"] for r in records) == ["15", "3"]
+    no_date = _REACTION.replace("08.09.2026, 12:08 UTC", "вчера")
+    records, _ = engine._docx_comment_records(_docx(_THREAD + no_date, BODY))
+    assert sorted(r["docx_id"] for r in records) == ["15", "3"]
+
+
+def test_an_unlisted_record_is_fenced_with_its_own_code(engine):
+    """Запись, которой нет в API, огорожена по месту — и отказ по этому месту
+    называет её саму, а не «машинную пометку», и не советует удалить тред,
+    которого может не быть."""
+    records = [{"docx_id": "3", "author": "Светлана Дюмаева",
+                "date_sec": "2026-09-08T11:32:11Z"},
+               {"docx_id": "15", "author": "",
+                "date_sec": "2026-09-08T12:08:03Z"}]
+    spans = [{"docx_id": "3"}, {"docx_id": "15"}]
+    problems, _ = engine._account_anchored_comments(
+        [THREAD_API], records, spans,
+        universe=engine._key_owners_universe([THREAD_API]))
+    [p] = problems
+    glob, blocked = engine._scope_anchor_problems(
+        problems, [(40, 50, "получилось без кредитов.", "15")])
+    assert glob == []
+    [(s, e, label)] = blocked
+    assert (s, e) == (40, 50)
+    assert engine._blocked_reason(label) == "anchor_accounting_failed"
+    assert "удалить" not in label
+    assert engine._blocked_reason("именованный диапазон «x»") == \
+        "named_range_overlap"

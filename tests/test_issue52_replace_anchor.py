@@ -865,3 +865,28 @@ def test_the_dry_run_names_a_stale_base_as_a_refusal(engine, monkeypatch,
     assert out["operations"][0]["reason"] == "concurrent_edit"
     assert docs.batches == []
     assert engine._RAISE_ERRORS is False
+
+
+def test_a_foreign_edit_between_the_base_check_and_the_first_write_stops(
+        engine, monkeypatch, tmp_path, capsys):
+    """Ревью Codex: сверка базы одна в начале `patch`, а заякоренный путь
+    перечитывает документ перед каждой операцией и закрепляется за тем, что
+    нашёл. Чужая правка в этом окне стала бы новой базой молча."""
+    docs = _twins(engine, monkeypatch)
+    real = engine._safe_get_doc
+    reads = []
+
+    def racing(service, file_id):
+        doc = real(service, file_id)
+        reads.append(doc.get("revisionId"))
+        if len(reads) == 1:
+            docs.rev = "R-foreign"       # кто-то правит сразу после сверки
+        return doc
+
+    monkeypatch.setattr(engine, "_safe_get_doc", racing)
+    code, out = _patch_with_base(engine, tmp_path, capsys, OPS_ONE,
+                                 _sidecar(engine, tmp_path, "R0"))
+    assert code == 3
+    assert out["ops_applied"] == 0
+    assert out["refused"][0]["reason"] == "concurrent_edit"
+    assert docs.batches == []
