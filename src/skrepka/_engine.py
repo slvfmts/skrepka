@@ -4101,8 +4101,11 @@ def _unknown_records_text(unknown, now=None):
     now = time.time() if now is None else now
     listed = "; ".join(f"{a!r} @ {d}" for a, d in sorted(unknown)[:5])
     ages = [_rfc3339_epoch(d) for _a, d in unknown]
-    if ages and all(a is not None and now - a > _FRESH_RECORD_SECONDS
-                    for a in ages):
+    # Гонка возможна, только если хоть одна запись доказанно свежая; запись
+    # без читаемой даты свежей не считается — совет «повторите» был бы
+    # обещанием без основания.
+    if not any(a is not None and now - a <= _FRESH_RECORD_SECONDS
+               for a in ages):
         return ("export contains comment entries the API does not list, "
                 "and they are old — not a race between two reads, waiting "
                 "will not help: " + listed)
@@ -4570,8 +4573,9 @@ def _anchor_map_remedy(shown):
         # отдаёт. Повтор не поможет — 12.10 на этот совет ушли две записи.
         return ("В выгрузке есть отметка комментария, которой нет в списке "
                 "комментариев Google, и появилась она давно — ждать и "
-                "повторять бесполезно. Её место огорожено; правки, которые "
-                "ничего не удаляют (вставки), работают по всему документу.")
+                "повторять бесполезно. Её место в тексте определить не "
+                "удалось, поэтому замены и удаления отклонены во всём "
+                "документе; вставки работают.")
     if any(m in shown for m in ("no comments.xml entry", "unknown to the API",
                                 "stale export", "without a w:id",
                                 "anchor spans in document.xml")):
@@ -6231,11 +6235,13 @@ def _note_consumed_copy(op, note, consumed):
     счёт не трогается, и если копий стало другое число, проверка
     стабильности откажет, как раньше."""
     if (op.get("op") != "replace_quote" or "occurrence" not in op
-            or not isinstance(op.get("quote"), str)):
+            or "range" in op or not isinstance(op.get("quote"), str)):
+        # Адрес по `range` старше `quote`: лишние `quote`/`occurrence` у такой
+        # операции не используются и копию цитаты она не уносит.
         return
     if (note or {}).get("applied_as") == "no-op":
         return
-    new_text = op.get("with") if "with" in op else op.get("text")
+    new_text = op.get("text") if "text" in op else op.get("with")
     if not isinstance(new_text, str) or op["quote"] in new_text:
         return
     consumed.setdefault(op["quote"], []).append(op["occurrence"])
@@ -7165,8 +7171,18 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
                 f"W8 preflight read failed: "
                 f"{e.reason if hasattr(e, 'reason') else e}",
                 state="not_applied")
+        if require_revision and attempt > 0:
+            # Повтор бывает только после чужой правки: отвергнутая канарейка
+            # или ревизия, уехавшая под картой. Под `--base` это и есть
+            # «документ изменился» — повторять поверх нельзя (ревью r20).
+            raise PatchOpError(
+                "документ изменился под первой записью, сверенной с базой — "
+                "правки готовились по другому тексту. Скачайте документ "
+                "заново и повторите.", state="not_applied",
+                reason="concurrent_edit",
+                details={"base_revision": require_revision,
+                         "live_revision": doc.get("revisionId")})
         if attempt == 0:
-            # Повтор идёт после своей же канарейки, она ревизию и сдвинула.
             _require_base_revision(doc, require_revision)
         # A multi-tab document is no longer refused here. The export
         # carries no tab id at all (M19-4), but it does carry each tab's
@@ -8317,6 +8333,15 @@ def decide_op(item, *, doc_tab, anchored, thread_state=None,
     # снимку. Настоящая замена без карты неразрешима.
     if r["kind"] == "insert" or item["insertion"]:
         return _dry_verdict(index, source, "would_apply")
+    if structural_stop:
+        # Разрушающая правка на заякоренном пути упрётся в доказательство
+        # границы вкладки раньше канарейки — это видно по чтению. Стоит выше
+        # ветки «одни призраки»: доказательство писатель требует и там, и
+        # отказ детерминирован (ревью r20).
+        return _dry_verdict(index, source, "would_refuse",
+                            reason=structural_stop["reason"],
+                            error=structural_stop["error"],
+                            details=structural_stop["details"])
     if anchors_live is False:
         # Every open thread with a quote is missing from the export — ghosts,
         # closed threads or both. The writer still takes the per-op path and
@@ -8325,13 +8350,6 @@ def decide_op(item, *, doc_tab, anchored, thread_state=None,
         # this, a document left with only ghosts got `unknown` on every
         # replace, and the agent stopped trusting the dry run (06.10).
         return _dry_verdict(index, source, "would_apply")
-    if structural_stop:
-        # Разрушающая правка на заякоренном пути упрётся в доказательство
-        # границы вкладки раньше канарейки — это видно по чтению.
-        return _dry_verdict(index, source, "would_refuse",
-                            reason=structural_stop["reason"],
-                            error=structural_stop["error"],
-                            details=structural_stop["details"])
     return _dry_verdict(index, source, "unknown",
                         reason="fresh_anchor_map_requires_canary")
 
@@ -8733,8 +8751,9 @@ def _dry_plain_export(docs_service, drive_service, file_id, revision_id):
     """Одна читающая выгрузка docx, доказанно той же ревизии, что снимок.
 
     Ревизия перечитывается после выгрузки: разошлась — выгрузки нет, и
-    прогноз остаётся прежним (`unknown`), а не строится на чужом состоянии.
-    Без ревизии (документ только для чтения) доказать нечего — тоже None.
+    структурный стоп по ней не предсказывается. Подсчёт призраков в этом
+    случае делает свою выгрузку, как до 0.20. Без ревизии (документ только
+    для чтения) доказать нечего — тоже None.
     """
     if not revision_id:
         return None
@@ -8837,7 +8856,7 @@ def dry_run_patch(file_id, ops_path, tab_id=None, output=None, base=None):
                 _dry_run_select_tab(doc, tab_id=tab_id)[1] or {},
                 purpose="patch")
         except PatchOpError as exc:
-            _bail(str(exc), reason=exc.reason or "concurrent_edit",
+            _bail(str(exc), reason=exc.reason or "schema_invalid",
                   details=exc.details)
         finally:
             _RAISE_ERRORS = False
@@ -9200,7 +9219,10 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None,
     # The proof costs a canary, so it is spent only when there is something
     # to write.
     no_live = None
-    if anchored and any(_op_writes_on_clean_path(
+    # Под `--base` этот путь не берётся: доказательство тратит канарейку,
+    # и вернувшись ни с чем, оно оставило бы ревизию сдвинутой собственной
+    # записью — первая операция приняла бы это за чужую правку (ревью r20).
+    if anchored and not base_revision and any(_op_writes_on_clean_path(
             r, noops[i], i in early_refusals or i in late_bound)
             for i, r in enumerate(resolved)):
         no_live = _no_live_anchor_snapshot(
@@ -9456,7 +9478,7 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None,
                                       if not attempted_write else None))
             finally:
                 _RAISE_ERRORS = False
-                attempted_write = True
+            attempted_write = True
             _note_consumed_copy(op, note, consumed_copies)
             applied.append(_op_source_label(op, resolved[i]))
             if i in deferred:
@@ -9492,6 +9514,12 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None,
         except PatchOpError as e:
             reason, state = str(e), e.state
             code, details = e.reason, e.details
+            # Отказ по базе флага не взводит: следующая операция сверит базу
+            # сама и откажет так же, пока документ не тот. Любой другой отказ
+            # мог пройти через канарейку и сдвинуть ревизию собственной
+            # записью — сверять базу дальше значило бы принять её за чужую.
+            if not (details or {}).get("base_revision"):
+                attempted_write = True
         except HttpError as e:
             reason = e.reason if hasattr(e, "reason") else str(e)
             # 5xx/transport after send: the write may or may not have landed
