@@ -385,7 +385,28 @@ def test_accounting_extra_docx_entry_blocks(engine):
     problems, _ = engine._account_anchored_comments(
         anchored, records, _spans("0", "1"),
         universe=engine._key_owners_universe(anchored))
-    assert any("unknown to the API" in p for p in problems)
+    # Огораживается место записи, а не документ (пост-мортем 12.10): её спан
+    # известен, и остальной документ правится.
+    [p] = problems
+    assert p.docx_ids == ("1",)
+    # Записи девять месяцев — это не гонка двух чтений, и совет «повторите
+    # через минуту» был бы ложью.
+    assert "not a race" in p and "stale export" not in p
+
+
+def test_a_fresh_unknown_record_still_reads_as_a_possible_race(engine):
+    now = engine._rfc3339_epoch("2026-01-01T00:05:00Z")
+    fresh = engine._unknown_records_text(
+        {("Z", "2026-01-01T00:00:09Z")}, now=now)
+    old = engine._unknown_records_text(
+        {("Z", "2026-01-01T00:00:09Z")}, now=now + 3600)
+    assert "stale export" in fresh and "not a race" not in fresh
+    assert "not a race" in old
+    # Одна свежая среди старых — гонку исключить нельзя.
+    mixed = engine._unknown_records_text(
+        {("Z", "2026-01-01T00:00:09Z"), ("Y", "2025-01-01T00:00:00Z")},
+        now=now)
+    assert "stale export" in mixed
 
 
 def test_accounting_reply_cannot_saturate_missing_parent(engine):

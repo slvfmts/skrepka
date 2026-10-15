@@ -112,6 +112,10 @@ _REASON_CODES = frozenset((
                                     # выбирать копию за человека нельзя
     "unknown_write_outcome",        # исход записи неизвестен
     "reply_journal_mismatch",       # журнал рядом с файлом — от другого прогона
+    "tab_boundary_unproven",        # вкладку не удалось найти в выгрузке
+                                    # целиком: структура, а не гонка
+    "anchor_accounting_failed",     # учёт комментариев выгрузки не сошёлся
+                                    # для всего документа
 ))
 
 _DETAILS_CAP = 200  # длинная цитата в квитанции — это шум, а не диагностика
@@ -2273,6 +2277,17 @@ _API_BREAK_TEXT = {"pageBreak": _PAGE_BREAK}
 _BREAK_CHARS = _SOFT_BREAK + _PAGE_BREAK
 
 
+def _strip_comment_markers(root, ids):
+    """Убрать из дерева document.xml маркеры комментариев с этими w:id."""
+    w = _WORDML_NS
+    tags = {f"{w}commentRangeStart", f"{w}commentRangeEnd",
+            f"{w}commentReference"}
+    for parent in list(root.iter()):
+        for child in list(parent):
+            if child.tag in tags and child.get(f"{w}id") in ids:
+                parent.remove(child)
+
+
 def _parse_docx_anchor_spans(docx_bytes):
     """Parse word/document.xml and extract comment anchor spans.
 
@@ -2310,9 +2325,15 @@ def _parse_docx_anchor_spans(docx_bytes):
     try:
         with zipfile.ZipFile(io.BytesIO(docx_bytes)) as z:
             xml_bytes = z.read("word/document.xml")
+            reactions = _docx_reaction_ids(z)
         root = ET.fromstring(xml_bytes)
     except Exception as e:
         return [], [f"malformed docx export: {e}"], empty_census
+    if reactions:
+        # Маркеры эмодзи-реакций снимаются до всякого разбора: это не якорь
+        # треда, а без записи в comments.xml (`_docx_comment_records` её
+        # пропускает) их спан стал бы «якорем без записи» и огородился.
+        _strip_comment_markers(root, reactions)
 
     w = _WORDML_NS
     seen_starts, seen_ends = {}, {}
@@ -2806,7 +2827,7 @@ def _api_cell_text(cell):
         para = el.get("paragraph")
         if not para:
             return None  # a nested table: not compared, not guessed
-        text, _pieces, _opaque = _api_para_read(para)
+        text, _pieces, _opaque = _api_para_read(para, textless_ok=True)
         if text is None:
             return None
         parts.append(text)
@@ -2853,6 +2874,23 @@ def _same_body_text(api_text, docx_text):
     if api_text is None or docx_text is None:
         return False
     return api_text == docx_text
+
+
+def _tab_boundary_refusal(why):
+    """Отказ по недоказанной границе вкладки — что не сошлось и что делать.
+
+    Раньше кончался «правьте эту вкладку в интерфейсе», и агент не отличал
+    разовую гонку от постоянной структуры (пост-мортем 15.10): повтор такой
+    отказ не снимает, а вставки он не трогает вовсе.
+    """
+    return (f"границу целевой вкладки в выгрузке доказать не удалось: {why}. "
+            f"Пока она не доказана, разместить якоря нельзя — у вкладок свои "
+            f"индексные пространства, и промах молчалив, поэтому правки, "
+            f"которые что-то удаляют, в этой вкладке отклонены. Это "
+            f"свойство структуры документа, а не гонка: повтор не поможет. "
+            f"Вставки (insert_*) и правки, которые только дописывают текст, "
+            f"работают — они якорей не трогают; во вкладке без комментариев "
+            f"правки идут как обычно")
 
 
 def _prove_target_segment(outline, tabs, tid, canary_text=None):
@@ -3825,6 +3863,54 @@ def _trunc_seconds(ts):
     return re.sub(r"\.\d+(?=Z$|[+-]\d{2}:\d{2}$)", "", ts or "")
 
 
+# Эмодзи-реакция на тексте (M33, пост-мортем 12.10). Google кладёт её в
+# comments.xml отдельной записью без `w:author`, с текстом-описанием в два
+# и больше абзацев: «1 реакция» и по строке на поставившего — «Светлана
+# Дюмаева – 🎇 | 08.09.2026, 12:08 UTC». У неё свои маркеры в document.xml,
+# а в `comments.list` её нет вовсе: API реакции комментариями не считает.
+_REACTION_HEAD = re.compile(r"^\d+\s+\S+$")
+_REACTION_LINE = re.compile(r"^.+\s[\u2013\u2014-]\s.+\|.+$")
+
+
+def _docx_reaction_ids(z):
+    """w:id записей comments.xml, которые суть реакции, а не комментарии.
+
+    Реакция — не тред: разговора у неё нет, человек ничего не теряет, и
+    документ из-за неё не запирается (раньше её ключ без автора попадал в
+    «неизвестные API записи» и останавливал все замены на месяц). Признак
+    узкий намеренно: нет автора И текст целиком из заголовка «N слово» и строк
+    «имя – эмодзи | дата». Комментарий живого человека автора имеет всегда.
+    `z` — открытый ZipFile выгрузки.
+    """
+    import xml.etree.ElementTree as ET
+
+    if "word/comments.xml" not in z.namelist():
+        return frozenset()
+    try:
+        root = ET.fromstring(z.read("word/comments.xml"))
+    except Exception:                                           # noqa: BLE001
+        # Разбор комментариев сам доложит о кривом XML; здесь не угадываем.
+        return frozenset()
+    w = _WORDML_NS
+    found = set()
+    for c in root.findall(f"{w}comment"):
+        if c.get(f"{w}author"):
+            continue
+        cid = c.get(f"{w}id")
+        if not cid:
+            continue
+        paras = []
+        for p in c.findall(f".//{w}p"):
+            text = "".join(t.text or "" for t in p.iter(f"{w}t"))
+            text = " ".join(text.replace("\u00a0", " ").split())
+            if text:
+                paras.append(text)
+        if (len(paras) >= 2 and _REACTION_HEAD.match(paras[0])
+                and all(_REACTION_LINE.match(x) for x in paras[1:])):
+            found.add(cid)
+    return frozenset(found)
+
+
 def _docx_comment_records(docx_bytes):
     """Parse word/comments.xml into [{docx_id, author, date_sec}].
 
@@ -3847,6 +3933,7 @@ def _docx_comment_records(docx_bytes):
             if "word/comments.xml" not in z.namelist():
                 return [], []
             root = ET.fromstring(z.read("word/comments.xml"))
+            reactions = _docx_reaction_ids(z)
     except Exception as e:
         return [], [f"malformed docx comments part: {e}"]
     seen_ids = set()
@@ -3859,6 +3946,11 @@ def _docx_comment_records(docx_bytes):
             problems.append(f"duplicate w:id {cid} in comments.xml")
             continue
         seen_ids.add(cid)
+        if cid in reactions:
+            # Не запись комментария: её маркеры убраны и из разбора
+            # document.xml (`_parse_docx_anchor_spans`), так что биекция
+            # «запись ⇔ спан» её не видит с обеих сторон.
+            continue
         records.append({
             "docx_id": cid,
             "author": c.get(f"{w}author") or "",
@@ -3978,6 +4070,26 @@ def _split_off_ghosts(threads, exported, universe):
                     holders.discard(cid)
                 changed = True
     return ghosts, owners
+
+
+_FRESH_RECORD_SECONDS = 600
+
+
+def _unknown_records_text(unknown, now=None):
+    """Name export records the API does not list — and say whether waiting
+    can help. A record minutes old may be a race between two reads; one
+    older than ten minutes is not, and «retry in a minute» would be a lie
+    (12.10: a month-old reaction, two wasted writes)."""
+    now = time.time() if now is None else now
+    listed = "; ".join(f"{a!r} @ {d}" for a, d in sorted(unknown)[:5])
+    ages = [_rfc3339_epoch(d) for _a, d in unknown]
+    if ages and all(a is not None and now - a > _FRESH_RECORD_SECONDS
+                    for a in ages):
+        return ("export contains comment entries the API does not list, "
+                "and they are old — not a race between two reads, waiting "
+                "will not help: " + listed)
+    return ("export contains comment entries unknown to the API (stale "
+            "export): " + listed)
 
 
 def _account_anchored_comments(anchored, records, spans, *, universe,
@@ -4106,13 +4218,19 @@ def _account_anchored_comments(anchored, records, spans, *, universe,
         # witness makes it a ghost (`_split_off_ghosts`).
     unknown = {k for k in docx_keys if k not in live_keys}
     if unknown:
-        # Global. An export record the API does not know means the export and
-        # the API disagree about what exists; the span it maps to is not the
-        # extent of the doubt.
-        problems.append(
-            "export contains comment entries unknown to the API (stale "
-            "export): "
-            + "; ".join(f"{a!r} @ {d}" for a, d in sorted(unknown)[:5]))
+        # An export record no open thread claims. It used to be global with
+        # «a race, retry in a minute» — and a record the API simply never
+        # lists (an emoji reaction, 12.10) froze the document for a month
+        # while the advice stayed false. On the write path the export is
+        # proven fresh by the canary, so a race is not the likely story; the
+        # record is something the API does not show. Its span sits at known
+        # coordinates, so the doubt is fenced there and the rest of the
+        # document stays editable. A record whose span cannot be placed still
+        # blocks the whole document (`_scope_anchor_problems`).
+        ids = sorted({r["docx_id"] for r in records
+                      if (r["author"], r["date_sec"]) in unknown}, key=str)
+        problems.append(_AnchorProblem(
+            _unknown_records_text(unknown), ids))
     # bijection: one span per comments.xml record, joined by w:id
     span_ids = Counter()
     for s in spans:
@@ -4408,6 +4526,14 @@ def _anchor_map_remedy(shown):
                 "одному треду чужая примета не помогает. Потом повторите "
                 "команду. Отвечать пачкой без пауз нельзя — ответы снова "
                 "попадут в одну секунду.")
+    if "not a race" in shown:
+        # Запись в выгрузке, которой API не показывает и которой больше десяти
+        # минут: эмодзи-реакция или что-то ещё, чего список комментариев не
+        # отдаёт. Повтор не поможет — 12.10 на этот совет ушли две записи.
+        return ("В выгрузке есть отметка комментария, которой нет в списке "
+                "комментариев Google, и появилась она давно — ждать и "
+                "повторять бесполезно. Её место огорожено; правки, которые "
+                "ничего не удаляют (вставки), работают по всему документу.")
     if any(m in shown for m in ("no comments.xml entry", "unknown to the API",
                                 "stale export", "without a w:id",
                                 "anchor spans in document.xml")):
@@ -4860,12 +4986,9 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
             first, last, why = _prove_target_segment(
                 census["outline"], tabs_now, tid, canary_text=canary_text)
             if why:
-                _abort(
-                    f"границу целевой вкладки в выгрузке доказать не "
-                    f"удалось: {why}. Пока она не доказана, разместить "
-                    f"якорь нельзя — у вкладок свои индексные пространства, "
-                    f"и промах молчалив. Правьте эту вкладку в интерфейсе "
-                    f"Google Docs")
+                _abort(_tab_boundary_refusal(why),
+                       reason="tab_boundary_unproven",
+                       details={"mismatch": why})
             mine, foreign, why = _confine_spans_to_segment(spans, first,
                                                             last)
             if why:
@@ -4936,7 +5059,8 @@ def _fresh_anchor_snapshot(docs_service, drive_service, file_id, doc,
                 "replaces/deletes are blocked (fail closed): "
                 + shown + ". " + _anchor_map_remedy(shown),
                 reason=("anchor_identity_collision"
-                        if "shares every" in shown else None),
+                        if "shares every" in shown
+                        else "anchor_accounting_failed"),
                 details={"problems": [str(p) for p in global_problems[:4]]})
         # Fenced ranges are checked too, not only placed anchors: an anchor at
         # the very end of the document is exactly what this guard is for, and
@@ -6033,6 +6157,50 @@ def _execute_index_replace(docs_service, file_id, tid, start, end, new_text,
         body={"requests": _scope_requests(requests, tid),
               "writeControl": _write_control(revision_id)},
     ).execute()
+
+
+def _rebase_occurrence(op, resolved, consumed):
+    """Пересчитать адрес `occurrence` с исходного снимка на живой документ.
+
+    Возвращает (операция для записи, ожидаемое число копий). Из исходного
+    счёта вычитаются копии, которые унесли СВОИ применённые замены этого
+    файла (`_note_consumed_copy`): копия с меньшим исходным номером сдвигает
+    номер на один, любая — уменьшает число на один. Проверка стабильности
+    остаётся как была: если живое число не равно пересчитанному, значит
+    копии двигал кто-то, кроме нас, и правка отказывает.
+    """
+    if not resolved or "occurrence" not in op:
+        return op, None
+    expect = resolved["quote_total"]
+    gone = consumed.get(op.get("quote")) or []
+    if not gone or expect is None:
+        return op, expect
+    occ = op["occurrence"]
+    if occ in gone:
+        # Ту же копию уже заменили — повторный адрес на неё показывал бы на
+        # соседку. Пересекающиеся правки отклоняет плановая фаза, так что
+        # сюда не приходят; подпорка, а не путь.
+        return op, expect
+    rebased = dict(op, occurrence=occ - sum(1 for g in gone if g < occ))
+    return rebased, expect - len(gone)
+
+
+def _note_consumed_copy(op, note, consumed):
+    """Запомнить, что применённая замена по `occurrence` унесла свою копию.
+
+    Только когда это доказуемо по самой операции: замена по цитате с явным
+    номером, записанная (не `no-op`), и в новом тексте цитаты нет. Иначе
+    счёт не трогается, и если копий стало другое число, проверка
+    стабильности откажет, как раньше."""
+    if (op.get("op") != "replace_quote" or "occurrence" not in op
+            or not isinstance(op.get("quote"), str)):
+        return
+    if (note or {}).get("applied_as") == "no-op":
+        return
+    new_text = op.get("with") if "with" in op else op.get("text")
+    if not isinstance(new_text, str) or op["quote"] in new_text:
+        return
+    consumed.setdefault(op["quote"], []).append(op["occurrence"])
 
 
 def _check_occurrence_stability(r, expected):
@@ -8033,7 +8201,7 @@ def _dry_decide_by_thread(index, source, op, anchored, thread_state):
 
 def decide_op(item, *, doc_tab, anchored, thread_state=None,
               early=None, blocked_all=None, blocked_writers=None,
-              anchors_live=None):
+              anchors_live=None, structural_stop=None):
     """Вердикт по одной операции — без писателя, выгрузки и канарейки.
 
     Два глобальных ограждения писателя действуют на РАЗНОЕ, и путать их
@@ -8099,6 +8267,13 @@ def decide_op(item, *, doc_tab, anchored, thread_state=None,
         # this, a document left with only ghosts got `unknown` on every
         # replace, and the agent stopped trusting the dry run (06.10).
         return _dry_verdict(index, source, "would_apply")
+    if structural_stop:
+        # Разрушающая правка на заякоренном пути упрётся в доказательство
+        # границы вкладки раньше канарейки — это видно по чтению.
+        return _dry_verdict(index, source, "would_refuse",
+                            reason=structural_stop["reason"],
+                            error=structural_stop["error"],
+                            details=structural_stop["details"])
     return _dry_verdict(index, source, "unknown",
                         reason="fresh_anchor_map_requires_canary")
 
@@ -8343,7 +8518,8 @@ def compile_index_plan(prepared):
                           early=early.get(it["index"]),
                           blocked_all=blocked_all,
                           blocked_writers=blocked_writers,
-                          anchors_live=prepared.get("anchors_live"))
+                          anchors_live=prepared.get("anchors_live"),
+                          structural_stop=prepared.get("structural_stop"))
                 for it in items]
 
     # Дальше — только заякоренный путь. На чистом документе все операции
@@ -8420,7 +8596,8 @@ def _dry_receipt(doc_id, prepared, verdicts):
     }
 
 
-def _ghosts_by_plain_export(drive_service, file_id, anchored, universe):
+def _ghosts_by_plain_export(drive_service, file_id, anchored, universe,
+                            docx_bytes=None):
     """Open anchored threads and which of them are ghosts, by one plain read.
 
     Returns (open_ids, ghost_ids), or None when the export cannot be read —
@@ -8444,10 +8621,11 @@ def _ghosts_by_plain_export(drive_service, file_id, anchored, universe):
     if not threads:
         return [], set()
     try:
-        docx_bytes = drive_service.files().export(
-            fileId=file_id,
-            mimeType="application/vnd.openxmlformats-officedocument"
-                     ".wordprocessingml.document").execute()
+        if docx_bytes is None:
+            docx_bytes = drive_service.files().export(
+                fileId=file_id,
+                mimeType="application/vnd.openxmlformats-officedocument"
+                         ".wordprocessingml.document").execute()
         records, problems = _docx_comment_records(docx_bytes)
         spans, span_problems, _census = _parse_docx_anchor_spans(docx_bytes)
     except Exception:                                           # noqa: BLE001
@@ -8477,7 +8655,8 @@ def _ghosts_by_plain_export(drive_service, file_id, anchored, universe):
     return [cid for cid, _keys in threads], ghosts
 
 
-def _dry_anchors_live(drive_service, file_id, anchored, universe):
+def _dry_anchors_live(drive_service, file_id, anchored, universe,
+                      docx_bytes=None):
     """Is any open anchored thread actually in the document?
 
     False when every open thread with a quote is a ghost (or there is none),
@@ -8485,14 +8664,69 @@ def _dry_anchors_live(drive_service, file_id, anchored, universe):
     read — then the dry run stays at `unknown` on replaces, as before.
     """
     split = _ghosts_by_plain_export(drive_service, file_id, anchored,
-                                    universe)
+                                    universe, docx_bytes=docx_bytes)
     if split is None:
         return None
     open_ids, ghosts = split
     return any(cid not in ghosts for cid in open_ids)
 
 
-def dry_run_patch(file_id, ops_path, tab_id=None, output=None):
+def _dry_plain_export(docs_service, drive_service, file_id, revision_id):
+    """Одна читающая выгрузка docx, доказанно той же ревизии, что снимок.
+
+    Ревизия перечитывается после выгрузки: разошлась — выгрузки нет, и
+    прогноз остаётся прежним (`unknown`), а не строится на чужом состоянии.
+    Без ревизии (документ только для чтения) доказать нечего — тоже None.
+    """
+    if not revision_id:
+        return None
+    try:
+        data = drive_service.files().export(
+            fileId=file_id,
+            mimeType="application/vnd.openxmlformats-officedocument"
+                     ".wordprocessingml.document").execute()
+        after = docs_service.documents().get(
+            documentId=file_id, fields="revisionId").execute().get(
+            "revisionId")
+    except Exception:                                           # noqa: BLE001
+        return None
+    return data if after == revision_id else None
+
+
+def _dry_structural_stop(docx_bytes, doc, tab_id):
+    """Стоп писателя, который виден по чтению: граница вкладки не доказана.
+
+    Писатель доказывает её по выгрузке с канарейкой в хвосте; без канарейки
+    доказательство то же самое, кроме этого одного элемента. Не сходится
+    здесь — не сойдётся и там: элемент, на котором оно рвётся, лежит в
+    тексте документа, а не в канарейке. Холостой прогон 15.10 отвечал на
+    такой документ `unknown` по всем 26 заменам, и оператор потратил на
+    попытку разрешение владельца на запись.
+
+    Возвращает {"reason", "error", "details"} или None. Ничего другого
+    отсюда не предсказывается: учёт комментариев без канарейки может
+    увидеть гонку, которой у писателя не будет.
+    """
+    tabs = _collect_tabs(doc)
+    if len(tabs) < 2 or docx_bytes is None:
+        return None
+    tid, _dt, problem = _dry_run_select_tab(doc, tab_id=tab_id)
+    if problem or tid is None:
+        return None
+    try:
+        _spans, _problems, census = _parse_docx_anchor_spans(docx_bytes)
+        _first, _last, why = _prove_target_segment(
+            census.get("outline") or [], tabs, tid)
+    except Exception:                                           # noqa: BLE001
+        return None
+    if not why:
+        return None
+    return {"reason": "tab_boundary_unproven",
+            "error": _tab_boundary_refusal(why),
+            "details": {"mismatch": why}}
+
+
+def dry_run_patch(file_id, ops_path, tab_id=None, output=None, base=None):
     """Холостой прогон `patch`: только чтение, ни одной записи.
 
     Снимок берётся читающими вызовами, и других здесь нет. Ни писатель, ни
@@ -8501,11 +8735,13 @@ def dry_run_patch(file_id, ops_path, tab_id=None, output=None):
     остались ли в документе живые треды или одни призраки
     (`_dry_anchors_live`).
     """
+    global _RAISE_ERRORS
     file_id = _extract_doc_id(file_id)
 
-    def _bail(message):
+    def _bail(message, reason="schema_invalid", details=None):
         verdicts = [_dry_verdict(None, "ops.json", "would_refuse",
-                                 reason="schema_invalid", error=message)]
+                                 reason=reason, error=message,
+                                 details=details)]
         receipt = {"action": "dry-run", "strategy": "read-only-advisory",
                    "doc_id": file_id, "writes_performed": 0,
                    "summary": _dry_summary(verdicts),
@@ -8535,11 +8771,28 @@ def dry_run_patch(file_id, ops_path, tab_id=None, output=None):
             drive_service, file_id)
     except Exception as exc:                                    # noqa: BLE001
         _error(f"dry-run read failed: {exc}")
+    if base:
+        _RAISE_ERRORS = True
+        try:
+            _check_replace_base(
+                base, file_id, doc,
+                _dry_run_select_tab(doc, tab_id=tab_id)[1] or {},
+                purpose="patch")
+        except PatchOpError as exc:
+            _bail(str(exc), reason=exc.reason or "concurrent_edit",
+                  details=exc.details)
+        finally:
+            _RAISE_ERRORS = False
     prepared = prepare_patch(doc, ops, tab_id=tab_id,
                              anchored=bool(anchored), comments=raw)
     if anchored:
+        docx_bytes = _dry_plain_export(docs_service, drive_service, file_id,
+                                       doc.get("revisionId"))
         prepared["anchors_live"] = _dry_anchors_live(
-            drive_service, file_id, anchored, universe)
+            drive_service, file_id, anchored, universe,
+            docx_bytes=docx_bytes)
+        prepared["structural_stop"] = _dry_structural_stop(
+            docx_bytes, doc, tab_id)
         early = _dry_early_refusals(prepared["items"],
                                     prepared["doc_tab"] or {})
         if prepared["anchors_live"] is False and not any(
@@ -8653,7 +8906,41 @@ def _no_live_anchor_snapshot(docs_service, drive_service, file_id, doc,
     return snap
 
 
-def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None):
+def _note_revision_drift(result, docs_service, file_id, revision_before):
+    """Сказать в квитанции заякоренного пути, куда ушла ревизия документа.
+
+    Каждая разрушающая правка на документе с комментариями вставляет и
+    удаляет служебную строку-канарейку — это две записи, и ревизия
+    сдвигается, даже если сама правка отказана и текст не изменился. Кто
+    сверяет ревизию перед следующей записью (`--expect-base`, правило «скачать
+    и сверить»), видит «документ изменился» и обязан остановиться; без этой
+    строки он не знает, что изменила его сама скрепка (пост-мортем 12.10).
+    Чтение не обязательное: не вышло — поля просто нет.
+    """
+    try:
+        after = docs_service.documents().get(
+            documentId=file_id, fields="revisionId").execute().get(
+            "revisionId")
+    except Exception:                                           # noqa: BLE001
+        return
+    result["revision_id_before"] = revision_before
+    result["revision_id_after"] = after
+    if after and revision_before and after != revision_before:
+        text = ("текст документа не изменился"
+                if not result.get("ops_applied")
+                else "текст изменён только применёнными правками")
+        result["revision_note"] = (
+            f"ревизия документа за время прогона сменилась. Двигает её и "
+            f"сама skrepka: каждая правка, которая что-то удаляет, вставляет "
+            f"и убирает служебную строку-канарейку для проверки свежести "
+            f"выгрузки — даже если правка отказана. По skrepka {text}. "
+            f"Отличить это от чужой правки по одной ревизии нельзя: базу "
+            f"для следующей записи снимите заново (download) и сверьте "
+            f"текст, а не номер ревизии")
+
+
+def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None,
+              base=None):
     """Apply structural patch operations to a Google Doc.
 
     Strategy is selected at DOCUMENT level (codex r1 #2 — anchor positions
@@ -8664,7 +8951,8 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None):
         its phase-0 characterization result (fail closed while unverified).
     """
     if dry_run:
-        return dry_run_patch(file_id, ops_path, tab_id=tab_id, output=output)
+        return dry_run_patch(file_id, ops_path, tab_id=tab_id, output=output,
+                             base=base)
     if output:
         # Путь проверяется ДО первого обращения к Google, и это не
         # придирчивость: узнать про негодный путь ПОСЛЕ записи в документ
@@ -8702,6 +8990,11 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None):
 
     revision_id = doc.get("revisionId")
     tid, doc_tab = _select_tab(doc, tab_id=tab_id)
+    if base:
+        # «Скачать и сверить перед записью» — механизмом, а не дисциплиной
+        # (пост-мортем Авито 12.10): документ правили после выгрузки — ни
+        # одной записи.
+        _check_replace_base(base, file_id, doc, doc_tab, purpose="patch")
 
     # Resolve every op against the current snapshot (validates targets early
     # for both paths) and classify what each one actually does.
@@ -9045,6 +9338,13 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None):
     # тредов после такой правки неполон по построению, и опираться на него
     # больше нельзя (ревью codex).
     unmapped_write = False
+    # Номер вхождения адресует копию на снимке, с которого начат вызов, — так
+    # его и выбирают. Своя же ранняя правка этого файла, унёсшая одну из
+    # копий, сдвигает и номер, и число копий, и раньше вторая из двух замен
+    # «с конца к началу» отказывала с `concurrent_edit` на собственной соседке
+    # (пост-мортем 12.10). Здесь копятся номера копий, унесённых своими
+    # применёнными заменами: цитата -> [исходные номера].
+    consumed_copies = {}
     failed_at, failure, app_state = None, None, None
     failed_code, failed_details = None, None
     for i, op in enumerate(ops):
@@ -9084,15 +9384,16 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None):
         try:
             _RAISE_ERRORS = True  # nested preflight errors must not exit
             try:
+                call_op, expect = _rebase_occurrence(
+                    op, resolved[i], consumed_copies)
                 note = _apply_op_anchor_safe(
-                    docs_service, drive_service, file_id, op, tab_id,
+                    docs_service, drive_service, file_id, call_op, tab_id,
                     # Номер вхождения осмыслен только вместе с числом копий,
                     # а копию мог унести любой сосед по файлу.
-                    expect_occurrences=(
-                        resolved[i]["quote_total"]
-                        if resolved[i] and "occurrence" in op else None))
+                    expect_occurrences=expect)
             finally:
                 _RAISE_ERRORS = False
+            _note_consumed_copy(op, note, consumed_copies)
             applied.append(_op_source_label(op, resolved[i]))
             if i in deferred:
                 # It resolved against the live document even though it did not
@@ -9198,6 +9499,7 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None):
             # об одном прогоне.
             result["action"] = "partially-patched"
             result["text_applied_reply_pending"] = True
+    _note_revision_drift(result, docs_service, file_id, revision_id)
     if refused:
         result["refused"] = refused
     if failed_at is not None:
@@ -12746,7 +13048,8 @@ def _base_revision_age_hours(base_path):
         return None
 
 
-def _check_replace_base(base_path, file_id, doc, doc_tab):
+def _check_replace_base(base_path, file_id, doc, doc_tab, *,
+                        purpose="replace"):
     """Доказать, что база описывает документ, который лежит сейчас.
 
     Доказательство одно и оно у Google записано словами: «If the revision ID
@@ -12819,11 +13122,16 @@ def _check_replace_base(base_path, file_id, doc, doc_tab):
         hint = ("the text matches the base word for word, so what changed is "
                 "formatting, a table or the structure — the part a `.md` does "
                 "not carry. Download the doc again.")
-    else:
+    elif purpose == "replace":
         hint = ("the document's text differs from the base: it was edited "
                 "after you downloaded it, and your replace would wipe those "
                 "edits. Download it again and move your changes into the "
                 "fresh copy.")
+    else:
+        hint = ("the document's text differs from the base: it was edited "
+                "after you downloaded it, and your edits were prepared "
+                "against the older text. Download it again and check them "
+                "against the fresh copy.")
     _error(f"the base describes a different state than the document is in "
            f"right now — {hint}", reason="concurrent_edit", details=detail)
 
@@ -13299,7 +13607,11 @@ def main():
                          "`would_refuse` — откажет, и видно почему. Итог — в "
                          "`summary.verdict`; код возврата 3 бывает только на "
                          "`refusals`")
-    pt.add_argument("--output", default=None,
+    pt.add_argument("--base", default=None,
+                    help="Сайдкар, который `download` положил рядом с "
+                         "выгрузкой. Если документ правили после неё — "
+                         "отказ до первой записи")
+    pt.add_argument("-o", "--output", default=None,
                     help="Записать полную квитанцию в файл и напечатать "
                          "короткую. Работает и у холостого прогона, и у "
                          "записи: длинную квитанцию вывод агента режет")
@@ -13320,7 +13632,7 @@ def main():
     dl.add_argument("file_id", help="Идентификатор или ссылка на Google-документ")
     dl.add_argument("--format", default="md", choices=list(EXPORT_MIMETYPES.keys()),
                     help="Формат выгрузки (по умолчанию md)")
-    dl.add_argument("--output",
+    dl.add_argument("-o", "--output",
                     help="Путь к файлу (по умолчанию — из названия)")
     dl.add_argument("--images-dir", help="Каталог для картинок (только md)")
 
@@ -13435,7 +13747,7 @@ def main():
                    tab_id=args.tab_id, occurrence=args.occurrence)
     elif args.command == "patch":
         patch_doc(args.file_id, args.ops, tab_id=args.tab_id,
-                  dry_run=args.dry_run, output=args.output)
+                  dry_run=args.dry_run, output=args.output, base=args.base)
     elif args.command == "download":
         download_doc(args.file_id, fmt=args.format, output=args.output,
                      images_dir=args.images_dir)

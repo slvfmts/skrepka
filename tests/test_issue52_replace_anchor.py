@@ -740,3 +740,128 @@ def test_a_failed_cleanup_is_never_swallowed(engine, monkeypatch, capsys):
             "op": "replace_anchor", "comment_id": "c1", "with": "X"}, None)
     warning = json.loads(capsys.readouterr().err.strip().splitlines()[-1])
     assert "осталась служебная строка" in warning["warning"]
+
+
+# ---------------------- номер вхождения от снимка начала вызова (12.10) -----
+
+def _twins(engine, monkeypatch):
+    texts = ["Alpha", "Копия", "Копия"]
+    docs, _drive = _stand(
+        engine, monkeypatch, texts,
+        [("Alpha", [("0", 0, 5)]), ("Копия", []), ("Копия", [])],
+        mutating=True)
+    return docs
+
+
+def _body(docs):
+    return docs._flat().split("\n")[:-1]
+
+
+@pytest.mark.parametrize("order", [(2, 1), (1, 2)])
+def test_two_ordinals_of_one_quote_in_one_call_both_apply(
+        engine, monkeypatch, tmp_path, capsys, order):
+    """Пост-мортем Точки 12.10: две замены одной подписи, `occurrence` 2 и 1,
+    — штатный способ адресовать одинаковые места. Вторая отказывала с
+    `concurrent_edit` («было 2, стало 1»), хотя копию унесла ПЕРВАЯ правка
+    этого же файла. Номер считается от снимка начала вызова — так его и
+    выбирают, — в любом порядке операций."""
+    docs = _twins(engine, monkeypatch)
+    code, out = _run(engine, tmp_path, capsys, [
+        {"op": "replace_quote", "quote": "Копия", "occurrence": n,
+         "with": f"Правка {n}"} for n in order])
+    assert code == 0, out
+    assert out["ops_applied"] == 2
+    assert _body(docs) == ["Alpha", "Правка 1", "Правка 2"]
+
+
+def test_a_replacement_that_keeps_the_quote_does_not_shift_the_count(
+        engine, monkeypatch, tmp_path, capsys):
+    """Новый текст содержит цитату — копия не унесена, и пересчитывать нечего:
+    число копий осталось 2, номер 1 — та же первая копия."""
+    docs = _twins(engine, monkeypatch)
+    code, out = _run(engine, tmp_path, capsys, [
+        {"op": "replace_quote", "quote": "Копия", "occurrence": 2,
+         "with": "Копия!"},
+        {"op": "replace_quote", "quote": "Копия", "occurrence": 1,
+         "with": "Первая"}])
+    assert code == 0, out
+    assert out["ops_applied"] == 2
+    # «Копия» → «Копия!» уходит чистой вставкой, а стенд вставки вне
+    # индексной перезаписи не применяет; важна вторая правка — она легла на
+    # первую копию, а не на ту, что уже тронута.
+    assert _body(docs)[1] == "Первая"
+
+
+def test_the_receipt_says_the_revision_moved_under_the_run(
+        engine, monkeypatch, tmp_path, capsys):
+    """Пост-мортем 12.10: запись, у которой ничего не применилось, сменила
+    ревизию документа (канарейка), и оператор, сверяющий ревизию перед
+    следующей записью, видел «документ изменился». Квитанция обязана
+    назвать обе ревизии и сказать, что их двигает и сама skrepka."""
+    _twins(engine, monkeypatch)
+    _code, out = _run(engine, tmp_path, capsys, [
+        {"op": "replace_quote", "quote": "Копия", "occurrence": 1,
+         "with": "Правка"}])
+    assert out["revision_id_before"] == "R0"
+    assert out["revision_id_after"] not in (None, "R0")
+    assert "канарейк" in out["revision_note"]
+
+
+# ----------------------------- --base у patch (пост-мортем Авито 12.10) -----
+
+def _sidecar(engine, tmp_path, revision):
+    path = tmp_path / "live.md.gdocs-base.json"
+    path.write_text(json.dumps({
+        "schema_version": engine.SIDECAR_SCHEMA_VERSION, "doc_id": "doc1",
+        "revision_id": revision, "elements": []}), encoding="utf-8")
+    return str(path)
+
+
+def _patch_with_base(engine, tmp_path, capsys, ops, base, dry_run=False):
+    path = tmp_path / "ops.json"
+    path.write_text(json.dumps(ops), encoding="utf-8")
+    code = 0
+    try:
+        engine.patch_doc("doc1", str(path), base=base, dry_run=dry_run)
+    except SystemExit as exc:
+        code = exc.code
+    return code, json.loads(capsys.readouterr().out)
+
+
+OPS_ONE = [{"op": "replace_quote", "quote": "Копия", "occurrence": 1,
+            "with": "Правка"}]
+
+
+def test_a_stale_base_stops_patch_before_any_write(engine, monkeypatch,
+                                                   tmp_path, capsys):
+    """Правило «скачать и сверить перед записью» — механизмом: документ
+    правили после выгрузки, значит ни одной записи, включая канарейку."""
+    docs = _twins(engine, monkeypatch)
+    code, out = _patch_with_base(engine, tmp_path, capsys, OPS_ONE,
+                                 _sidecar(engine, tmp_path, "R-old"))
+    assert code == 1
+    assert out["reason"] == "concurrent_edit"
+    assert out["details"]["base_revision"] == "R-old"
+    assert docs.batches == []
+
+
+def test_a_matching_base_lets_patch_through(engine, monkeypatch, tmp_path,
+                                            capsys):
+    docs = _twins(engine, monkeypatch)
+    code, out = _patch_with_base(engine, tmp_path, capsys, OPS_ONE,
+                                 _sidecar(engine, tmp_path, "R0"))
+    assert code == 0, out
+    assert _body(docs)[1] == "Правка"
+
+
+def test_the_dry_run_names_a_stale_base_as_a_refusal(engine, monkeypatch,
+                                                     tmp_path, capsys):
+    docs = _twins(engine, monkeypatch)
+    code, out = _patch_with_base(engine, tmp_path, capsys, OPS_ONE,
+                                 _sidecar(engine, tmp_path, "R-old"),
+                                 dry_run=True)
+    assert code == 3
+    assert out["summary"]["verdict"] == "refusals"
+    assert out["operations"][0]["reason"] == "concurrent_edit"
+    assert docs.batches == []
+    assert engine._RAISE_ERRORS is False

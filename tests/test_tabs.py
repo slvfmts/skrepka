@@ -424,6 +424,78 @@ def _tab_with_table(tab_id, title, cell_text):
                       "textRun": {"content": "\n"}}]}}]}}}
 
 
+def _tab_with_icon_table(tab_id, title, after_text):
+    """Вкладка: таблица 1×2, в ячейке (0, 0) только картинка, в (0, 1) текст;
+    следом абзац с текстом и пустой абзац — как таблица преимуществ с
+    иконками на лендинге Северстали (пост-мортем 15.10)."""
+    def para(start, elements):
+        return {"startIndex": start, "endIndex": elements[-1]["endIndex"],
+                "paragraph": {"elements": elements}}
+    icon = para(4, [{"startIndex": 4, "endIndex": 5,
+                     "inlineObjectElement": {"inlineObjectId": "kix.icon"}},
+                    {"startIndex": 5, "endIndex": 6,
+                     "textRun": {"content": "\n"}}])
+    word = para(7, [{"startIndex": 7, "endIndex": 13,
+                     "textRun": {"content": "Плюсы\n"}}])
+    after_end = 15 + len(after_text) + 1
+    return {"tabProperties": {"tabId": tab_id, "title": title},
+            "documentTab": {"body": {"content": [
+                {"startIndex": 1, "endIndex": 14, "table": {
+                    "tableRows": [{"startIndex": 2, "endIndex": 13,
+                                   "tableCells": [
+                                       {"startIndex": 3, "endIndex": 6,
+                                        "content": [icon]},
+                                       {"startIndex": 6, "endIndex": 13,
+                                        "content": [word]}]}]}},
+                para(15, [{"startIndex": 15, "endIndex": after_end,
+                           "textRun": {"content": after_text + "\n"}}]),
+                para(after_end, [{"startIndex": after_end,
+                                  "endIndex": after_end + 1,
+                                  "textRun": {"content": "\n"}}])]}}}
+
+
+def test_a_cell_holding_only_a_picture_does_not_break_the_tab_proof(
+        engine, make_docx):
+    """Пост-мортем 15.10: ячейка из одной иконки закрывала для `patch` всю
+    вкладку — «ячейки (0, 0) нет на стороне API». Картинка не даёт тексту ни
+    одного символа ни с одной стороны, и абзац тела с ней сравнивается по
+    тексту давно; ячейка обязана читаться так же."""
+    api = [_tab_with_icon_table("t.0", "Tab 1", "Абзац после"),
+           _tab_body("t.2", "Редакция 2", ["Другое", ""])]
+    tbl = ('<w:tbl><w:tr><w:tc><w:p><w:r><w:drawing/></w:r></w:p></w:tc>'
+           '<w:tc><w:p><w:r><w:t>Плюсы</w:t></w:r></w:p></w:tc>'
+           '</w:tr></w:tbl>')
+    body = (_head("Tab 1") + tbl + _para("Абзац после", comment=0) + "<w:p/>"
+            + _head("Редакция 2") + _para("Другое") + "<w:p/>")
+    spans, problems, census = engine._parse_docx_anchor_spans(make_docx(body))
+    assert problems == []
+    tabs = engine._collect_tabs({"tabs": api})
+    first, last, why = engine._prove_target_segment(census["outline"], tabs,
+                                                    "t.0")
+    assert why is None, why
+    assert (first, last) == (0, 3)
+
+
+def test_a_picture_cell_still_compares_its_text(engine, make_docx):
+    """Обратная сторона: картинка не отменяет сравнения текста ячейки. Если
+    рядом с иконкой в API есть слово, которого нет в выгрузке, граница не
+    доказана — иначе «умеет читать картинки» стало бы «не читает ячейку»."""
+    api = _tab_with_icon_table("t.0", "Tab 1", "Абзац после")
+    cell = api["documentTab"]["body"]["content"][0]["table"]["tableRows"][0][
+        "tableCells"][0]["content"][0]["paragraph"]["elements"]
+    cell[1]["textRun"]["content"] = "подпись\n"
+    tbl = ('<w:tbl><w:tr><w:tc><w:p><w:r><w:drawing/></w:r></w:p></w:tc>'
+           '<w:tc><w:p><w:r><w:t>Плюсы</w:t></w:r></w:p></w:tc>'
+           '</w:tr></w:tbl>')
+    body = _head("Tab 1") + tbl + _para("Абзац после") + "<w:p/>"
+    _spans, problems, census = engine._parse_docx_anchor_spans(
+        make_docx(body))
+    assert problems == []
+    tabs = engine._collect_tabs({"tabs": [api]})
+    _f, _l, why = engine._prove_target_segment(census["outline"], tabs, "t.0")
+    assert why and "(0, 0)" in why
+
+
 def test_a_cell_anchor_in_the_second_tab_is_placed(engine, make_docx):
     """Решётка считается ВНУТРИ отрезка — иначе замеренное M19-19.
 

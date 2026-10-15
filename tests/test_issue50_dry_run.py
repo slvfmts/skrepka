@@ -1194,3 +1194,87 @@ def test_a_file_with_nothing_for_the_clean_batch_stays_per_op(
     out = _dry(engine, tmp_path, capsys, [
         {"op": "replace_anchor", "comment_id": "g1", "with": "Beta"}])
     assert out["doc_strategy"] == "anchor-safe-per-op"
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-15: недоказуемая граница вкладки видна по чтению
+# ---------------------------------------------------------------------------
+
+_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+def _two_tab_doc(first_text):
+    def tab(tid, title, text):
+        end = 1 + len(text) + 1
+        return {"tabProperties": {"tabId": tid, "title": title},
+                "documentTab": {"body": {"content": [{
+                    "startIndex": 1, "endIndex": end,
+                    "paragraph": {"elements": [{
+                        "startIndex": 1, "endIndex": end,
+                        "textRun": {"content": text + "\n"}}]}}]}}}
+    return {"revisionId": "R0",
+            "tabs": [tab("t.0", "Первая", first_text),
+                     tab("t.1", "Вторая", "Другое")]}
+
+
+def _two_tab_docx(first_text):
+    import io
+    import zipfile
+
+    def para(text, cid=None):
+        if cid is None:
+            return f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p>"
+        return (f'<w:p><w:commentRangeStart w:id="{cid}"/><w:r><w:t>{text}'
+                f'</w:t></w:r><w:commentRangeEnd w:id="{cid}"/></w:p>')
+    body = (para("Первая") + para(first_text, cid=0)
+            + para("Вторая") + para("Другое"))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("word/document.xml",
+                   f'<w:document xmlns:w="{_W}"><w:body>{body}</w:body>'
+                   f'</w:document>')
+        z.writestr("word/comments.xml",
+                   f'<w:comments xmlns:w="{_W}"><w:comment w:id="0" '
+                   f'w:author="A" w:date="2026-10-05T08:16:00Z"/>'
+                   f'</w:comments>')
+    return buf.getvalue()
+
+
+def test_an_unprovable_tab_boundary_is_a_refusal_not_unknown(
+        engine, monkeypatch, tmp_path, capsys):
+    """Пост-мортем 15.10: холостой прогон ответил `unknown` на все 26 замен
+    во вкладке, граница которой не доказывается по выгрузке, — и оператор
+    потратил на попытку разрешение владельца на запись. Это видно по
+    чтению: доказательство то же, что у писателя, кроме канарейки."""
+    threads = [_thread("live", "A", "2026-10-05T08:16:00Z")]
+    # В документе одна фраза, в выгрузке — другая: граница не сходится.
+    _service, _drive = _wire_export(
+        engine, monkeypatch, _two_tab_doc("Alpha Omega"), threads,
+        _two_tab_docx("Совсем иное"))
+    path = _ops_file(tmp_path, [
+        {"op": "replace_quote", "quote": "Alpha", "with": "Beta"},
+        {"op": "insert_after_quote", "quote": "Omega", "text": "!"}])
+    with pytest.raises(SystemExit) as exc:
+        engine.dry_run_patch("d1", path, tab_id="t.0")
+    assert exc.value.code == 3
+    out = json.loads(capsys.readouterr().out)
+    replace, insert = out["operations"]
+    assert replace["status"] == "would_refuse", replace
+    assert replace.get("reason") == "tab_boundary_unproven", replace
+    assert "повтор не поможет" in replace["error"]
+    # Вставка якорей не трогает и границы не доказывает — её прогноз прежний.
+    assert insert["status"] == "would_apply"
+
+
+def test_a_provable_tab_boundary_keeps_the_dry_run_at_unknown(
+        engine, monkeypatch, tmp_path, capsys):
+    """Зеркало: граница сходится — прогноз прежний, `unknown`. Без этой пары
+    первый тест доказывал бы только «двухвкладочный ⇒ отказ»."""
+    threads = [_thread("live", "A", "2026-10-05T08:16:00Z")]
+    _wire_export(engine, monkeypatch, _two_tab_doc("Alpha"), threads,
+                 _two_tab_docx("Alpha"))
+    engine.dry_run_patch("d1", _ops_file(tmp_path, [
+        {"op": "replace_quote", "quote": "Alpha", "with": "Beta"}]),
+        tab_id="t.0")
+    out = json.loads(capsys.readouterr().out)
+    assert out["operations"][0]["status"] == "unknown"
