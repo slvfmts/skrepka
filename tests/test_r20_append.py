@@ -239,3 +239,22 @@ def test_a_stale_base_stops_append(engine, monkeypatch, tmp_path, capsys):
     code, out = _run(engine, tmp_path, capsys, "Текст\n", base=str(base))
     assert code == 1 and out["reason"] == "concurrent_edit"
     assert docs.batches == []
+
+
+@pytest.mark.parametrize("md, text, spans", [
+    # ревью Codex: вложенный одинаковый маркер ронял разбор KeyError
+    ("**a **b** c**", "a b c", [(0, 5, "bold")]),
+    ("**a __b__ c**", "a b c", [(0, 5, "bold")]),
+    ("***оба***", "оба", [(0, 3, "bold"), (0, 3, "italic")]),
+    ("**[жирная ссылка](https://e.x)**", "жирная ссылка",
+     [(0, 13, "bold"), (0, 13, "link:https://e.x")]),
+    ("**жирный *курсив* хвост**", "жирный курсив хвост",
+     [(0, 19, "bold"), (7, 13, "italic")]),
+    # эмодзи — две единицы UTF-16: смещения после него сдвигаются на 2
+    ("🙂 **жирный**", "🙂 жирный", [(3, 9, "bold")]),
+])
+def test_nested_and_wide_inline_marks(engine, md, text, spans):
+    blocks, why = engine._append_blocks(md)
+    assert why is None
+    assert blocks[0]["text"] == text
+    assert sorted(blocks[0]["spans"]) == sorted(spans)

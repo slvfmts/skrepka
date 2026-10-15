@@ -9598,13 +9598,20 @@ def _append_inline(inline):
     внутри абзаца — пробел, как в любом markdown. Всё прочее — отказ с
     названием конструкции, а не тихое упрощение.
     """
-    parts, spans, active, starts = [], [], [], {}
+    parts, spans, opened = [], [], {}
     pos = 0
 
     def put(text):
         nonlocal pos
         parts.append(text)
         pos += _utf16_len(text)
+
+    def mark_of(tok):
+        if tok.type.startswith("strong"):
+            return "bold"
+        if tok.type.startswith("em"):
+            return "italic"
+        return "link"
 
     for tok in inline.children or []:
         t = tok.type
@@ -9615,19 +9622,22 @@ def _append_inline(inline):
         elif t == "hardbreak":
             put("\v")
         elif t in ("strong_open", "em_open", "link_open"):
-            mark = ("bold" if t == "strong_open" else "italic"
-                    if t == "em_open" else f"link:{tok.attrs.get('href', '')}")
-            active.append(mark)
-            starts[mark] = pos
+            # Стек на каждую метку: `**a **b** c**` открывает полужирный
+            # дважды, и закрытие внутреннего не должно ни ронять разбор, ни
+            # обрывать внешний (ревью Codex). Полужирный внутри полужирного —
+            # тот же полужирный: span пишется по самой внешней паре.
+            href = tok.attrs.get("href", "") if t == "link_open" else None
+            opened.setdefault(mark_of(tok), []).append((pos, href))
         elif t in ("strong_close", "em_close", "link_close"):
-            mark = ("bold" if t == "strong_close" else "italic"
-                    if t == "em_close" else
-                    next((m for m in reversed(active)
-                          if m.startswith("link:")), None))
-            if mark in active:
-                active.remove(mark)
-                if pos > starts[mark]:
-                    spans.append((starts.pop(mark), pos, mark))
+            stack = opened.get(mark_of(tok)) or []
+            if not stack:
+                continue
+            start, href = stack.pop()
+            if mark_of(tok) == "link":
+                if pos > start:
+                    spans.append((start, pos, f"link:{href}"))
+            elif not stack and pos > start:
+                spans.append((start, pos, mark_of(tok)))
         else:
             return None, f"«{t}» в строке «{inline.content[:40]}»"
     return "".join(parts), spans
@@ -9864,11 +9874,13 @@ def append_block(file_id, md_path, tab_id=None, *, dry_run=False,
                   "writeControl": _write_control(revision_id)},
         ).execute()
     except HttpError as e:
+        # `concurrent_edit` — только отказ по закреплённой ревизии; прочие
+        # 400 (кривой запрос) этим кодом назвать значило бы послать агента
+        # перескачивать документ, который никто не трогал.
         _error(f"дозапись не прошла, документ не изменён: "
                f"{e.reason if hasattr(e, 'reason') else e}",
-               reason=("concurrent_edit"
-                       if getattr(getattr(e, "resp", None), "status", None)
-                       == 400 else None))
+               reason=("concurrent_edit" if "revision" in str(e).lower()
+                       else None))
     receipt["revision_id_after"] = None
     try:
         after_doc = _safe_get_doc(docs_service, file_id)
