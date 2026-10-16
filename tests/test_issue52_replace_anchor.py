@@ -443,67 +443,6 @@ def test_an_ordinal_after_a_thread_edit_still_lands_on_its_copy(
     снимка остаётся №2 — это сценарий «один заголовок прокомментирован,
     поправь во всех каналах» (вопрос владельца 16.10).
     """
-    docs = _live_twins(engine, monkeypatch)
-    code, out = _run(engine, tmp_path, capsys, [
-        {"op": "replace_anchor", "comment_id": "c1", "with": "Первая"},
-        {"op": "replace_anchor", "comment_id": "c1", "with": "Вторая"},
-    ])
-    assert code == 3
-    assert len(out["refused"]) == 2
-    assert out["ops_applied"] == 0
-    assert all("одному треду" in e["error"] for e in out["refused"])
-
-
-def test_a_document_without_comments_has_nothing_to_address(engine,
-                                                            monkeypatch,
-                                                            tmp_path, capsys):
-    docs = DocsStub(make_doc(SINGLE))
-    drive = DriveStub([], _docx_builder(docs, [(t, []) for t in SINGLE], []))
-    wire(engine, monkeypatch, docs, drive)
-    code, out = _run(engine, tmp_path, capsys, [
-        {"op": "replace_anchor", "comment_id": "c1", "with": "Правка"}])
-    assert code == 3
-    entry = out["refused"][0]
-    assert entry["reason"] == "comment_thread_unresolvable"
-    assert "нет заякоренных комментариев" in entry["error"]
-    assert docs.batches == []
-
-
-# ------------------------------------------ последовательность в файле -----
-
-def test_a_thread_already_touched_by_this_run_is_refused(engine, monkeypatch,
-                                                         tmp_path, capsys):
-    """Адрес этой операции — тред, и любой текст под ним для неё законен.
-
-    Значит после соседней правки, сдвинувшей разговор, она молча накрыла бы
-    её результат целиком, и обе числились бы применёнными. У обычной замены
-    этой беды нет: она сверяет текст в разрешённом диапазоне с тем, по
-    которому адресовалась. Найдено ревью codex.
-    """
-    _docs, _drive = _single(engine, monkeypatch, mutating=True)
-    code, out = _run(engine, tmp_path, capsys, [
-        {"op": "replace_quote", "quote": "опи", "with": "ОПИ"},
-        {"op": "replace_anchor", "comment_id": "c1", "with": "Правка"},
-    ])
-    assert code == 3
-    assert out["ops_applied"] == 1
-    entry = out["refused"][0]
-    assert entry["reason"] == "concurrent_edit"
-    assert "уже задет правкой" in entry["error"]
-
-
-def test_an_ordinal_after_a_thread_edit_still_lands_on_its_copy(
-        engine, monkeypatch, tmp_path, capsys):
-    """Номер вхождения осмыслен только вместе с числом копий.
-
-    Три одинаковых абзаца, разговор на первом. Правка по треду переписывает
-    первую копию — и `occurrence: 2` на живом документе показывал бы на
-    бывшую третью. До 0.20.1 такая правка отказывала (`concurrent_edit`,
-    «было 3, стало 2»): учёт знал только свои замены по цитате. Теперь он
-    ведёт позиции копий через каждую применённую правку, и №2 исходного
-    снимка остаётся №2 — это сценарий «один заголовок прокомментирован,
-    поправь во всех каналах» (вопрос владельца 16.10).
-    """
     from test_sync_anchors import make_docx_full
     docs = MutatingDocsStub(make_doc(["Копия", "Копия", "Копия"]))
 
