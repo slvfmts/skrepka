@@ -1025,3 +1025,29 @@ def test_a_foreign_edit_between_the_base_check_and_the_first_write_stops(
     assert out["ops_applied"] == 0
     assert out["refused"][0]["reason"] == "concurrent_edit"
     assert docs.batches == []
+
+
+def test_copies_swapped_under_the_run_are_caught_by_position(
+        engine, monkeypatch, tmp_path, capsys):
+    """Ревью Codex 0.20.1: чужая правка убрала одну копию и добавила другую —
+    число копий прежнее, и проверка по числу пропускала правку в новую,
+    чужую копию. Учёт знает, ГДЕ стояли копии, и сверяет места."""
+    docs = _twins(engine, monkeypatch)
+    real = engine._safe_get_doc
+    reads = []
+
+    def racing(service, file_id):
+        doc = real(service, file_id)
+        reads.append(1)
+        if len(reads) == 1:
+            # после снимка: первая «Копия» переписана, новая — в конце
+            docs._store("Alpha\nЧужое\nКопия\nКопия\n")
+        return doc
+
+    monkeypatch.setattr(engine, "_safe_get_doc", racing)
+    _code, out = _run(engine, tmp_path, capsys, [
+        {"op": "replace_quote", "quote": "Копия", "occurrence": 2,
+         "with": "Правка"}])
+    assert out["ops_applied"] == 0
+    assert out["refused"][0]["reason"] == "concurrent_edit"
+    assert "Правка" not in docs._flat()

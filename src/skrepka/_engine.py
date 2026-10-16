@@ -6296,6 +6296,47 @@ def _rebase_occurrence(op, resolved, ledger):
     return dict(op, occurrence=alive_before + 1), alive, None
 
 
+def _ledger_positions(ledger, op):
+    """Где учёт ждёт живые копии цитаты операции, или None, если не знает."""
+    if (not ledger or ledger.get("\x00poisoned") or "occurrence" not in op
+            or "range" in op or not isinstance(op.get("quote"), str)):
+        return None
+    copies = ledger.get(op["quote"])
+    if not copies:
+        return None
+    return [(c[0], c[1]) for c in copies if c[2]]
+
+
+def _check_copy_positions(doc_tab, op, expected):
+    """Копии цитаты стоят там, где их ждёт учёт, — не только их число.
+
+    Одного числа мало (ревью Codex, 0.20.1): чужая правка, убравшая одну
+    копию и добавившая другую, оставляет число прежним, и номер тихо
+    показывает на новую копию. Позиции учёт знает с начала вызова и сдвигает
+    своими правками; разошлись — документ правил кто-то ещё, отказ. Цена —
+    отказ и тогда, когда чужая правка выше лишь сдвинула копии, не трогая их:
+    промахнуться мимо копии дороже.
+    """
+    if expected is None:
+        return
+    q = op["quote"]
+    live = []
+    for k in range(1, len(expected) + 2):
+        found = _find_quote_in_doctab(doc_tab, q, occurrence=k)
+        if not found:
+            break
+        live.append(tuple(found[:2]))
+    if live != [tuple(x) for x in expected]:
+        _error(
+            f"одинаковые места цитаты {q!r} стоят не там, где стояли, когда "
+            f"выбирали номер, — документ правили во время прогона. Номер "
+            f"вхождения теперь может показывать на другую копию; правка "
+            f"отклонена. Прочитайте документ заново.",
+            reason="concurrent_edit",
+            details={"expected_positions": [list(x) for x in expected][:10],
+                     "found_positions": [list(x) for x in live][:10]})
+
+
 def _check_occurrence_stability(r, expected):
     """Номер вхождения имеет смысл только вместе с их числом.
 
@@ -7167,7 +7208,8 @@ def _require_base_revision(doc, required):
 
 
 def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
-                          expect_occurrences=None, require_revision=None):
+                          expect_occurrences=None, require_revision=None,
+                          expect_positions=None):
     """Apply ONE op on a commented doc.
 
     Inserts: fresh read, re-resolve, pinned batch (C5 verified safe).
@@ -7193,6 +7235,7 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
         tid, doc_tab = _select_tab(doc, tab_id=tab_id)
         r = _resolve_op(op, doc_tab, tid)
         _check_occurrence_stability(r, expect_occurrences)
+        _check_copy_positions(doc_tab, op, expect_positions)
         _refuse_on_suggestion_at(doc_tab, r["start"], r["source"])
         if not r["text"]:
             return {"source": r["source"], "applied_as": "no-op",
@@ -7244,6 +7287,7 @@ def _apply_op_anchor_safe(docs_service, drive_service, file_id, op, tab_id,
         r = None if by_anchor else _resolve_op(op, doc_tab, tid)
         if r is not None:
             _check_occurrence_stability(r, expect_occurrences)
+            _check_copy_positions(doc_tab, op, expect_positions)
 
         if r is not None and _op_is_noop(op, doc_tab, r):
             return {"source": r["source"], "applied_as": "no-op",
@@ -9518,6 +9562,7 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None,
             try:
                 call_op, expect, why = _rebase_occurrence(
                     op, resolved[i], consumed_copies)
+                positions = _ledger_positions(consumed_copies, op)
                 if why:
                     _error(why, reason="concurrent_edit",
                            details={"occurrence": op.get("occurrence")})
@@ -9527,7 +9572,8 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None,
                     # а копию мог унести любой сосед по файлу.
                     expect_occurrences=expect,
                     require_revision=(base_revision
-                                      if not attempted_write else None))
+                                      if not attempted_write else None),
+                    expect_positions=positions)
             finally:
                 _RAISE_ERRORS = False
             attempted_write = True
