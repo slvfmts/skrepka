@@ -6201,50 +6201,99 @@ def _execute_index_replace(docs_service, file_id, tid, start, end, new_text,
     ).execute()
 
 
-def _rebase_occurrence(op, resolved, consumed):
+def _copy_ledger(ops, doc_tab):
+    """Где на исходном снимке стоят копии цитат, адресованных номером.
+
+    {цитата: [[начало, конец, жива], ...]} в порядке номеров. Номер вхождения
+    адресует копию на снимке начала вызова — так его и выбирают, — а цикл
+    записи правит документ по одной операции. Каждая применённая правка
+    сдвигает копии за собой или задевает их (`_ledger_apply`), и номер
+    пересчитывается по живым копиям (`_rebase_occurrence`). Раньше учёт знал
+    только свои замены по цитате, и правка по треду на одной из копий ломала
+    номера остальных (0.20.1).
+    """
+    ledger = {}
+    for op in ops:
+        if (not isinstance(op, dict) or "occurrence" not in op
+                or "range" in op or not isinstance(op.get("quote"), str)
+                or op["quote"] in ledger or not op["quote"]):
+            continue
+        q = op["quote"]
+        try:
+            total = _count_quote_occurrences(doc_tab, q)
+            ledger[q] = [list(_find_quote_in_doctab(doc_tab, q, k)[:2])
+                         + [True] for k in range(1, total + 1)]
+        except Exception:                                       # noqa: BLE001
+            # Не разрешилось — этим займётся сама операция; без позиций
+            # пересчёта нет, и проверка стабильности стоит как раньше.
+            continue
+    return ledger
+
+
+def _ledger_apply(ledger, note):
+    """Провести через учёт копий одну применённую правку.
+
+    `range_before` и `text_after` квитанции — фактически выполненные
+    (`_effect_receipt`). Вставка строго внутри копии и удаление, задевшее
+    копию, делают её «не той»; всё, что лежит за правкой, сдвигается на
+    разницу длин. Квитанция без диапазона — учёт больше ничего не знает и
+    выключается: тогда номер не пересчитывается вовсе, и при сдвиге копий
+    правка откажет, как до 0.20.
+    """
+    if not ledger or not note or note.get("applied_as") == "no-op":
+        return
+    rng, text = note.get("range_before"), note.get("text_after")
+    if (not isinstance(rng, list) or len(rng) != 2
+            or not isinstance(text, str)):
+        ledger["\x00poisoned"] = True
+        return
+    a, b = rng
+    delta = _utf16_len(text) - (b - a)
+    for q, copies in ledger.items():
+        if q == "\x00poisoned":
+            continue
+        for c in copies:
+            if not c[2]:
+                continue
+            s, e = c[0], c[1]
+            touched = (s < a < e) if a == b else (s < b and a < e)
+            if touched:
+                c[2] = False
+            elif s >= (a if a == b else b):
+                c[0], c[1] = s + delta, e + delta
+
+
+def _rebase_occurrence(op, resolved, ledger):
     """Пересчитать адрес `occurrence` с исходного снимка на живой документ.
 
-    Возвращает (операция для записи, ожидаемое число копий). Из исходного
-    счёта вычитаются копии, которые унесли СВОИ применённые замены этого
-    файла (`_note_consumed_copy`): копия с меньшим исходным номером сдвигает
-    номер на один, любая — уменьшает число на один. Проверка стабильности
-    остаётся как была: если живое число не равно пересчитанному, значит
-    копии двигал кто-то, кроме нас, и правка отказывает.
+    Возвращает (операция для записи, ожидаемое число копий, отказ или None).
+    Номер — среди живых копий, число — живые копии. Если собственную копию
+    операции уже задела правка этого файла, адрес показывает на текст,
+    которого не выбирали, — отказ. Проверка стабильности остаётся: живое
+    число на документе не равно пересчитанному — копии двигал кто-то ещё.
     """
     if not resolved or "occurrence" not in op:
-        return op, None
+        return op, None, None
     expect = resolved["quote_total"]
-    gone = consumed.get(op.get("quote")) or []
-    if not gone or expect is None:
-        return op, expect
+    copies = ledger.get(op.get("quote")) if isinstance(op.get("quote"),
+                                                       str) else None
+    if (not copies or ledger.get("\x00poisoned") or expect is None
+            or len(copies) != expect):
+        return op, expect, None
     occ = op["occurrence"]
-    if occ in gone:
-        # Ту же копию уже заменили — повторный адрес на неё показывал бы на
-        # соседку. Пересекающиеся правки отклоняет плановая фаза, так что
-        # сюда не приходят; подпорка, а не путь.
-        return op, expect
-    rebased = dict(op, occurrence=occ - sum(1 for g in gone if g < occ))
-    return rebased, expect - len(gone)
-
-
-def _note_consumed_copy(op, note, consumed):
-    """Запомнить, что применённая замена по `occurrence` унесла свою копию.
-
-    Только когда это доказуемо по самой операции: замена по цитате с явным
-    номером, записанная (не `no-op`), и в новом тексте цитаты нет. Иначе
-    счёт не трогается, и если копий стало другое число, проверка
-    стабильности откажет, как раньше."""
-    if (op.get("op") != "replace_quote" or "occurrence" not in op
-            or "range" in op or not isinstance(op.get("quote"), str)):
-        # Адрес по `range` старше `quote`: лишние `quote`/`occurrence` у такой
-        # операции не используются и копию цитаты она не уносит.
-        return
-    if (note or {}).get("applied_as") == "no-op":
-        return
-    new_text = op.get("text") if "text" in op else op.get("with")
-    if not isinstance(new_text, str) or op["quote"] in new_text:
-        return
-    consumed.setdefault(op["quote"], []).append(op["occurrence"])
+    if not 1 <= occ <= len(copies):
+        return op, expect, None
+    if all(c[2] for c in copies):
+        return op, expect, None
+    if not copies[occ - 1][2]:
+        return op, expect, (
+            f"копию №{occ} цитаты {op['quote']!r} уже изменила правка из "
+            f"этого же файла — текст под этим адресом не тот, для которого "
+            f"писали правку. Прочитайте документ заново и адресуйте её ещё "
+            f"раз.")
+    alive_before = sum(1 for c in copies[:occ - 1] if c[2])
+    alive = sum(1 for c in copies if c[2])
+    return dict(op, occurrence=alive_before + 1), alive, None
 
 
 def _check_occurrence_stability(r, expected):
@@ -9424,7 +9473,7 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None,
     # «с конца к началу» отказывала с `concurrent_edit` на собственной соседке
     # (пост-мортем 12.10). Здесь копятся номера копий, унесённых своими
     # применёнными заменами: цитата -> [исходные номера].
-    consumed_copies = {}
+    consumed_copies = _copy_ledger(ops, doc_tab)
     # `--base`: до первой попытки записи документ обязан стоять на ревизии из
     # сайдкара; после неё ревизию двигает уже сама skrepka (канарейка).
     attempted_write = False
@@ -9467,8 +9516,11 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None,
         try:
             _RAISE_ERRORS = True  # nested preflight errors must not exit
             try:
-                call_op, expect = _rebase_occurrence(
+                call_op, expect, why = _rebase_occurrence(
                     op, resolved[i], consumed_copies)
+                if why:
+                    _error(why, reason="concurrent_edit",
+                           details={"occurrence": op.get("occurrence")})
                 note = _apply_op_anchor_safe(
                     docs_service, drive_service, file_id, call_op, tab_id,
                     # Номер вхождения осмыслен только вместе с числом копий,
@@ -9479,7 +9531,7 @@ def patch_doc(file_id, ops_path, tab_id=None, *, dry_run=False, output=None,
             finally:
                 _RAISE_ERRORS = False
             attempted_write = True
-            _note_consumed_copy(op, note, consumed_copies)
+            _ledger_apply(consumed_copies, note)
             applied.append(_op_source_label(op, resolved[i]))
             if i in deferred:
                 # It resolved against the live document even though it did not
@@ -9943,7 +9995,7 @@ def append_block(file_id, md_path, tab_id=None, *, dry_run=False,
 # Named ranges (mark)
 # ---------------------------------------------------------------------------
 
-def mark_range(file_id, name, quote, tab_id=None, occurrence=1):
+def mark_range(file_id, name, quote, tab_id=None, occurrence=None):
     """Create a named range around a text fragment.
 
     Named ranges are the only reliable machine-owned anchoring mechanism:
@@ -9968,14 +10020,19 @@ def mark_range(file_id, name, quote, tab_id=None, occurrence=1):
     total = _count_quote_occurrences(doc_tab, quote)
     if total == 0:
         _error(f"quote not found in tab {tid or '(default)'}: {quote!r}")
-    if occurrence > total:
-        _error(
-            f"occurrence {occurrence} out of range: only {total} matches for {quote!r}"
-        )
-    if total > 1 and occurrence == 1:
+    # «Номер не указан» и «указан 1» — разные вещи: раньше умолчание было 1,
+    # и явная первая копия повторяющейся цитаты отказывала как неоднозначная
+    # (0.20.1).
+    if total > 1 and occurrence is None:
         _error(
             f"quote is non-unique ({total} matches). "
             f"Pass --occurrence N to disambiguate."
+        )
+    if occurrence is None:
+        occurrence = 1
+    if occurrence < 1 or occurrence > total:
+        _error(
+            f"occurrence {occurrence} out of range: only {total} matches for {quote!r}"
         )
 
     found = _find_quote_in_doctab(doc_tab, quote, occurrence=occurrence)
@@ -14065,7 +14122,7 @@ def main():
     mk.add_argument("--quote", required=True, help="Фрагмент текста")
     mk.add_argument("--tab", dest="tab_id", default=None,
                     help="Идентификатор вкладки. Нужен, только если вкладок несколько")
-    mk.add_argument("--occurrence", type=int, default=1,
+    mk.add_argument("--occurrence", type=int, default=None,
                     help="Номер вхождения, если цитата неоднозначна (с 1)")
 
     # download command

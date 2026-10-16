@@ -645,6 +645,46 @@ def test_mark_sends_its_request_through_the_write_gate(engine, monkeypatch):
     assert named[0]["createNamedRange"]["range"]["tabId"] == "t.втор"
 
 
+def _mark_on_twins(engine, monkeypatch, **kw):
+    doc = {"revisionId": "R0",
+           "tabs": [_tab_body("t.0", "Черновик", ["цель", "цель", ""])]}
+    docs = _Docs(doc)
+
+    class Drive:
+        def comments(self):
+            return self
+
+        def list(self, **kw):
+            return _Res({"comments": []})
+
+    monkeypatch.setattr(engine, "get_creds", lambda: object())
+    monkeypatch.setattr(engine, "get_docs_service", lambda c: docs)
+    monkeypatch.setattr(engine, "get_drive_service", lambda c: Drive())
+    try:
+        engine.mark_range("F", "метка", "цель", **kw)
+    except SystemExit:
+        pass
+    return [r["createNamedRange"]["range"] for b in docs.batches
+            for r in b["requests"] if "createNamedRange" in r]
+
+
+def test_mark_can_name_the_first_of_repeated_copies(engine, monkeypatch,
+                                                    capsys):
+    """0.20.1: явный `--occurrence 1` у повторяющейся цитаты отказывал как
+    «неоднозначная» — умолчание и явная первая копия были неотличимы, и
+    пометить первую копию было нечем."""
+    [rng] = _mark_on_twins(engine, monkeypatch, occurrence=1)
+    assert (rng["startIndex"], rng["endIndex"]) == (1, 5)
+    [rng] = _mark_on_twins(engine, monkeypatch, occurrence=2)
+    assert (rng["startIndex"], rng["endIndex"]) == (6, 10)
+
+
+def test_mark_without_a_number_still_refuses_on_repeats(engine, monkeypatch,
+                                                        capsys):
+    assert _mark_on_twins(engine, monkeypatch) == []
+    assert "non-unique" in capsys.readouterr().out
+
+
 def test_sync_still_refuses_a_multi_tab_document(engine, monkeypatch,
                                                 tmp_path, capsys):
     """Гейт `sync` снимать нельзя: его запросы вкладку не несут.

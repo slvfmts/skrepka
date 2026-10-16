@@ -121,17 +121,26 @@ def test_dry_base_missing_reason(engine, monkeypatch, tmp_path, capsys):
     assert out["operations"][0]["reason"] == "schema_invalid"
 
 
-def test_a_range_addressed_replace_consumes_no_quote_copy(engine):
+def test_a_range_addressed_replace_is_not_counted_as_a_quote_copy(engine):
     """Ревью r20, находка 6а: у операции с `range` лишние `quote` и
-    `occurrence` не используются — копию цитаты она не уносит, и пересчёт
-    номера по ней сдвинул бы соседнюю правку на чужую копию."""
-    consumed = {}
-    engine._note_consumed_copy(
-        {"op": "replace_quote", "range": "r1", "quote": "Копия",
-         "occurrence": 1, "with": "Другое"}, {}, consumed)
-    assert consumed == {}
-    engine._note_consumed_copy(
-        {"op": "replace_quote", "quote": "Копия", "occurrence": 1,
-         "text": "Копия!", "with": "Другое"}, {}, consumed)
-    # писатель берёт `text` раньше `with`; цитата в нём осталась — не унесена
-    assert consumed == {}
+    `occurrence` не используются — копий её цитаты учёт не заводит, и пересчёт
+    номера по ней не сдвинет соседнюю правку на чужую копию."""
+    tab = {"body": {"content": [{"startIndex": 1, "endIndex": 13,
+                                 "paragraph": {"elements": [{
+                                     "startIndex": 1, "endIndex": 13,
+                                     "textRun": {"content": "Копия Копия\n"}}]}}]}}
+    ledger = engine._copy_ledger(
+        [{"op": "replace_quote", "range": "r1", "quote": "Копия",
+          "occurrence": 1, "with": "x"}], tab)
+    assert ledger == {}
+    ledger = engine._copy_ledger(
+        [{"op": "replace_quote", "quote": "Копия", "occurrence": 2,
+          "with": "x"}], tab)
+    assert ledger == {"Копия": [[1, 6, True], [7, 12, True]]}
+    # вставка в начало сдвигает обе, замена первой — уносит её
+    engine._ledger_apply(ledger, {"applied_as": "insert",
+                                  "range_before": [1, 1], "text_after": "ab"})
+    assert ledger["Копия"] == [[3, 8, True], [9, 14, True]]
+    engine._ledger_apply(ledger, {"applied_as": "replace",
+                                  "range_before": [3, 8], "text_after": "Z"})
+    assert ledger["Копия"] == [[3, 8, False], [5, 10, True]]

@@ -411,30 +411,165 @@ def test_a_thread_already_touched_by_this_run_is_refused(engine, monkeypatch,
     assert "уже задет правкой" in entry["error"]
 
 
-def test_an_ordinal_that_moved_under_the_run_is_refused(engine, monkeypatch,
-                                                        tmp_path, capsys):
+def _live_twins(engine, monkeypatch, anchor=None):
+    """Три копии «Копия», тред c1 на первой; выгрузка строится из ТЕКУЩЕГО
+    состояния документа — статичная показала бы после первой правки старый
+    текст, и вторая упёрлась бы в несуществующий якорь."""
+    from test_sync_anchors import make_docx_full
+    docs = MutatingDocsStub(make_doc(["Копия", "Копия", "Копия"]))
+
+    def live_export():
+        lines = docs._flat().split("\n")[:-1]
+        paras = [(t, [("0",) + (anchor or (0, len(t)))] if i == 0 else [])
+                 for i, t in enumerate(lines)]
+        if docs.canary_text is not None:
+            paras.append((docs.canary_text, []))
+        return make_docx_full(paras, [("0", "A", CREATED_SEC)])
+
+    wire(engine, monkeypatch, docs,
+         DriveStub([api_comment("c1", "A", CREATED)], live_export))
+    return docs
+
+
+def test_an_ordinal_after_a_thread_edit_still_lands_on_its_copy(
+        engine, monkeypatch, tmp_path, capsys):
     """Номер вхождения осмыслен только вместе с числом копий.
 
-    Три одинаковых абзаца, разговор на первом. Правка по треду убирает одну
-    копию — и `occurrence: 2` теперь показывает на бывшую третью. Проверка
-    «в этом диапазоне та самая цитата» на близнецах тавтологична и
-    промолчала бы, а правка уехала бы в чужую копию. Найдено ревью codex.
+    Три одинаковых абзаца, разговор на первом. Правка по треду переписывает
+    первую копию — и `occurrence: 2` на живом документе показывал бы на
+    бывшую третью. До 0.20.1 такая правка отказывала (`concurrent_edit`,
+    «было 3, стало 2»): учёт знал только свои замены по цитате. Теперь он
+    ведёт позиции копий через каждую применённую правку, и №2 исходного
+    снимка остаётся №2 — это сценарий «один заголовок прокомментирован,
+    поправь во всех каналах» (вопрос владельца 16.10).
     """
-    texts = ["Копия", "Копия", "Копия"]
-    _docs, _drive = _stand(
-        engine, monkeypatch, texts,
-        [("Копия", [("0", 0, 5)]), ("Копия", []), ("Копия", [])],
-        mutating=True)
+    docs = _live_twins(engine, monkeypatch)
     code, out = _run(engine, tmp_path, capsys, [
         {"op": "replace_anchor", "comment_id": "c1", "with": "Первая"},
-        {"op": "replace_quote", "quote": "Копия", "occurrence": 2,
-         "with": "Вторая"},
+        {"op": "replace_anchor", "comment_id": "c1", "with": "Вторая"},
+    ])
+    assert code == 3
+    assert len(out["refused"]) == 2
+    assert out["ops_applied"] == 0
+    assert all("одному треду" in e["error"] for e in out["refused"])
+
+
+def test_a_document_without_comments_has_nothing_to_address(engine,
+                                                            monkeypatch,
+                                                            tmp_path, capsys):
+    docs = DocsStub(make_doc(SINGLE))
+    drive = DriveStub([], _docx_builder(docs, [(t, []) for t in SINGLE], []))
+    wire(engine, monkeypatch, docs, drive)
+    code, out = _run(engine, tmp_path, capsys, [
+        {"op": "replace_anchor", "comment_id": "c1", "with": "Правка"}])
+    assert code == 3
+    entry = out["refused"][0]
+    assert entry["reason"] == "comment_thread_unresolvable"
+    assert "нет заякоренных комментариев" in entry["error"]
+    assert docs.batches == []
+
+
+# ------------------------------------------ последовательность в файле -----
+
+def test_a_thread_already_touched_by_this_run_is_refused(engine, monkeypatch,
+                                                         tmp_path, capsys):
+    """Адрес этой операции — тред, и любой текст под ним для неё законен.
+
+    Значит после соседней правки, сдвинувшей разговор, она молча накрыла бы
+    её результат целиком, и обе числились бы применёнными. У обычной замены
+    этой беды нет: она сверяет текст в разрешённом диапазоне с тем, по
+    которому адресовалась. Найдено ревью codex.
+    """
+    _docs, _drive = _single(engine, monkeypatch, mutating=True)
+    code, out = _run(engine, tmp_path, capsys, [
+        {"op": "replace_quote", "quote": "опи", "with": "ОПИ"},
+        {"op": "replace_anchor", "comment_id": "c1", "with": "Правка"},
     ])
     assert code == 3
     assert out["ops_applied"] == 1
     entry = out["refused"][0]
     assert entry["reason"] == "concurrent_edit"
-    assert entry["details"] == {"expected_matches": 3, "found_matches": 2}
+    assert "уже задет правкой" in entry["error"]
+
+
+def test_an_ordinal_after_a_thread_edit_still_lands_on_its_copy(
+        engine, monkeypatch, tmp_path, capsys):
+    """Номер вхождения осмыслен только вместе с числом копий.
+
+    Три одинаковых абзаца, разговор на первом. Правка по треду переписывает
+    первую копию — и `occurrence: 2` на живом документе показывал бы на
+    бывшую третью. До 0.20.1 такая правка отказывала (`concurrent_edit`,
+    «было 3, стало 2»): учёт знал только свои замены по цитате. Теперь он
+    ведёт позиции копий через каждую применённую правку, и №2 исходного
+    снимка остаётся №2 — это сценарий «один заголовок прокомментирован,
+    поправь во всех каналах» (вопрос владельца 16.10).
+    """
+    from test_sync_anchors import make_docx_full
+    docs = MutatingDocsStub(make_doc(["Копия", "Копия", "Копия"]))
+
+    def live_export():
+        # Выгрузка из ТЕКУЩЕГО состояния: статичная показала бы после первой
+        # правки старый текст, и вторая упёрлась бы в несуществующий якорь.
+        lines = docs._flat().split("\n")[:-1]
+        paras = [(t, [("0", 0, len(t))] if i == 0 else [])
+                 for i, t in enumerate(lines)]
+        if docs.canary_text is not None:
+            paras.append((docs.canary_text, []))
+        return make_docx_full(paras, [("0", "A", CREATED_SEC)])
+
+    wire(engine, monkeypatch, docs,
+         DriveStub([api_comment("c1", "A", CREATED)], live_export))
+    code, out = _run(engine, tmp_path, capsys, [
+        {"op": "replace_anchor", "comment_id": "c1", "with": "Первая"},
+        {"op": "replace_quote", "quote": "Копия", "occurrence": 2,
+         "with": "Вторая"},
+    ])
+    assert code == 0, json.dumps(out, ensure_ascii=False)
+    assert out["ops_applied"] == 2
+    assert _body(docs) == ["Первая", "Вторая", "Копия"]
+
+
+def test_an_ordinal_whose_own_copy_was_already_touched_is_refused(
+        engine, monkeypatch, tmp_path, capsys):
+    """Правка по треду переписала кусок копии №1 («Коп» → «Кот»). Следующая
+    правка этого файла адресует ту же №1 — её текста там больше нет. Без
+    отказа пересчёт по живым копиям отдал бы ей бывшую №2, и число копий
+    сошлось бы: правка молча ушла бы не туда."""
+    docs = _live_twins(engine, monkeypatch, anchor=(0, 3))
+    _code, out = _run(engine, tmp_path, capsys, [
+        {"op": "replace_anchor", "comment_id": "c1", "with": "Кот"},
+        {"op": "replace_quote", "quote": "Копия", "occurrence": 1,
+         "with": "Правка"}])
+    assert out["ops_applied"] == 1
+    assert out["refused"][0]["reason"] == "concurrent_edit"
+    assert _body(docs) == ["Котия", "Копия", "Копия"]
+
+
+def test_a_foreign_change_to_the_copies_still_refuses(
+        engine, monkeypatch, tmp_path, capsys):
+    """Зеркало: копию между операциями изменил не этот файл — пересчитывать
+    нечем, число живых копий не сходится с учётом, правка отказывает."""
+    docs = _twins(engine, monkeypatch)
+    real = docs.batchUpdate
+    calls = []
+
+    def foreign(documentId=None, body=None):
+        result = real(documentId=documentId, body=body)
+        if "Правка 1" in docs._flat() and not calls:
+            # сразу после первой правки кто-то вписал ещё одну копию выше
+            calls.append(1)
+            docs._store(docs._flat().replace("Alpha", "Копия", 1))
+        return result
+
+    monkeypatch.setattr(docs, "batchUpdate", foreign)
+    _code, out = _run(engine, tmp_path, capsys, [
+        {"op": "replace_quote", "quote": "Копия", "occurrence": 1,
+         "with": "Правка 1"},
+        {"op": "replace_quote", "quote": "Копия", "occurrence": 2,
+         "with": "Правка 2"}])
+    assert out["ops_applied"] == 1
+    assert out["refused"][0]["reason"] == "concurrent_edit"
+    assert "Правка 2" not in docs._flat()
 
 
 def test_an_op_without_an_ordinal_still_rides_on_its_uniqueness(
